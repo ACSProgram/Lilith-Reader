@@ -1,0 +1,9 @@
+// app.rc — 应用资源（Phase 6）
+// 目前只有应用图标：作为 exe 图标、窗口图标与任务栏图标（Windows 默认取 exe 首个图标资源）。
+// 版本资源、打开方式注册表脚本仍属 Phase 7 发布打包，见 docs/01-迁移计划.md。
+//
+// 刻意不 #include <windows.h>：资源编译器对它的展开支持有限，这里只需要一个整型 ID。
+
+#define IDI_APPICON 101
+
+IDI_APPICON ICON "../../assets/icon.ico"

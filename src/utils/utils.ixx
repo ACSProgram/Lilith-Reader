@@ -4,6 +4,8 @@
 
 module;
 #include <windows.h>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
@@ -114,6 +116,33 @@ inline int read_ini_int_ex(const std::wstring& ini, const wchar_t* section,
     const long v = wcstol(buf, &end, 10);
     if (end == buf) return fallback;
     return static_cast<int>(v);
+}
+
+// 通用 ini 浮点读取（指定节）。缺键/非法值返回 fallback；范围钳制由调用方负责。
+inline float read_ini_float_ex(const std::wstring& ini, const wchar_t* section,
+                               const wchar_t* key, float fallback) {
+    wchar_t buf[64]{};
+    const DWORD n = GetPrivateProfileStringW(section, key, L"", buf, 64, ini.c_str());
+    if (n == 0 || n >= 63) return fallback;
+    wchar_t* end = nullptr;
+    const double v = wcstod(buf, &end);
+    if (end == buf) return fallback;
+    return static_cast<float>(v);
+}
+
+// 通用 ini 写入（指定节；Phase 6 设置界面即时落盘用）。
+inline void write_ini_int(const std::wstring& ini, const wchar_t* section,
+                          const wchar_t* key, int value) {
+    wchar_t buf[32]{};
+    _itow_s(value, buf, 10);
+    WritePrivateProfileStringW(section, key, buf, ini.c_str());
+}
+
+inline void write_ini_float(const std::wstring& ini, const wchar_t* section,
+                            const wchar_t* key, float value) {
+    wchar_t buf[64]{};
+    swprintf_s(buf, L"%.4f", static_cast<double>(value));
+    WritePrivateProfileStringW(section, key, buf, ini.c_str());
 }
 
 inline WindowState load_window_state(const std::wstring& ini_path) {

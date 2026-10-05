@@ -118,6 +118,8 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <!-- Phase 6：应用图标资源（exe/窗口/任务栏图标） -->
+    <ResourceCompile Include="app\app.rc" />
     <ClCompile Include="app\main.cpp" />
     <ClCompile Include="utils\utils.ixx" />
     <ClCompile Include="document\document.ixx" />
