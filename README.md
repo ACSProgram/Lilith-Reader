@@ -37,23 +37,27 @@
 └── vcpkg.json
 ```
 
-## 构建（当前状态：Phase 0 框架已完成 ✅）
+## 构建（当前状态：Phase 1 应用外壳已完成 ✅）
 
 - Visual Studio 18 (2026) Community，PlatformToolset v145（MSVC 14.51）
 - vcpkg，manifest 模式，triplet `x64-windows-static`
 - MSVC `/MT`（静态 CRT）+ `/O2` + `/utf-8`
 - 构建：VS 打开 `LilithReader.slnx` 直接 F5，或命令行运行 `build.bat`
 - 产出：`bin\Release\LilithReader.exe`（Phase 0 约 2.3MB，静态 CRT，仅依赖系统组件 DLL）
-- 当前程序：Win32 + D3D11 + ImGui 1.93 + ImPlot 1.1 框架窗口（中文字体暂用系统微软雅黑，Phase 6 换内嵌子集字体）
+- 当前程序：应用外壳——拖放/命令行打开文档、格式识别占位页、窗口状态持久化、F3 调试浮层（UI 字体暂用系统微软雅黑，Phase 6 换内嵌子集字体）
 
 ## 状态
 
 | 阶段 | 状态 |
 |---|---|
 | Phase 0 骨架与环境 | ✅ 完成（2026-10-05） |
-| Phase 1 应用外壳 | 未开始 |
+| Phase 1 应用外壳 | ✅ 完成（2026-10-05，[人工验证](docs/04-人工验证.md) §1 待人工执行） |
 | Phase 2 MuPDF 文档核心 | 未开始 |
 | Phase 3 自研画布 | 未开始 |
+
+## 纪律
+
+开发过程中**不实际运行软件做测试**（编译与自动化测试除外）；需人工运行确认的项统一记录在 [人工验证](docs/04-人工验证.md)。
 
 详见 [迁移计划](docs/01-迁移计划.md)。
 
@@ -62,3 +66,4 @@
 - [迁移计划](docs/01-迁移计划.md) —— 分阶段执行的主计划
 - [架构设计](docs/02-架构设计.md) —— 画布、渲染管线、字体、稳定性设计
 - [决策记录](docs/03-决策记录.md) —— 关键选型及理由（ADR）
+- [人工验证](docs/04-人工验证.md) —— 需人工运行确认的验证清单
