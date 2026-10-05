@@ -1,27 +1,32 @@
-// render.ixx — Lilith Reader 渲染调度层（Phase 3）
+// render.ixx — Lilith Reader 渲染调度层（Phase 3 建立，Phase 4 完善）
 //
 // 职责：衔接 document 与 canvas。架构文档 §1 的依赖方向要求
 //       document 与 canvas **互不 import**，由本层居中调度，为将来替换
 //       MuPDF 为 PDFium 预留解耦（ADR-003）。
 //
-// 本层做三件事：
+// 本层做四件事：
 //   1. **线程归属**：单工作线程独占唯一的 Document；UI 线程零 fz_* 调用、
 //      零阻塞（延续 ADR-006/ADR-012）。
 //   2. **页状态机**：Unloaded → Loading → Loaded / Failed（架构文档 §3.2）。
-//      Phase 2 的 DocSession 临时线程在本阶段被本层取代。
+//      Phase 4 补齐 Failed 语义：自动重试 ≤1 次，仍失败则定格并等用户点击重试
+//      （`retry_page`）；重试/加载期间保留旧纹理，不闪白（ADR-024/031）。
 //   3. **纹理上传与生命周期**：渲染线程用 ID3D11Device 直接建纹理
 //      （D3D11 的 device 方法可多线程调用），产出即释放 PageBitmap；
-//      被替换/逐出的纹理进**退役队列**，由 UI 线程在帧首 drain_retired() 释放
-//      —— 杜绝"删除正在被本帧 draw list 引用的纹理"（架构文档 §3.3）。
+//      被替换/逐出的纹理进**两段式退役队列**，由 UI 线程在帧首 drain_retired()
+//      释放 —— 任何纹理都"活过一帧"，杜绝"删除正在被本帧 draw list 引用的纹理"
+//      （架构文档 §3.3，ADR-019/033）。
+//   4. **缓存**：按**字节预算**的 LRU 逐出（默认 512MiB，可设 128MiB~2GiB）。
+//      逐出策略本身是纯函数，单独放在 lilithreader.page_cache 里可单测（ADR-030）。
 //
 // 纪律：
 //   · 本模块接口不出现 ImGui/D3D 类型：纹理以不透明 void* 暴露，UI 侧自行转
 //     ImTextureID（= ID3D11ShaderResourceView*）。UI **只读**该句柄，绝不释放。
-//   · 缓存策略：Phase 3 采用"保留窗口"（可见 ± 预加载）逐出窗口外页；
-//     按**字节预算**的 LRU 在 Phase 4 替换本策略，接口不变。
+//   · 本层不出现任何 fz_* 调用（只经 Document/PageBitmap 公开接口），
+//     故不受 ADR-009 的 setjmp 纪律约束。
 
 module;
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -34,14 +39,17 @@ export module lilithreader.render;
 // 让 import render 的翻译单元一并可见（避免"导出声明引用非导出模块类型"）。
 export import lilithreader.document;
 
+// 重新导出页缓存纯策略：预算常量/钳制、自动重试上限供 app 层直接使用。
+export import lilithreader.page_cache;
+
 export namespace lr {
 
 // ---- 单页状态机 ----
 enum class PageStatus : int {
     Unloaded = 0,  // 无纹理（尚未请求，或已被逐出）
-    Loading,       // 渲染中
+    Loading,       // 渲染中（保留旧纹理，UI 继续显示旧图，ADR-024）
     Loaded,        // 纹理可用
-    Failed,        // 渲染失败（失败占位 UI 已实现；点击重试/自动重试为 Phase 4 计划）
+    Failed,        // 渲染失败：自动重试已用尽。UI 显示错误占位，点击可重试（retry_page）
 };
 
 // UI 线程读取的页快照（值拷贝，不持有所有权）
@@ -71,6 +79,14 @@ struct RenderWant {
     float scale = 1.0f;
 };
 
+// 缓存统计（F3 调试浮层/诊断用）
+struct CacheStats {
+    std::size_t budget_bytes = 0;    // 当前预算
+    std::size_t used_bytes = 0;      // 已驻留纹理字节数
+    int         resident_pages = 0;  // 已驻留页数
+    int         evictions = 0;       // 自打开文档以来累计逐出页数
+};
+
 // ---- 渲染调度器 ----
 class Renderer {
 public:
@@ -95,8 +111,17 @@ public:
     // 排队、换入；已在足够倍率上 Loaded 的页会被跳过。
     void set_wanted(std::vector<RenderWant> wants);
 
-    // 帧首调用：释放上一帧退役的纹理。必须在构建本帧 draw list 之前调用。
+    // 帧首调用：释放**上一帧之前**退役的纹理。必须在构建本帧 draw list 之前调用。
     void drain_retired();
+
+    // 设置缓存字节预算（钳制到 [kCacheBudgetMin, kCacheBudgetMax]）。
+    // 预算调小会立即触发一次逐出。默认 kCacheBudgetDefault。
+    void set_cache_budget(std::size_t bytes);
+    [[nodiscard]] CacheStats cache_stats() const;
+
+    // 手动重试某页（用户点击失败占位）：重置自动重试计数并重新排队。
+    // 页不可见时仅置标记，待其重新进入可见范围后生效。
+    void retry_page(int page);
 
 private:
     struct Impl;

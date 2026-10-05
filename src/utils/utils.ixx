@@ -103,6 +103,19 @@ inline int read_ini_int(const std::wstring& ini, const wchar_t* key, int fallbac
     return static_cast<int>(v);
 }
 
+// 通用 ini 整数读取（指定节）。供 [cache] BudgetMB 等设置项使用（Phase 4）。
+// 缺键/非法值返回 fallback；负数与超范围由调用方钳制。
+inline int read_ini_int_ex(const std::wstring& ini, const wchar_t* section,
+                           const wchar_t* key, int fallback) {
+    wchar_t buf[32]{};
+    const DWORD n = GetPrivateProfileStringW(section, key, L"", buf, 32, ini.c_str());
+    if (n == 0 || n >= 31) return fallback;
+    wchar_t* end = nullptr;
+    const long v = wcstol(buf, &end, 10);
+    if (end == buf) return fallback;
+    return static_cast<int>(v);
+}
+
 inline WindowState load_window_state(const std::wstring& ini_path) {
     constexpr int kAbsent = INT_MAX;
     WindowState s;

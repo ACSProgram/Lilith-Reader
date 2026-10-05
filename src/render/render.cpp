@@ -1,11 +1,16 @@
-// render.cpp — lilithreader.render 的实现单元（Phase 3）
+// render.cpp — lilithreader.render 的实现单元（Phase 3 建立，Phase 4 完善）
 //
 // 线程模型（架构文档 §3.1）：
 //   · UI 线程：只投递命令/渲染请求、读取快照；零 fz_*、零阻塞。
 //   · 工作线程（本文件）：独占 Document；渲染 → 建纹理 → 发布快照。
 //   · 纹理生命周期：渲染线程建纹理（ID3D11Device 方法可多线程调用），
-//     被替换/逐出的纹理进退役队列；UI 线程帧首 drain_retired() 释放，
-//     保证"正在被本帧 draw list 引用的纹理"不会被提前删除。
+//     被替换/逐出的纹理进**两段式退役队列**；UI 线程帧首 drain_retired() 释放。
+//
+// 两段式退役队列（ADR-033）：
+//   渲染线程把退役纹理放入 retired_pending（"本帧"）；drain_retired() 先释放
+//   retired_ready（"上一帧的 pending"），再把 pending 移入 ready。
+//   于是任何纹理都至少**活过一个完整帧**才被 Release —— 即使将来有人把
+//   drain 挪到帧末，"本帧 draw list 引用过的纹理"也不会被提前释放。
 //
 // 本文件不含任何 fz_* 调用（只经 Document/PageBitmap 的公开接口），
 // 故不受 ADR-009 的 setjmp 纪律约束。
@@ -17,7 +22,6 @@ module;
 #include <d3d11.h>
 
 #include <algorithm>
-#include <climits>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -34,13 +38,10 @@ module;
 module lilithreader.render;
 
 import lilithreader.document;
+import lilithreader.page_cache;
 
 namespace lr {
 namespace {
-
-// 保留窗口：可见范围外扩这么多页的纹理暂不逐出，避免来回滚动反复重渲。
-// Phase 4 将改为按字节预算的 LRU，本常量随之废弃。
-constexpr int kRetainMargin = 4;
 
 // 用 MuPDF 的 RGBA8 缓冲直接建纹理：IMMUTABLE + 初始数据，一次调用完成上传。
 // 这是 ID3D11Device 的方法（free-threaded），可在渲染线程安全调用。
@@ -113,9 +114,27 @@ struct Renderer::Impl {
     bool                    wants_dirty = false;
     std::uint64_t           next_id = 0;
 
-    DocState              doc;
-    std::vector<PageSlot> slots;
-    std::vector<void*>    retired;  // 待释放的 SRV
+    DocState doc;
+
+    // 页缓存条目：同时承载"发布给 UI 的快照"与"缓存策略所需的元数据"。
+    struct Entry {
+        PageSlot      slot;                  // 发布给 UI（值拷贝，UI 只读）
+        std::size_t   bytes = 0;             // 纹理字节数；0 = 未驻留
+        std::uint64_t last_use = 0;          // LRU 序号（越大越新）
+        int           auto_retries = 0;      // 本轮失败已消耗的自动重试次数
+        bool          manual_retry = false;  // UI 请求重试（点击失败占位）
+        float         failed_scale = -1.0f;  // 定格失败时的倍率（用于识别"新请求"）
+    };
+
+    std::vector<Entry>  pages;
+    std::size_t         used_bytes = 0;                       // 已驻留纹理字节数
+    std::size_t         budget_bytes = kCacheBudgetDefault;   // 字节预算
+    std::uint64_t       use_tick = 0;                         // LRU 时钟
+    int                 evictions = 0;                        // 累计逐出页数
+
+    // 两段式退役队列（见文件头）
+    std::vector<void*>  retired_pending;
+    std::vector<void*>  retired_ready;
 
     Document     doc_engine;  // 仅工作线程访问
     std::jthread worker;
@@ -126,30 +145,43 @@ struct Renderer::Impl {
         worker.request_stop();
         cv.notify_all();
         if (worker.joinable()) worker.join();
-        // 工作线程已停，此后不会再有新退役项；统一释放全部纹理
-        for (PageSlot& s : slots) release_srv(s.texture);
-        slots.clear();
-        for (void* p : retired) release_srv(p);
-        retired.clear();
+        std::lock_guard lock(mtx);
+        for (Entry& e : pages) release_srv(e.slot.texture);
+        pages.clear();
+        for (void* p : retired_pending) release_srv(p);
+        for (void* p : retired_ready) release_srv(p);
+        retired_pending.clear();
+        retired_ready.clear();
+        used_bytes = 0;
     }
 
     static void release_srv(void* p) {
         if (p) static_cast<ID3D11ShaderResourceView*>(p)->Release();
     }
 
-    // ---- 加锁访问辅助 ----
+    // ---- 加锁访问辅助（以下 *_locked 均要求调用者持 mtx） ----
 
-    // 把 tex 移入退役队列（调用者须持锁）
-    void retire_locked(void*& tex) {
-        if (tex) {
-            retired.push_back(tex);
-            tex = nullptr;
+    // 把一页的纹理退役（入 pending）并从驻留统计扣除。槽位的状态/错误保留，
+    // 由调用方决定后续语义（逐出置 Unloaded / 替换置 Loaded）。
+    void retire_entry_locked(Entry& e) {
+        if (e.slot.texture) {
+            retired_pending.push_back(e.slot.texture);
+            e.slot.texture = nullptr;
         }
+        if (e.bytes) {
+            used_bytes = used_bytes >= e.bytes ? used_bytes - e.bytes : 0;
+            e.bytes = 0;
+        }
+        e.slot.pixel_w = 0;
+        e.slot.pixel_h = 0;
+        e.slot.scale = 0.0f;
     }
 
-    void clear_slots_locked() {
-        for (PageSlot& s : slots) retire_locked(s.texture);
-        slots.clear();
+    void clear_pages_locked() {
+        for (Entry& e : pages) retire_entry_locked(e);
+        pages.clear();
+        used_bytes = 0;
+        evictions = 0;
     }
 
     void publish_doc(const DocState& s) {
@@ -157,33 +189,10 @@ struct Renderer::Impl {
         doc = s;
     }
 
-    // 标记某页进入 Loading：**只改状态，绝不动 texture / scale**。
-    //
-    // 这里是"缩放闪烁"的根因所在（第三轮调试实测）：旧实现在此用 PageSlot{} 覆盖
-    // 整个槽位，于是重渲染一开始旧纹理就从快照里消失 —— UI 先退回"载入中…"占位框，
-    // 等新纹理就绪再换入，肉眼就是闪一下。保留旧纹理后，UI 在重渲染期间继续显示它
-    // （双线性放大，略糊但不闪），新纹理就绪时在同一把锁内原子替换。
-    // 顺带修掉一个更严重的隐患：旧实现把旧 SRV 指针直接覆盖掉、且不入退役队列，
-    // **每重渲染一次就泄漏一个纹理**（缩放越频繁，显存涨得越快）。
-    void mark_loading(int page) {
-        std::lock_guard lock(mtx);
-        if (page >= 0 && static_cast<std::size_t>(page) < slots.size())
-            slots[page].status = PageStatus::Loading;
-    }
-
-    // 标记某页渲染失败：**保留已有纹理**（若曾成功渲染过），宁可继续显示旧图，
-    // 也不要闪回"渲染失败"占位框；从未渲染成功的页 texture 为空，UI 自然显示失败占位。
-    // 下一次 wants 变化会再尝试（Phase 4 补退避与重试次数上限）。
-    void mark_failed(int page, DocError err) {
-        std::lock_guard lock(mtx);
-        if (page < 0 || static_cast<std::size_t>(page) >= slots.size()) return;
-        slots[page].status = PageStatus::Failed;
-        slots[page].error = err;
-    }
-
     PageSlot slot_snapshot(int page) const {
         std::lock_guard lock(mtx);
-        if (page >= 0 && static_cast<std::size_t>(page) < slots.size()) return slots[page];
+        if (page >= 0 && static_cast<std::size_t>(page) < pages.size())
+            return pages[static_cast<std::size_t>(page)].slot;
         return {};
     }
 
@@ -225,7 +234,7 @@ struct Renderer::Impl {
         doc_engine.close();
         {
             std::lock_guard lock(mtx);
-            clear_slots_locked();
+            clear_pages_locked();
             last_wants.clear();
         }
 
@@ -239,8 +248,8 @@ struct Renderer::Impl {
                 s.phase = DocPhase::Ready;
                 s.info = info;
                 std::lock_guard lock(mtx);
-                slots.assign(static_cast<std::size_t>(info.page_count > 0 ? info.page_count : 0),
-                             PageSlot{});
+                pages.assign(static_cast<std::size_t>(info.page_count > 0 ? info.page_count : 0),
+                             Entry{});
             } else {
                 s.phase = DocPhase::Failed;
                 s.error = ierr;
@@ -261,7 +270,7 @@ struct Renderer::Impl {
         s.phase = DocPhase::Idle;
         s.id = c.id;
         std::lock_guard lock(mtx);
-        clear_slots_locked();
+        clear_pages_locked();
         last_wants.clear();
         doc = s;
     }
@@ -277,9 +286,9 @@ struct Renderer::Impl {
                 s.phase = DocPhase::Ready;
                 s.info = info;
                 std::lock_guard lock(mtx);
-                clear_slots_locked();
-                slots.assign(static_cast<std::size_t>(info.page_count > 0 ? info.page_count : 0),
-                             PageSlot{});
+                clear_pages_locked();
+                pages.assign(static_cast<std::size_t>(info.page_count > 0 ? info.page_count : 0),
+                             Entry{});
                 last_wants.clear();
             } else {
                 s.phase = DocPhase::Failed;
@@ -299,56 +308,129 @@ struct Renderer::Impl {
     void handle_wants(const std::vector<RenderWant>& w) {
         if (!doc_engine.is_open()) return;
 
-        // 保留窗口外的已加载页逐出（Phase 3 策略；Phase 4 换字节预算 LRU）
-        int lo = INT_MAX, hi = INT_MIN;
-        for (const RenderWant& x : w) {
-            if (x.page < 0) continue;
-            if (x.page < lo) lo = x.page;
-            if (x.page > hi) hi = x.page;
+        // 1) 标记本帧需要的页（pinned，不可逐出）并刷新其 LRU 序号
+        std::vector<char> wanted;
+        {
+            std::lock_guard lock(mtx);
+            wanted.assign(pages.size(), 0);
+            ++use_tick;
+            for (const RenderWant& x : w) {
+                if (x.page < 0 || static_cast<std::size_t>(x.page) >= pages.size()) continue;
+                wanted[static_cast<std::size_t>(x.page)] = 1;
+                pages[static_cast<std::size_t>(x.page)].last_use = use_tick;
+            }
         }
-        if (lo != INT_MAX) {
-            lo -= kRetainMargin;
-            hi += kRetainMargin;
-        }
-        evict_outside(lo, hi);
 
+        // 2) 按字节预算逐出（纯策略：lilithreader.page_cache::select_evictions）
+        evict_to_budget(wanted);
+
+        // 3) 渲染缺失/不够清晰的页（按 wants 顺序，可见页在前）
         for (const RenderWant& x : w) {
             if (x.page < 0 || !(x.scale > 0.0f)) continue;
-            const PageSlot cur = slot_snapshot(x.page);
-            if (cur.status == PageStatus::Loading) continue;      // 已在渲染
+            if (static_cast<std::size_t>(x.page) >= pages.size()) continue;
+            PageSlot cur;
+            {
+                std::lock_guard lock(mtx);
+                cur = pages[static_cast<std::size_t>(x.page)].slot;
+            }
             if (cur.status == PageStatus::Loaded && cur.scale >= x.scale * 0.999f)
-                continue;                                         // 已够清晰
+                continue;  // 已够清晰
             render_one(x.page, x.scale);
         }
     }
 
-    void evict_outside(int lo, int hi) {
-        std::lock_guard lock(mtx);
-        for (int i = 0; i < static_cast<int>(slots.size()); ++i) {
-            if (i >= lo && i <= hi) continue;
-            if (slots[i].texture) {
-                retire_locked(slots[i].texture);
-                slots[i] = PageSlot{};
+    void evict_to_budget(const std::vector<char>& wanted) {
+        std::vector<CachePageView> views;
+        std::size_t used = 0, budget = 0;
+        {
+            std::lock_guard lock(mtx);
+            views.resize(pages.size());
+            for (std::size_t i = 0; i < pages.size(); ++i) {
+                CachePageView v;
+                v.bytes = pages[i].bytes;
+                v.last_use = pages[i].last_use;
+                v.pinned = i < wanted.size() && wanted[i] != 0;
+                views[i] = v;
             }
+            used = used_bytes;
+            budget = budget_bytes;
+        }
+        const std::vector<int> victims = select_evictions(views, used, budget);
+        if (victims.empty()) return;
+        std::lock_guard lock(mtx);
+        for (int i : victims) {
+            if (i < 0 || static_cast<std::size_t>(i) >= pages.size()) continue;
+            Entry& e = pages[static_cast<std::size_t>(i)];
+            if (e.bytes == 0) continue;  // 已被处理（防御）
+            retire_entry_locked(e);
+            e.slot.status = PageStatus::Unloaded;
+            e.slot.error = DocError::Ok;
+            e.auto_retries = 0;          // 逐出即"从未渲染"，下次请求给全新额度
+            e.failed_scale = -1.0f;
+            ++evictions;
         }
     }
 
+    // 渲染单页。失败时自动重试至多 kMaxAutoRetries 次，仍失败则定格为 Failed
+    // （等待 UI 点击重试，见 retry_page）。加载/重试期间**保留旧纹理**（ADR-024）。
     void render_one(int page, float scale) {
-        mark_loading(page);  // 保留旧纹理，见 mark_loading 注释
-
-        PageBitmap bmp;
-        const DocError err = doc_engine.render_page(page, scale, bmp);
-        if (err != DocError::Ok) {
-            mark_failed(page, err);
-            return;
+        {
+            std::lock_guard lock(mtx);
+            if (page < 0 || static_cast<std::size_t>(page) >= pages.size()) return;
+            Entry& e = pages[static_cast<std::size_t>(page)];
+            const bool manual = e.manual_retry;
+            if (e.slot.status == PageStatus::Failed && !manual) {
+                // 同一倍率的失败已定格（避免随 wants 变化无限重渲）；
+                // 倍率变化视为**新请求**，重新给自动重试额度 —— 否则页会永久卡在失败时的
+                // 旧倍率上（曾成功渲染过时旧纹理仍在，永远等不到高清换入）。
+                const bool same_scale = std::fabs(e.failed_scale - scale) <= 0.002f;
+                if (same_scale && !should_render_failed(false, e.auto_retries)) return;
+                if (!same_scale) e.auto_retries = 0;
+            }
+            if (manual) {
+                e.manual_retry = false;
+                e.auto_retries = 0;  // 手动重试重置额度
+            }
+            // 只改状态，绝不动 texture/scale —— 重渲染期间 UI 继续显示旧纹理，不闪白。
+            e.slot.status = PageStatus::Loading;
+            e.slot.error = DocError::Ok;
         }
 
-        ID3D11ShaderResourceView* srv = nullptr;
-        if (!create_page_texture(device, bmp.samples(), bmp.width(), bmp.height(),
-                                 bmp.stride(), &srv)) {
-            mark_failed(page, DocError::Internal);
-            return;
+        for (;;) {
+            PageBitmap bmp;
+            DocError err = doc_engine.render_page(page, scale, bmp);
+
+            ID3D11ShaderResourceView* srv = nullptr;
+            if (err == DocError::Ok &&
+                !create_page_texture(device, bmp.samples(), bmp.width(), bmp.height(),
+                                     bmp.stride(), &srv)) {
+                err = DocError::Internal;
+            }
+            if (err == DocError::Ok) {
+                publish_loaded(page, srv, bmp);
+                return;
+            }
+            if (srv) { srv->Release(); srv = nullptr; }
+
+            // 失败：还有自动重试额度吗？
+            bool again = false;
+            {
+                std::lock_guard lock(mtx);
+                if (page >= 0 && static_cast<std::size_t>(page) < pages.size()) {
+                    Entry& e = pages[static_cast<std::size_t>(page)];
+                    if (e.auto_retries < kMaxAutoRetries) {
+                        ++e.auto_retries;
+                        again = true;
+                    }
+                }
+            }
+            if (!again) { mark_failed(page, err, scale); return; }
         }
+    }
+
+    void publish_loaded(int page, ID3D11ShaderResourceView* srv, const PageBitmap& bmp) {
+        const std::size_t bytes =
+            static_cast<std::size_t>(bmp.width()) * static_cast<std::size_t>(bmp.height()) * 4u;
 
         PageSlot loaded;
         loaded.status = PageStatus::Loaded;
@@ -358,12 +440,28 @@ struct Renderer::Impl {
         loaded.scale = bmp.effective_scale();
 
         std::lock_guard lock(mtx);
-        if (page >= 0 && static_cast<std::size_t>(page) < slots.size()) {
-            retire_locked(slots[page].texture);  // 旧纹理入退役队列（由 UI 帧首释放）
-            slots[page] = loaded;
-        } else {
-            retired.push_back(srv);  // 文档已切换，结果作废
+        if (page < 0 || static_cast<std::size_t>(page) >= pages.size()) {
+            retired_pending.push_back(srv);  // 文档已切换，结果作废
+            return;
         }
+        Entry& e = pages[static_cast<std::size_t>(page)];
+        retire_entry_locked(e);  // 旧纹理入退役队列（由 UI 帧首释放）
+        e.slot = loaded;
+        e.bytes = bytes;
+        e.auto_retries = 0;
+        e.manual_retry = false;
+        e.failed_scale = -1.0f;
+        used_bytes += bytes;
+    }
+
+    void mark_failed(int page, DocError err, float scale) {
+        std::lock_guard lock(mtx);
+        if (page < 0 || static_cast<std::size_t>(page) >= pages.size()) return;
+        Entry& e = pages[static_cast<std::size_t>(page)];
+        e.slot.status = PageStatus::Failed;
+        e.slot.error = err;
+        e.failed_scale = scale;
+        // 保留已有纹理（ADR-024）：宁可继续显示旧图，也不闪回失败占位。
     }
 };
 
@@ -433,7 +531,7 @@ DocState Renderer::doc_state() const {
 int Renderer::page_count() const {
     if (!impl_) return 0;
     std::lock_guard lock(impl_->mtx);
-    return static_cast<int>(impl_->slots.size());
+    return static_cast<int>(impl_->pages.size());
 }
 
 PageSlot Renderer::slot(int page) const {
@@ -456,9 +554,49 @@ void Renderer::drain_retired() {
     std::vector<void*> local;
     {
         std::lock_guard lock(impl_->mtx);
-        local.swap(impl_->retired);
+        local.swap(impl_->retired_ready);       // 本帧释放"上一帧之前"退役的
+        impl_->retired_ready.swap(impl_->retired_pending);
+        impl_->retired_pending.clear();
     }
     for (void* p : local) Impl::release_srv(p);
+}
+
+void Renderer::set_cache_budget(std::size_t bytes) {
+    if (!impl_) return;
+    std::lock_guard lock(impl_->mtx);
+    impl_->budget_bytes = clamp_cache_budget(bytes);
+    // 预算调小可能需立即逐出：用上一帧的请求重跑一次调度（无请求时无可逐出页）
+    if (!impl_->last_wants.empty()) {
+        impl_->wants = impl_->last_wants;
+        impl_->wants_dirty = true;
+        impl_->cv.notify_all();
+    }
+}
+
+CacheStats Renderer::cache_stats() const {
+    if (!impl_) return {};
+    std::lock_guard lock(impl_->mtx);
+    CacheStats s;
+    s.budget_bytes = impl_->budget_bytes;
+    s.used_bytes = impl_->used_bytes;
+    s.evictions = impl_->evictions;
+    for (const Impl::Entry& e : impl_->pages)
+        if (e.bytes > 0) ++s.resident_pages;
+    return s;
+}
+
+void Renderer::retry_page(int page) {
+    if (!impl_) return;
+    std::lock_guard lock(impl_->mtx);
+    if (page < 0 || static_cast<std::size_t>(page) >= impl_->pages.size()) return;
+    Impl::Entry& e = impl_->pages[static_cast<std::size_t>(page)];
+    if (e.manual_retry) return;  // 已在待重试队列
+    e.manual_retry = true;
+    e.auto_retries = 0;
+    // 重新武装一次调度：否则 set_wanted 的去重会拦住"同参数"的再次投递
+    impl_->wants = impl_->last_wants;
+    impl_->wants_dirty = true;
+    impl_->cv.notify_all();
 }
 
 }  // namespace lr

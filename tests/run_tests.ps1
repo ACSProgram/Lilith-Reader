@@ -139,6 +139,12 @@ Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\canvas.ifc",
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\canvas.ifc",
     "/Fo$out\canvas_test.obj", (Join-Path $tests "canvas_test.cpp"))) "编译 canvas_test.cpp"
 
+# Phase 4：页缓存纯策略（零依赖，不碰 D3D/线程/MuPDF），单独编译成 page_cache_test.exe
+Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\page_cache.ifc", "/Fo$out\page_cache.ixx.obj",
+    (Join-Path $src "render\page_cache.ixx"))) "编译 page_cache.ixx"
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\page_cache.ifc",
+    "/Fo$out\page_cache_test.obj", (Join-Path $tests "page_cache_test.cpp"))) "编译 page_cache_test.cpp"
+
 # 依赖库清单取自 unofficial-libmupdf 的 INTERFACE_LINK_LIBRARIES（不能改成"链上 lib\*.lib"：
 # jpeg.lib 与 turbojpeg.lib 会符号冲突）
 $libs = @("libmupdf.lib", "freetype.lib", "harfbuzz.lib", "jbig2dec.lib", "jpeg.lib",
@@ -156,6 +162,10 @@ Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\doc_test.exe", "$out\doc_test.obj", "$o
 # 必须一并链接 canvas.ixx.obj：接口单元里的内联成员（如 Canvas::state）由它发射。
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\canvas_test.exe", "$out\canvas_test.obj",
     "$out\canvas.obj", "$out\canvas.ixx.obj", "/link") + $libdirs) "链接 canvas_test.exe"
+
+# 页缓存策略测试同样只用 C++ 标准库；必须链 page_cache.ixx.obj（导出函数由它发射）。
+Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\page_cache_test.exe", "$out\page_cache_test.obj",
+    "$out\page_cache.ixx.obj", "/link") + $libdirs) "链接 page_cache_test.exe"
 
 # ---- 4. 运行测试 ---------------------------------------------------------------
 
@@ -181,6 +191,16 @@ try {
 $canvasExit = $LASTEXITCODE
 Write-Host "  canvas_test.exe 退出码 = $canvasExit"
 
+Step "运行页缓存策略测试"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & "$out\page_cache_test.exe"
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$cacheExit = $LASTEXITCODE
+Write-Host "  page_cache_test.exe 退出码 = $cacheExit"
+
 if ($Probe) {
     Step "编译并运行 MuPDF 诊断探针"
     Invoke-Cl ($defs + $incs + @("/c", "/Fo$out\mupdf_probe.obj",
@@ -191,10 +211,11 @@ if ($Probe) {
 }
 
 Step "结束"
-if ($testExit -eq 0 -and $canvasExit -eq 0) {
+if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0) {
     Write-Host "全部通过。" -ForegroundColor Green
 } else {
     Write-Host "存在失败用例。" -ForegroundColor Red
 }
 if ($testExit -ne 0) { exit $testExit }
-exit $canvasExit
+if ($canvasExit -ne 0) { exit $canvasExit }
+exit $cacheExit

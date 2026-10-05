@@ -1,4 +1,5 @@
-// main.cpp — Lilith Reader 应用外壳（Phase 1 外壳 + Phase 2 文档核心 + Phase 3 自研画布）
+// main.cpp — Lilith Reader 应用外壳（Phase 1 外壳 + Phase 2 文档核心 + Phase 3 自研画布
+// + Phase 4 渲染调度：失败重试 / 方向感知预加载 / 缓存预算）
 // Win32 + D3D11 + ImGui：命令行/拖放打开、窗口状态持久化、画布阅读（滚动/缩放/多列网格）。
 //
 // 分层（架构文档 §1）：main 只做 UI 与输入；文档经 render 调度层访问（UI 线程零 fz_*、
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -248,6 +250,16 @@ float  g_want_scale = -1.0f;         // 已投递给渲染层的倍率；<0 表�
 float  g_last_target_scale = -1.0f;  // 上一帧的目标倍率
 double g_zoom_dirty_since = -1.0;    // 目标倍率最后一次变化的时刻；<0 表示无待定
 
+// 滚动方向（-1 上 / 0 未定 / +1 下）：只服务**方向感知预加载**（Phase 4）——
+// 向下滚只预取下方一行，向上滚只预取上方，避免为回不去的方向白渲染。
+// 刚打开/跳页后为 0（未定），此时两侧都预取，防止首个方向反转出现空档。
+int    g_scroll_dir = 0;
+float  g_prev_scroll_y = 0.0f;
+
+// 缓存字节预算的 ini 默认值（MB）；实际取值读 [cache] BudgetMB，再由渲染层钳制到
+// [kCacheBudgetMin, kCacheBudgetMax]。用户可手改 ini 调整，无需设置界面。
+constexpr int kCacheBudgetDefaultMB = 512;
+
 // 画布留白/间距当前所依据的界面缩放值；与 ui_scale() 不一致时才重新下发
 // （set_margin_gap 会让布局缓存失效，不能每帧无条件调用）。
 float g_canvas_scale = -1.0f;
@@ -288,6 +300,8 @@ void reset_doc_state() {
     g_last_target_scale = -1.0f;
     g_zoom_dirty_since = -1.0;
     g_canvas_scale = -1.0f;
+    g_scroll_dir = 0;
+    g_prev_scroll_y = 0.0f;
     update_title();
 }
 
@@ -327,6 +341,8 @@ void enter_reading() {
     g_last_target_scale = -1.0f;
     g_zoom_dirty_since = -1.0;
     g_canvas_scale = ui_scale();  // 留白已按当前缩放写入
+    g_scroll_dir = 0;             // 方向未定：首帧两侧都预取
+    g_prev_scroll_y = g_canvas.state().scroll_y;
 }
 
 void request_open_document(std::wstring path) {
@@ -537,7 +553,10 @@ void update_want_scale() {
     }
 }
 
-// 可见页 + 上下各一行预加载 → 渲染请求（可见页优先）
+// 可见页 + 预加载页 → 渲染请求（可见页优先）。
+// 预加载策略（Phase 4）：可见行 ±1 行，且**方向感知** —— 向下滚只预取下方一行、
+// 向上滚只预取上方一行。理由：滚动有方向，反向的预加载在下一帧多半就被逐出，
+// 纯属浪费渲染线程与显存；方向未定（刚打开/跳页后）时两侧都预取。
 void emit_wants() {
     const int n = g_canvas.page_count();
     if (n <= 0) return;
@@ -547,17 +566,19 @@ void emit_wants() {
     const int last = g_canvas.visible_last();
     if (first < 0 || last < first) return;
 
-    const int cols = g_canvas.state().columns;
     const int r0 = g_canvas.row_of(first);
     const int r1 = g_canvas.row_of(last);
-    const int pf = g_canvas.first_page_in_row(std::max(0, r0 - 1));
-    const int pl = std::min(n - 1, (r1 + 2) * cols - 1);
+    int pf = first, pl = last;
+    if (g_scroll_dir >= 0 && r1 + 1 < g_canvas.rows())
+        pl = std::max(pl, g_canvas.row_page_end(r1 + 1));      // 下方一行
+    if (g_scroll_dir <= 0 && r0 - 1 >= 0)
+        pf = std::min(pf, g_canvas.row_page_begin(r0 - 1));    // 上方一行
 
     std::vector<lr::RenderWant> wants;
     wants.reserve(static_cast<std::size_t>(pl - pf + 1));
     for (int i = first; i <= last && i < n; ++i) wants.push_back({ i, scale });
     for (int i = pf; i <= pl; ++i)
-        if (i < first || i > last) wants.push_back({ i, scale });
+        if (i >= 0 && i < n && (i < first || i > last)) wants.push_back({ i, scale });
 
     g_renderer->set_wanted(std::move(wants));
 }
@@ -568,7 +589,9 @@ void draw_page_placeholder(ImDrawList* dl, const ImVec2& pmin, const ImVec2& pma
     const bool failed = (s.status == lr::PageStatus::Failed);
     dl->AddRectFilled(pmin, pmax, failed ? kColFailed : kColPlaceholder);
     dl->AddRect(pmin, pmax, failed ? kColFailedBorder : kColPlaceholderBorder);
-    const char* txt = failed ? "渲染失败" : (s.status == lr::PageStatus::Loading ? "载入中…" : "");
+    // 失败占位提示"点击重试"（Phase 4）：命中测试在 draw_canvas_area 里做（见 retry 注释）
+    const char* txt = failed ? "渲染失败 · 点击重试"
+                             : (s.status == lr::PageStatus::Loading ? "载入中…" : "");
     if (txt[0] != '\0') {
         const ImVec2 ts = ImGui::CalcTextSize(txt);
         dl->AddText(ImVec2((pmin.x + pmax.x - ts.x) * 0.5f, (pmin.y + pmax.y - ts.y) * 0.5f),
@@ -600,7 +623,37 @@ void draw_canvas_area() {
     const bool hovered = ImGui::IsWindowHovered();
     g_canvas_hovered = hovered;
     g_canvas_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+
+    // 失败占位点击重试（Phase 4）：在输入处理**之前**做命中测试，只针对
+    // "Failed 且尚无纹理"的页（曾成功渲染过、因重渲染失败而保留旧图的页不显示占位，
+    // 也无从点击）。单击不会触发拖拽平移（平移需要移动阈值），故两者不冲突。
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        const ImVec2 mp = ImGui::GetIO().MousePos;
+        const int cnt = g_canvas.page_count();
+        const int vf = g_canvas.visible_first();
+        const int vl = g_canvas.visible_last();
+        for (int i = vf; i <= vl && i < cnt; ++i) {
+            const lr::PageSlot s = g_renderer->slot(i);
+            if (s.status != lr::PageStatus::Failed || s.texture != nullptr) continue;
+            const lr::PageRect r = g_canvas.page_rect(i);
+            const float x0 = origin.x + r.x, y0 = origin.y + r.y;
+            if (mp.x >= x0 && mp.x <= x0 + r.w && mp.y >= y0 && mp.y <= y0 + r.h) {
+                g_renderer->retry_page(i);
+                break;
+            }
+        }
+    }
+
     if (!g_open_jump) handle_canvas_input(origin, size, hovered);
+
+    // 滚动方向（供方向感知预加载）：以内容坐标 scroll_y 的变化判定。
+    // 阈值 0.5px 抑制浮点抖动导致的假翻转。
+    {
+        const float sy = g_canvas.state().scroll_y;
+        if (sy > g_prev_scroll_y + 0.5f) g_scroll_dir = +1;
+        else if (sy < g_prev_scroll_y - 0.5f) g_scroll_dir = -1;
+        g_prev_scroll_y = sy;
+    }
 
     update_want_scale();
     emit_wants();
@@ -773,6 +826,14 @@ void draw_debug_overlay() {
                         g_canvas.max_scroll_y());
             ImGui::Text("cols: %d  fit: %d", g_canvas.state().columns,
                         g_canvas.state().fit_width ? 1 : 0);
+            // 缓存统计（Phase 4）：驻留字节/预算、驻留页数、累计逐出页数
+            const lr::CacheStats cs = g_renderer->cache_stats();
+            ImGui::Text("cache: %.1f / %.0f MB  pages %d  evict %d",
+                        (double)cs.used_bytes / 1048576.0,
+                        (double)cs.budget_bytes / 1048576.0,
+                        cs.resident_pages, cs.evictions);
+            ImGui::TextDisabled("preload dir %d  (+1 下 / -1 上 / 0 两侧)",
+                                g_scroll_dir);
             // 快捷键**不**看这两个量（ADR-026），列出仅为排查"某个键没反应"时定位用
             ImGui::TextDisabled("canvas hover %d  focus %d  text-input %d",
                                 g_canvas_hovered ? 1 : 0, g_canvas_focused ? 1 : 0,
@@ -964,6 +1025,18 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
     if (!g_hwnd || !g_gfx.initialize(g_hwnd)) return 1;
 
     g_renderer = std::make_unique<lr::Renderer>(g_gfx.device);
+
+    // 缓存字节预算（Phase 4）：读 ini [cache] BudgetMB，缺省 512MB；
+    // 渲染层会钳制到 [kCacheBudgetMin, kCacheBudgetMax]（128MB~2GB）。
+    // 非法/非正值回落到默认值。
+    {
+        const int mb = lr::read_ini_int_ex(g_ini_path, L"cache", L"BudgetMB",
+                                           kCacheBudgetDefaultMB);
+        const std::size_t bytes = static_cast<std::size_t>(mb > 0 ? mb : kCacheBudgetDefaultMB)
+                                  * 1024ull * 1024ull;
+        g_renderer->set_cache_budget(bytes);
+    }
+
     g_ui.initialize(g_hwnd);
     DragAcceptFiles(g_hwnd, TRUE);
 
