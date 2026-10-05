@@ -18,9 +18,9 @@
 //         早期版本 gap 也是屏幕像素常量，缩小时页面变小而间距不变，看起来"间距过大"
 //         （第四轮反馈）。用比例而非固定 pt，是为了让不同页幅的文档视觉比例一致。
 //
-// 本期（Phase 3）简化：**所有页面按统一尺寸布局**（取首页尺寸）。
-//   PDF/EPUB/CBZ 绝大多数页面同尺寸；异构尺寸页的逐页布局留待后续阶段，
-//   届时只需把 set_uniform 换成 set_page_sizes 的逐页数据即可，布局函数无需改动。
+// 逐页尺寸（ADR-022）：set_page_sizes 传入各页真实尺寸（列宽取最宽页、行高取行内
+// 最高页、每页按自身纵横比绘制），异构 PDF 不再形变。set_uniform 保留为回退路径
+// （页数超过探测上限 DocumentInfo::page_sizes 整表为空时），布局函数两者共用。
 
 module;
 
@@ -72,7 +72,7 @@ inline constexpr int   kMaxColumns = 4;
 // **不参与任何布局计算**。之所以必须存在，是因为当视口比"一行"还高时（横向页 /
 // 缩小 / 多列），末尾若干行的 row_top 会超过 max_scroll_y，**无法**被对齐到视口顶部；
 // 若翻页游标只能由滚动位置反推，就会在末行前反复无进展（"卡住"），
-// 或在"到底显示末页"与"反推回前一行"之间来回跳（详见 docs/history/phase3-画布.md §8）。
+// 或在"到底显示末页"与"反推回前一行"之间来回跳（详见 docs/archive/2026-10/phase3-画布.md §8）。
 class Canvas {
 public:
     Canvas() = default;
@@ -80,7 +80,7 @@ public:
     // ---- 输入 ----
     void set_viewport(float w, float h);
     void set_uniform(int page_count, PageSizePt size);       // 全部页面同一尺寸
-    void set_page_sizes(std::vector<PageSizePt> sizes);      // 逐页尺寸（留待后续阶段）
+    void set_page_sizes(std::vector<PageSizePt> sizes);      // 逐页尺寸（ADR-022）
     void set_default_size(PageSizePt size);                  // 未提供尺寸的页回退值
     void set_state(const CanvasState& s);                    // 原样写入（不钳制）
     void set_margin_gap(float margin_px, float gap_ratio);   // 单位不同，见文件头 ADR-029

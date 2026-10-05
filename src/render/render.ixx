@@ -41,7 +41,7 @@ enum class PageStatus : int {
     Unloaded = 0,  // 无纹理（尚未请求，或已被逐出）
     Loading,       // 渲染中
     Loaded,        // 纹理可用
-    Failed,        // 渲染失败（Phase 4 补错误占位与重试）
+    Failed,        // 渲染失败（失败占位 UI 已实现；点击重试/自动重试为 Phase 4 计划）
 };
 
 // UI 线程读取的页快照（值拷贝，不持有所有权）
