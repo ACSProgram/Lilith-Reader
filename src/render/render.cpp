@@ -831,6 +831,26 @@ void Renderer::set_thumbs_wanted(std::vector<int> pages, int target_px) {
     impl_->thumb_pages = std::move(pages);
     impl_->thumb_target_px = target_px;
     impl_->thumbs_dirty = true;
+
+    // 退役**请求范围之外**的缩略图：否则长时间滚动后缩略图会无限累积
+    // （每张约 100KB，1000 页即上百 MB），与"内存有界"的纪律相悖。
+    // 侧栏请求的是一段连续区间，取其 [min,max] 即可。
+    if (!impl_->thumb_pages.empty()) {
+        int lo = impl_->thumb_pages.front();
+        int hi = impl_->thumb_pages.front();
+        for (int p : impl_->thumb_pages) {
+            if (p < lo) lo = p;
+            if (p > hi) hi = p;
+        }
+        for (int i = 0; i < static_cast<int>(impl_->thumbs.size()); ++i) {
+            if (i >= lo && i <= hi) continue;
+            Impl::Entry& e = impl_->thumbs[static_cast<std::size_t>(i)];
+            if (e.bytes == 0 && e.slot.texture == nullptr) continue;
+            impl_->retire_thumb_locked(e);
+            e.slot.status = PageStatus::Unloaded;
+            e.slot.error = DocError::Ok;
+        }
+    }
     impl_->cv.notify_all();
 }
 
