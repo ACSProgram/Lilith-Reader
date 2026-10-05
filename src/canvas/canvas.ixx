@@ -47,6 +47,8 @@ struct CanvasState {
     // 双页对开（书籍模式）：封面（第 0 页）单独成页，其余两页对开 —— (1,2)、(3,4)…。
     // 与"columns=2 的均匀网格"的区别仅在**奇偶偏移**：真实书籍装订是封面单张、正文成对。
     // 开启时等效 2 列（columns 被忽略），布局复用网格的翻页/缩放/钳制逻辑。
+    // 与 columns 是**同层级的视图模式**（人工验证反馈）：显式切列（set_columns）会退出对开，
+    // 无需先关闭对开；对开期间 columns 只被暂时覆盖、值保持不变，关闭后即恢复。
     bool  spread = false;
     float margin_px = 16.0f;   // 内容四周留白（**屏幕像素**；界面 chrome，不随缩放变化）
     float gap_ratio = 0.013f;  // 页/列间距，占**列宽（最宽页）的比例**；屏幕间距 = 该值 × 列宽 × zoom，
@@ -143,7 +145,7 @@ public:
     void zoom_by(float factor, float anchor_sx, float anchor_sy);
     // 滚到第 index 页顶部（align∈[0,1]：0=页顶贴视口顶，1=页顶贴视口底）
     void scroll_to_page(int index, float align = 0.0f);
-    // 切换列数：锚定到当前首个可见页，避免跳变
+    // 切换列数：锚定到当前首个可见页，避免跳变；会**退出双页对开**（两者同层级）
     void set_columns(int columns);
     // 切换双页对开（书籍模式）：锚定到当前阅读页，避免跳变
     void set_spread(bool on);

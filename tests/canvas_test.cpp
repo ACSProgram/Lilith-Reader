@@ -6,7 +6,8 @@
 //
 // 覆盖：fit-width 派生、固定缩放居中、内容尺寸与滚动钳制、以鼠标为锚的缩放
 //       （定点不变性）、命中测试、可见范围、列切换锚定、非均匀页尺寸、缩放钳制、
-//       空文档、fit 复位、阅读游标翻页、页间距随缩放（ADR-029）。
+//       空文档、fit 复位、阅读游标翻页、页间距随缩放（ADR-029）、
+//       双页对开映射与"对开/列数同层级互斥"（ADR-038，Phase 5）。
 //
 // 退出码：0 = 全部通过，1 = 有 FAIL。
 //
@@ -478,6 +479,26 @@ void test_spread_book_mode() {
     check(a.visible_first() <= 6 && 6 <= a.visible_last(), "切换对开后锚点页仍可见");
     a.set_spread(false);
     check(!a.state().spread, "spread 已关闭");
+
+    // 列数与对开是**同层级互斥**的视图模式（人工验证反馈）：对开期间显式切列应
+    // 直接退出对开并生效，无需先关闭对开；对开期间 columns 值保留、关闭后恢复。
+    lr::Canvas m = make(9, 1, true);
+    m.set_spread(true);
+    check(m.state().spread, "对开已开（列数 1 被暂时覆盖）");
+    check(m.state().columns == 1, "对开期间 columns 保留原值 1");
+    m.set_columns(3);
+    check(!m.state().spread, "对开期间按列键 → 直接退出对开");
+    check(m.state().columns == 3, "并即时生效为 3 列（无需先关对开）");
+    // 回归：columns 已等于目标值时，set_columns 早退逻辑不得让对开关不掉
+    m.set_spread(true);
+    m.set_columns(3);
+    check(!m.state().spread, "对开 + 同值列键(3) 也能退出对开（早退修复）");
+    check(m.state().columns == 3, "列数仍为 3");
+    // 只关对开、不动列数：columns 作为"记忆偏好"保持
+    lr::Canvas k = make(9, 4, true);
+    k.set_spread(true);
+    k.set_spread(false);
+    check(!k.state().spread && k.state().columns == 4, "关闭对开后恢复原列数 4（值保留）");
 }
 
 }  // namespace

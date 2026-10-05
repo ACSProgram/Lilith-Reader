@@ -436,9 +436,13 @@ void Canvas::scroll_rows(int dir) {
 
 void Canvas::set_columns(int columns) {
     const int c = clampi(columns, kMinColumns, kMaxColumns);
-    if (c == clampi(state_.columns, kMinColumns, kMaxColumns)) return;
+    // 列数与双页对开是**同一层级的视图模式**：显式切列即退出对开。否则对开期间
+    // eff_cols() 恒为 2、columns 被覆盖，用户必须先按 D 关闭对开才能切列
+    // （人工验证反馈的"两模式不平行"）。故即便 columns 值未变，只要对开开启也要退出。
+    if (c == clampi(state_.columns, kMinColumns, kMaxColumns) && !state_.spread) return;
     const int anchor = current_page();  // 切换前记录当前阅读页（到底时即末行首页）
     state_.columns = c;
+    state_.spread = false;
     dirty_ = true;
     scroll_to_page(anchor, 0.0f);
 }

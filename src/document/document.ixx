@@ -61,10 +61,13 @@ enum class DocError : std::int32_t {
 
 // ---- 页面配色（Phase 5）----
 //
-// 在渲染线程对渲染结果做一次色彩变换（ADR：Phase 5 决策）：
+// 在渲染线程对渲染结果做一次色彩变换（位置决策见 ADR-036；反色端点见 ADR-043）：
 //   Normal  原样；
-//   Invert  反色（暗色背景阅读）——用 fz_invert_pixmap，官方实现会保留 alpha；
-//   EyeCare 护眼（暖色纸张）——用 fz_tint_pixmap 把黑/白映射到暖色端点。
+//   Invert  反色（暗色背景阅读）——柔化映射：白→#1F1D1B、黑→#D8D4CE（逐通道 LUT），保留 alpha；
+//   EyeCare 护眼（暖色纸张）——RGB 经线性 LUT 映射 黑→#2B2318、白→#F6EEDC。
+// 为什么不用 fz_invert_pixmap / fz_tint_pixmap：这两者面向 RGB/Gray，对 **RGBA（带 alpha）
+// 的 4 分量 pixmap** 行为不在公开契约里（tint 明确只写 RGB/BGR/Gray）；自实现逐像素变换
+// 只改 RGB、保留 alpha，行为可控且可单测。
 // 之所以放在渲染层而不是 UI 层叠 shader：纹理是 IMMUTABLE 且零拷贝上传，
 // 变换必须发生在像素进入 GPU 之前；且配色变化即触发一次重渲染（缓存整体失效）。
 enum class ColorMode : int {

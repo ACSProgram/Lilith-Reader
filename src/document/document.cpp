@@ -154,7 +154,9 @@ float clamp_scale(fz_rect bounds, float scale, int max_dimension) noexcept {
 // 已知的 RGBA8（n==4），逐像素改 RGB、**保留 alpha**，行为完全可控且可单测。
 // 只做 POD 运算、不构造 C++ 对象，故可安全放在 fz_try 内调用。
 //
-//   mode 1（反色）：RGB ← 255−RGB（暗色背景阅读）
+//   mode 1（反色）：**柔化**的暗色映射，而非纯黑底白字（纯反色刺眼）：
+//                   白 → 深暖灰 #1F1D1B，黑 → 浅暖灰 #D8D4CE，中间调线性过渡；
+//                   逐通道 LUT，等价于"先反相再把对比度压到 [暗,亮] 区间"。
 //   mode 2（护眼）：RGB 经 LUT 线性映射 黑→#2B2318、白→#F6EEDC（暖色纸张）
 void apply_color_transform(fz_context* ctx, fz_pixmap* pix, int mode) noexcept {
     if (pix == nullptr || mode == 0) return;
@@ -166,12 +168,19 @@ void apply_color_transform(fz_context* ctx, fz_pixmap* pix, int mode) noexcept {
     if (p == nullptr || w <= 0 || h <= 0 || stride <= 0) return;
 
     if (mode == 1) {
+        constexpr unsigned char kDark[3]  = { 0x1F, 0x1D, 0x1B };  // 白 → 深暖灰
+        constexpr unsigned char kLight[3] = { 0xD8, 0xD4, 0xCE };  // 黑 → 浅暖灰
+        unsigned char lut[3][256];
+        for (int c = 0; c < 3; ++c)
+            for (int v = 0; v < 256; ++v)
+                lut[c][v] = static_cast<unsigned char>(
+                    kDark[c] + (kLight[c] - kDark[c]) * (255 - v) / 255);
         for (int y = 0; y < h; ++y) {
             unsigned char* row = p + static_cast<std::size_t>(y) * static_cast<std::size_t>(stride);
             for (int x = 0; x < w; ++x) {
-                row[0] = static_cast<unsigned char>(255 - row[0]);
-                row[1] = static_cast<unsigned char>(255 - row[1]);
-                row[2] = static_cast<unsigned char>(255 - row[2]);
+                row[0] = lut[0][row[0]];
+                row[1] = lut[1][row[1]];
+                row[2] = lut[2][row[2]];
                 row += 4;  // alpha 不动
             }
         }
@@ -477,6 +486,10 @@ struct Document::Impl {
     fz_context*  ctx = nullptr;         // == ch->ctx，热路径上的快捷别名
     fz_document* doc = nullptr;
     int          page_count = 0;
+    // 是否仍需密码。**只由 open()/authenticate() 维护、绝不在认证后再问 MuPDF**：
+    // MuPDF 1.26.10 上，认证成功后调用 fz_needs_password() 会破坏文档的解密状态
+    // （内容流静默解密失败 → 整页空白，见 ADR-041）。info() 因此只能读这个缓存值。
+    int          needs_password = 0;
     std::string  last_error;
 
     ~Impl() { destroy(); }
@@ -491,6 +504,7 @@ struct Document::Impl {
         ch.reset();
         ctx = nullptr;
         page_count = 0;
+        needs_password = 0;
     }
 };
 
@@ -651,6 +665,7 @@ DocError Document::open(const std::wstring& path) noexcept {
         needs_password = 0;  // 探测失败不致命，下一步 count_pages 会再兜一次
     }
     if (needs_password) {
+        s.needs_password = 1;  // 缓存：认证后不得再问 MuPDF（ADR-041）
         set_error(s.last_error, "document is encrypted and requires a password");
         return DocError::NeedsPassword;
     }
@@ -708,6 +723,8 @@ DocError Document::authenticate(std::string_view utf8_password) noexcept {
     DocError result = DocError::Ok;
     char err[kErrCap] = {};
 
+    // 注意：认证成功后**不得**再调用 fz_needs_password() —— MuPDF 1.26.10 上会破坏
+    // 解密状态（内容流静默失败 → 整页空白，见 ADR-041）。需要该信息时读 s.needs_password。
     fz_try(s.ctx) {
         fz_var(ok);
         ok = fz_authenticate_password(s.ctx, s.doc, password);
@@ -725,6 +742,7 @@ DocError Document::authenticate(std::string_view utf8_password) noexcept {
         set_error(s.last_error, "invalid password");
         return DocError::NeedsPassword;
     }
+    s.needs_password = 0;  // 已解锁（ok 非 0 = 用户或所有者口令通过）
 
     // 解锁后重新取页数
     int pages = 0;
@@ -782,7 +800,8 @@ DocError Document::info(DocumentInfo& out) const noexcept {
         fz_var(format);
 
         pages = fz_count_pages(s.ctx, s.doc);
-        needs_password = fz_needs_password(s.ctx, s.doc);
+        // 读缓存值而非调 fz_needs_password()：认证后再问 MuPDF 会破坏解密（ADR-041）
+        needs_password = s.needs_password;
         if (pages <= 0) fz_throw(s.ctx, FZ_ERROR_FORMAT, "document contains no pages");
 
         // 权限位：非加密文档恒为允许；查询失败不应影响打开，故各自独立容错由返回值表达。

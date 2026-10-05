@@ -213,6 +213,34 @@ void run_case(const std::wstring& dir, const Case& c) {
 
 // ---- 加密用例 ----
 
+// 打开/解锁后必须能渲染出**非白内容**：回归"解密后整页空白"。
+// 样本页左上角有一段文字，正常渲染必有若干深色像素（R<200）；全白即视为空白 bug。
+std::string g_render_detail;
+bool renders_nonblank(lr::Document& doc, std::size_t& dark_out) {
+    lr::PageBitmap bmp;
+    const lr::DocError err = doc.render_page(0, 1.0f, bmp, 8192);
+    if (err != lr::DocError::Ok) {
+        g_render_detail = std::string("render_page 失败：") + std::string(lr::to_string(err)) +
+                          " (" + std::string(doc.last_error()) + ")";
+        dark_out = 0;
+        return false;
+    }
+    const std::uint8_t* px = bmp.samples();
+    const std::size_t n = static_cast<std::size_t>(bmp.width()) *
+                          static_cast<std::size_t>(bmp.height());
+    std::size_t dark = 0;
+    for (std::size_t i = 0; i < n; ++i)
+        if (px[i * 4] < 200) ++dark;
+    dark_out = dark;
+    if (dark == 0) {
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "整页空白：%dx%d 全为浅色像素", bmp.width(), bmp.height());
+        g_render_detail = buf;
+        return false;
+    }
+    return true;
+}
+
 void run_enc_case(const std::wstring& dir, const EncCase& c, const char* password) {
     const std::wstring path = dir + L"\\" + std::wstring(c.name, c.name + std::strlen(c.name));
     if (!file_exists(path)) { skip(c.name, c.why); return; }
@@ -232,6 +260,11 @@ void run_enc_case(const std::wstring& dir, const EncCase& c, const char* passwor
         lr::DocumentInfo info;
         if (doc.info(info) != lr::DocError::Ok || info.page_count != 1) {
             fail(c.name, c.why, "打开后 info/页数异常");
+            return;
+        }
+        std::size_t dark = 0;
+        if (!renders_nonblank(doc, dark)) {
+            fail(c.name, c.why, g_render_detail.c_str());
             return;
         }
         pass(c.name, c.why);
@@ -262,6 +295,11 @@ void run_enc_case(const std::wstring& dir, const EncCase& c, const char* passwor
     lr::DocumentInfo info;
     if (doc.info(info) != lr::DocError::Ok || info.page_count != 1) {
         fail(c.name, c.why, "解锁后 info/页数异常");
+        return;
+    }
+    std::size_t dark = 0;
+    if (!renders_nonblank(doc, dark)) {
+        fail(c.name, c.why, g_render_detail.c_str());
         return;
     }
     pass(c.name, c.why);
@@ -483,8 +521,8 @@ void run_render_cases(const std::wstring& dir) {
     const std::uint8_t* pe = be.samples();
     if (pn[0] > 200) pass("real.pdf", "正常：背景为白");
     else fail("real.pdf", "正常：背景为白", "像素不符");
-    if (pi[0] < 55) pass("real.pdf", "反色：背景变黑");
-    else fail("real.pdf", "反色：背景变黑", "像素不符");
+    if (pi[0] > 8 && pi[0] < 80) pass("real.pdf", "反色：背景变深灰（柔化，非纯黑）");
+    else fail("real.pdf", "反色：背景变深灰（柔化，非纯黑）", "像素不符");
     if (pi[3] == 255 && pn[3] == 255) pass("real.pdf", "反色保留 alpha=255");
     else fail("real.pdf", "反色保留 alpha=255", "alpha 被改");
     if (pe[0] > pe[2]) pass("real.pdf", "护眼：背景为暖色（R>B）");

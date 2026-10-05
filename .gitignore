@@ -24,6 +24,9 @@ tests/_build/
 # vcpkg local state
 vcpkg_installed/
 
+# Editor（个人 IDE 配置，含本机绝对路径，不入库）
+.vscode/
+
 # OS
 Thumbs.db
 Desktop.ini

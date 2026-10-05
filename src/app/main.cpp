@@ -72,6 +72,11 @@ HWND g_hwnd = nullptr;
 ImGuiStyle g_base_style;
 bool g_base_style_ready = false;
 
+// 主题由下方 apply_theme_colors() 定义；此处前置声明，供 apply_ui_scale 在重算样式后
+// 重新套用当前主题（g_base_style 里存的是浅色默认值）。
+void apply_theme_colors();
+extern bool g_theme_applied;
+
 void apply_ui_scale() {
     if (!g_base_style_ready) return;
     ImGuiStyle& st = ImGui::GetStyle();
@@ -79,6 +84,7 @@ void apply_ui_scale() {
     st.ScaleAllSizes(ui_scale());      // 内边距/间距/圆角/滚动条（不含字体）
     st.FontScaleMain = g_user_scale;   // 字体：主缩放（将来交给用户设置）
     st.FontScaleDpi = g_dpi_scale;     // 字体：DPI 缩放（自动）
+    if (g_theme_applied) apply_theme_colors();  // 覆盖 g_base_style 里的浅色配色
 }
 
 // 读取窗口所在显示器的 DPI 缩放；变化时重算样式。仅在帧间调用（改样式不能跨帧）。
@@ -103,17 +109,86 @@ constexpr float  kCanvasMarginPx = 18.0f;   // 画布四周留白（**屏幕像�
 // 故随缩放线性变化；**刻意不过 px()**：它要与页面同比例，不该随 DPI 单独放大。
 constexpr float  kCanvasGapRatio = 0.013f;
 
-// ---- 主题色（浅色阅读器） ----
-constexpr ImU32 kColBackdrop = IM_COL32(228, 231, 235, 255);  // 页面区背景
-constexpr ImU32 kColChrome = IM_COL32(242, 244, 246, 255);    // 状态栏背景
-constexpr ImU32 kColPageBorder = IM_COL32(0, 0, 0, 46);
-constexpr ImU32 kColPlaceholder = IM_COL32(246, 247, 249, 255);
-constexpr ImU32 kColPlaceholderBorder = IM_COL32(200, 204, 210, 255);
-constexpr ImU32 kColPlaceholderText = IM_COL32(130, 134, 140, 255);
-constexpr ImU32 kColFailed = IM_COL32(252, 238, 238, 255);
-constexpr ImU32 kColFailedBorder = IM_COL32(220, 150, 150, 255);
-constexpr ImU32 kColChromeText = IM_COL32(60, 64, 70, 255);
-constexpr ImU32 kColChromeDim = IM_COL32(120, 126, 134, 255);
+// ---- 主题色 ----
+// 阅读器有两套 chrome 配色：默认浅色；**反色模式下整套界面也转深色**（否则页面变暗、
+// 四周仍亮，暗色阅读没有实际意义）。画布/状态栏是自绘的，故颜色不写死在常量里，
+// 而是放进可切换的调色板 g_pal。
+struct Palette {
+    ImU32 backdrop;          // 页面区背景
+    ImU32 chrome;            // 状态栏背景
+    ImU32 page_border;       // 页面描边
+    ImU32 placeholder;       // 页占位填充
+    ImU32 placeholder_border;
+    ImU32 placeholder_text;
+    ImU32 failed;
+    ImU32 failed_border;
+    ImU32 chrome_text;       // 状态栏主文字
+    ImU32 chrome_dim;        // 状态栏次要文字
+};
+
+constexpr Palette kPalLight{
+    IM_COL32(228, 231, 235, 255), IM_COL32(242, 244, 246, 255),
+    IM_COL32(0, 0, 0, 46),        IM_COL32(246, 247, 249, 255),
+    IM_COL32(200, 204, 210, 255), IM_COL32(130, 134, 140, 255),
+    IM_COL32(252, 238, 238, 255), IM_COL32(220, 150, 150, 255),
+    IM_COL32(60, 64, 70, 255),    IM_COL32(120, 126, 134, 255),
+};
+
+constexpr Palette kPalDark{
+    IM_COL32(23, 24, 28, 255),    IM_COL32(32, 33, 38, 255),
+    IM_COL32(255, 255, 255, 40),  IM_COL32(38, 39, 44, 255),
+    IM_COL32(70, 72, 80, 255),    IM_COL32(150, 154, 162, 255),
+    IM_COL32(60, 36, 38, 255),    IM_COL32(150, 80, 80, 255),
+    IM_COL32(210, 213, 218, 255), IM_COL32(140, 145, 152, 255),
+};
+
+Palette g_pal = kPalLight;
+bool    g_dark_theme = false;          // 当前是否为深色 chrome（反色模式）
+bool    g_theme_applied = false;       // g_pal / ImGui 颜色是否已按 g_dark_theme 应用
+
+// 把 ImGui 控件配色设成浅色/深色。自绘部分用 g_pal，不在这里。
+void apply_theme_colors() {
+    ImGuiStyle& st = ImGui::GetStyle();
+    if (g_dark_theme) {
+        st.Colors[ImGuiCol_Text]                  = ImVec4(0.86f, 0.87f, 0.89f, 1.00f);
+        st.Colors[ImGuiCol_TextDisabled]          = ImVec4(0.52f, 0.55f, 0.59f, 1.00f);
+        st.Colors[ImGuiCol_WindowBg]              = ImVec4(0.09f, 0.09f, 0.11f, 1.00f);
+        st.Colors[ImGuiCol_ChildBg]               = ImVec4(0.09f, 0.09f, 0.11f, 1.00f);
+        st.Colors[ImGuiCol_PopupBg]               = ImVec4(0.12f, 0.12f, 0.14f, 0.98f);
+        st.Colors[ImGuiCol_Border]                = ImVec4(0.26f, 0.27f, 0.30f, 1.00f);
+        st.Colors[ImGuiCol_FrameBg]               = ImVec4(0.18f, 0.19f, 0.22f, 1.00f);
+        st.Colors[ImGuiCol_FrameBgHovered]        = ImVec4(0.24f, 0.25f, 0.29f, 1.00f);
+        st.Colors[ImGuiCol_FrameBgActive]         = ImVec4(0.28f, 0.29f, 0.33f, 1.00f);
+        st.Colors[ImGuiCol_TitleBg]               = ImVec4(0.09f, 0.09f, 0.11f, 1.00f);
+        st.Colors[ImGuiCol_TitleBgActive]         = ImVec4(0.12f, 0.12f, 0.14f, 1.00f);
+        st.Colors[ImGuiCol_Button]                = ImVec4(0.20f, 0.21f, 0.25f, 1.00f);
+        st.Colors[ImGuiCol_ButtonHovered]         = ImVec4(0.28f, 0.30f, 0.34f, 1.00f);
+        st.Colors[ImGuiCol_ButtonActive]          = ImVec4(0.34f, 0.36f, 0.41f, 1.00f);
+        st.Colors[ImGuiCol_Header]                = ImVec4(0.22f, 0.24f, 0.28f, 1.00f);
+        st.Colors[ImGuiCol_HeaderHovered]         = ImVec4(0.28f, 0.30f, 0.35f, 1.00f);
+        st.Colors[ImGuiCol_HeaderActive]          = ImVec4(0.33f, 0.35f, 0.41f, 1.00f);
+        st.Colors[ImGuiCol_Separator]             = ImVec4(0.26f, 0.27f, 0.30f, 1.00f);
+        st.Colors[ImGuiCol_Tab]                   = ImVec4(0.15f, 0.16f, 0.19f, 1.00f);
+        st.Colors[ImGuiCol_TabHovered]            = ImVec4(0.28f, 0.30f, 0.35f, 1.00f);
+        st.Colors[ImGuiCol_TabSelected]           = ImVec4(0.24f, 0.26f, 0.31f, 1.00f);
+        st.Colors[ImGuiCol_ScrollbarBg]           = ImVec4(0.09f, 0.09f, 0.11f, 1.00f);
+        st.Colors[ImGuiCol_ScrollbarGrab]         = ImVec4(0.30f, 0.32f, 0.36f, 1.00f);
+        st.Colors[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.37f, 0.39f, 0.44f, 1.00f);
+        st.Colors[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.43f, 0.45f, 0.50f, 1.00f);
+    } else {
+        ImGui::StyleColorsLight(&st);
+    }
+}
+
+// 依据配色模式决定 chrome 明暗；只在需要时真正改动。
+void sync_theme(int color_mode) {
+    const bool want_dark = (color_mode == 1);
+    if (g_theme_applied && want_dark == g_dark_theme) return;
+    g_dark_theme = want_dark;
+    g_pal = want_dark ? kPalDark : kPalLight;
+    apply_theme_colors();
+    g_theme_applied = true;
+}
 
 // ---------------- D3D11（RAII） ----------------
 struct Graphics {
@@ -274,6 +349,7 @@ std::vector<lr::OutlineItem> g_outline;
 
 // ---- 加密密码对话框（Phase 5）----
 bool        g_open_password = false;
+bool        g_auth_pending = false;  // 认证请求在途：弹窗保持打开、背景不变，避免闪烁
 char        g_password_buf[256] = {};
 std::string g_password_error;
 
@@ -441,7 +517,8 @@ void reset_doc_state() {
     g_color_mode = 0;
     g_show_sidebar = false;
     g_open_password = false;
-    g_password_buf[0] = '\0';
+    g_auth_pending = false;
+    std::memset(g_password_buf, 0, sizeof g_password_buf);  // 明文密码整个缓冲清零（ADR-039）
     g_password_error.clear();
     update_title();
 }
@@ -505,6 +582,7 @@ void request_open_document(std::wstring path) {
     g_canvas = lr::Canvas{};
     g_outline.clear();
     g_show_sidebar = false;
+    g_auth_pending = false;  // 新开文档：清掉上一次可能残留的认证在途标记
     g_doc_key = lr::document_key(path);  // 0 = 取不到属性（不存在等）
 
     // 本地即时判定：不存在 / 不在支持清单内（不必浪费一次线程往返）
@@ -535,7 +613,9 @@ void close_document() {
 }
 
 void poll_document() {
-    if (g_doc.kind != UiDoc::Kind::Opening) return;
+    // 认证请求在途时，文档仍停在 NeedsPassword，但请求已投出，需要在这里接收结果。
+    const bool awaiting_auth = (g_doc.kind == UiDoc::Kind::NeedsPassword && g_auth_pending);
+    if (g_doc.kind != UiDoc::Kind::Opening && !awaiting_auth) return;
 
     const lr::DocState snap = g_renderer->doc_state();
     if (snap.id != g_doc.request_id) return;  // 已被更新的请求取代
@@ -546,21 +626,25 @@ void poll_document() {
         g_doc.kind = UiDoc::Kind::Reading;
         g_doc.info = snap.info;
         g_doc.error = lr::DocError::Ok;
+        g_auth_pending = false;
+        g_open_password = false;
+        std::memset(g_password_buf, 0, sizeof g_password_buf);  // 解锁成功：明文密码不再需要（ADR-039）
         enter_reading();
         break;
     case lr::DocPhase::Failed:
         g_doc.error = snap.error;
         g_doc.detail_u8 = snap.detail_u8;
         if (snap.error == lr::DocError::NeedsPassword) {
-            // 加密文档：弹密码框（文档仍处于打开态，可继续 authenticate）
+            // 密码错误：**保持弹窗打开**（只更新错误提示），不关→开跳变，避免闪烁。
             g_doc.kind = UiDoc::Kind::NeedsPassword;
+            g_auth_pending = false;
             g_open_password = true;
-            g_password_buf[0] = '\0';
             g_password_error = snap.detail_u8.find("invalid password") != std::string::npos
                                    ? "密码错误，请重试"
                                    : std::string();
         } else {
             g_doc.kind = UiDoc::Kind::Failed;
+            g_auth_pending = false;
         }
         break;
     default:  // Idle：被显式关闭
@@ -572,11 +656,11 @@ void poll_document() {
 
 void submit_password() {
     if (g_password_buf[0] == '\0') { g_password_error = "请输入密码"; return; }
-    g_doc.kind = UiDoc::Kind::Opening;
-    g_doc.request_id = g_renderer->authenticate(g_password_buf);
-    g_open_password = false;
+    // 保持 kind=NeedsPassword（背景不变）、弹窗不关闭：认证结果由 poll_document 接收。
+    // 这样"解锁/输错"都不会出现弹窗关闭再打开的闪烁。
+    g_auth_pending = true;
     g_password_error.clear();
-    std::memset(g_password_buf, 0, sizeof g_password_buf);
+    g_doc.request_id = g_renderer->authenticate(g_password_buf);
 }
 
 // ---------------- 窗口状态校验 ----------------
@@ -772,15 +856,15 @@ void emit_wants() {
 void draw_page_placeholder(ImDrawList* dl, const ImVec2& pmin, const ImVec2& pmax,
                            const lr::PageSlot& s) {
     const bool failed = (s.status == lr::PageStatus::Failed);
-    dl->AddRectFilled(pmin, pmax, failed ? kColFailed : kColPlaceholder);
-    dl->AddRect(pmin, pmax, failed ? kColFailedBorder : kColPlaceholderBorder);
+    dl->AddRectFilled(pmin, pmax, failed ? g_pal.failed : g_pal.placeholder);
+    dl->AddRect(pmin, pmax, failed ? g_pal.failed_border : g_pal.placeholder_border);
     // 失败占位提示"点击重试"（Phase 4）：命中测试在 draw_canvas_area 里做（见 retry 注释）
     const char* txt = failed ? "渲染失败 · 点击重试"
                              : (s.status == lr::PageStatus::Loading ? "载入中…" : "");
     if (txt[0] != '\0') {
         const ImVec2 ts = ImGui::CalcTextSize(txt);
         dl->AddText(ImVec2((pmin.x + pmax.x - ts.x) * 0.5f, (pmin.y + pmax.y - ts.y) * 0.5f),
-                    kColPlaceholderText, txt);
+                    g_pal.placeholder_text, txt);
     }
 }
 
@@ -810,7 +894,7 @@ void draw_canvas_area() {
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(origin, ImVec2(origin.x + size.x, origin.y + size.y), kColBackdrop);
+    dl->AddRectFilled(origin, ImVec2(origin.x + size.x, origin.y + size.y), g_pal.backdrop);
 
     const bool hovered = ImGui::IsWindowHovered();
     g_canvas_hovered = hovered;
@@ -866,7 +950,7 @@ void draw_canvas_area() {
         if (s.texture != nullptr) {
             dl->AddImage(static_cast<ImTextureID>(reinterpret_cast<std::intptr_t>(s.texture)),
                          pmin, pmax);
-            dl->AddRect(pmin, pmax, kColPageBorder);
+            dl->AddRect(pmin, pmax, g_pal.page_border);
         } else {
             draw_page_placeholder(dl, pmin, pmax, s);
         }
@@ -887,7 +971,7 @@ void draw_status_bar() {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos();
     const ImVec2 ws = ImGui::GetWindowSize();
-    dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + ws.y), kColChrome);
+    dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + ws.y), g_pal.chrome);
 
     const int total = g_canvas.page_count();
     // 页码用画布游标（到底时即末行首页），而不是 visible_first()：后者在
@@ -916,11 +1000,11 @@ void draw_status_bar() {
     if (current_page_has_bookmark()) right += "   ·   ★";
 
     ImGui::SetCursorPos(ImVec2(px(10), (bar_h - ImGui::GetTextLineHeight()) * 0.5f));
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColChromeText), "%s", left.c_str());
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_pal.chrome_text), "%s", left.c_str());
 
     const float rw = ImGui::CalcTextSize(right.c_str()).x;
     ImGui::SetCursorPos(ImVec2(ws.x - rw - px(10), (bar_h - ImGui::GetTextLineHeight()) * 0.5f));
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColChromeDim), "%s", right.c_str());
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim), "%s", right.c_str());
 
     ImGui::EndChild();
 }
@@ -1113,13 +1197,20 @@ void draw_bookmarks_tab() {
         return;
     }
     ImGui::BeginChild("##bm_list", ImVec2(0, 0), false);
+    // × 按钮与 Selectable 同排：Selectable 默认铺满整行，其命中区会盖住后面的按钮，
+    // 导致按钮点不到。给 Selectable 显式留出按钮 + 间距的宽度，两者命中区不再重叠。
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float btn_w = ImGui::CalcTextSize("×").x + style.FramePadding.x * 2.0f;
+    const float sel_w =
+        std::max(px(40.0f), ImGui::GetContentRegionAvail().x - btn_w - style.ItemSpacing.x);
     int del = -1;
     for (int i = 0; i < static_cast<int>(r->bookmarks.size()); ++i) {
         const lr::Bookmark& b = r->bookmarks[i];
         ImGui::PushID(i);
         char label[64];
         std::snprintf(label, sizeof label, "第 %d 页", b.page + 1);
-        if (ImGui::Selectable(label, b.page == cur)) g_canvas.scroll_to_page(b.page, 0.0f);
+        if (ImGui::Selectable(label, b.page == cur, 0, ImVec2(sel_w, 0)))
+            g_canvas.scroll_to_page(b.page, 0.0f);
         ImGui::SameLine();
         if (ImGui::SmallButton("×")) del = i;
         ImGui::PopID();
@@ -1178,24 +1269,38 @@ void draw_sidebar() {
 
 // ---------------- 密码对话框（Phase 5） ----------------
 void draw_password_popup() {
-    if (!g_open_password) return;
+    if (!g_open_password) {
+        // 认证成功后需把上一个模态真正关掉，否则它会继续吞输入/绘制
+        if (ImGui::IsPopupOpen("需要密码") &&
+            ImGui::BeginPopupModal("需要密码", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        return;
+    }
     if (!ImGui::IsPopupOpen("需要密码")) ImGui::OpenPopup("需要密码");
     if (ImGui::BeginPopupModal("需要密码", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Text("此文档已加密，请输入密码：");
         ImGui::TextDisabled("%s", g_doc.name_u8.c_str());
         ImGui::SetNextItemWidth(px(260));
         if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        // 认证在途时禁用交互并提示"验证中…"，弹窗保持打开（不再关→开跳变）。
+        ImGui::BeginDisabled(g_auth_pending);
         const bool enter = ImGui::InputText("##pwd", g_password_buf, sizeof g_password_buf,
                                             ImGuiInputTextFlags_Password |
                                             ImGuiInputTextFlags_EnterReturnsTrue);
-        if (!g_password_error.empty())
+        ImGui::EndDisabled();
+        if (g_auth_pending)
+            ImGui::TextDisabled("验证中…");
+        else if (!g_password_error.empty())
             ImGui::TextColored(ImVec4(0.9f, 0.35f, 0.35f, 1.0f), "%s", g_password_error.c_str());
+        ImGui::BeginDisabled(g_auth_pending);
         const bool ok = enter || ImGui::Button("解锁");
         ImGui::SameLine();
         const bool cancel = ImGui::Button("取消");
+        ImGui::EndDisabled();
         if (ok) {
             submit_password();
-            ImGui::CloseCurrentPopup();
         } else if (cancel) {
             g_open_password = false;
             ImGui::CloseCurrentPopup();
@@ -1220,6 +1325,7 @@ void draw_shell() {
     poll_document();
     g_renderer->drain_retired();  // 帧首：释放上一帧退役的纹理
     update_ime_association();     // 输入法关联随文本输入激活状态切换（ADR-028）
+    sync_theme(g_color_mode);     // 反色模式下整套 chrome 转深色（含 ImGui 控件配色）
 
     if (ImGui::IsKeyPressed(ImGuiKey_F3, false)) g_show_debug ^= 1;
 
@@ -1269,7 +1375,9 @@ void draw_shell() {
 
     // Esc：密码框 → 关闭并放弃文档；跳页弹窗 → 关弹窗；有文档 → 关闭返回引导页；无文档 → 退出
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-        if (g_open_password) {
+        if (g_auth_pending) {
+            // 认证请求在途，忽略 Esc，避免状态错乱
+        } else if (g_open_password) {
             g_open_password = false;
             close_document();
         } else if (g_open_jump) {

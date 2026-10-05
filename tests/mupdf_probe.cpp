@@ -26,6 +26,10 @@ struct Result {
     bool  opened = false;
     int   pages = 0;
     int   caught = 0;
+    int   needs_pw = -1;   // -1 未查；0/1（认证前）
+    int   auth = -1;       // fz_authenticate_password 原始返回值（-1 未尝试；非 0 = 成功）
+    int   dark = -1;       // -1 未渲染；>=0 深色像素数（R<200）
+    int   rend_err = 0;    // 渲染时捕获的错误码（0 = 无）
     char  format[64] = {};
     char  message[256] = {};
     float w = 0.0f, h = 0.0f;
@@ -35,14 +39,25 @@ constexpr std::size_t kFormatCap = sizeof(Result::format);
 constexpr std::size_t kMessageCap = sizeof(Result::message);
 
 // 返回 void + 出参：避免 setjmp 干扰 MSVC 的返回值分析（曾导致 C4715 与运行时崩溃）
+//
+// 除识别外还做一次"解锁 + 渲染一页"的探针（样本口令固定为 lilith）：
+//   用于定位"加密文档解锁后整页空白"这类只在解密路径出现的问题。
+//   **纪律**：认证成功后不得再调用 fz_needs_password() —— MuPDF 1.26.10 上那会
+//   破坏解密状态，让内容流静默解出乱码（渲染成空白），见 ADR-041。
 void probe(fz_context* ctx, const wchar_t* path, const char* magic, Result& out) noexcept {
     fz_stream*   stm = nullptr;
     fz_document* doc = nullptr;
+    fz_page*     pg = nullptr;
+    fz_pixmap*   pix = nullptr;
+    fz_device*   dev = nullptr;
     Result       r;
 
     fz_try(ctx) {
         fz_var(stm);
         fz_var(doc);
+        fz_var(pg);
+        fz_var(pix);
+        fz_var(dev);
         fz_var(r);
 
         stm = fz_open_file_w(ctx, path);
@@ -52,16 +67,42 @@ void probe(fz_context* ctx, const wchar_t* path, const char* magic, Result& out)
         r.opened = true;
         if (fz_lookup_metadata(ctx, doc, FZ_META_FORMAT, r.format, kFormatCap) < 0)
             std::strncpy(r.format, "(unsupported)", kFormatCap - 1);
+        r.needs_pw = fz_needs_password(ctx, doc) ? 1 : 0;
+        r.auth = r.needs_pw ? fz_authenticate_password(ctx, doc, "lilith") : 1;
         r.pages = fz_count_pages(ctx, doc);
         if (r.pages > 0) {
-            fz_page* p = fz_load_page(ctx, doc, 0);
-            const fz_rect b = fz_bound_page(ctx, p);
-            fz_drop_page(ctx, p);
+            pg = fz_load_page(ctx, doc, 0);
+            const fz_rect b = fz_bound_page(ctx, pg);
             r.w = b.x1 - b.x0;
             r.h = b.y1 - b.y0;
+            if (r.auth != 0) {
+                const fz_matrix m = fz_scale(1.0f, 1.0f);
+                const fz_irect ib = fz_round_rect(fz_transform_rect(b, m));
+                pix = fz_new_pixmap_with_bbox(ctx, fz_device_rgb(ctx), ib, nullptr, 1);
+                fz_clear_pixmap_with_value(ctx, pix, 0xFF);
+                dev = fz_new_draw_device(ctx, m, pix);
+                fz_run_page(ctx, pg, dev, fz_identity, nullptr);
+                fz_close_device(ctx, dev);
+                fz_drop_device(ctx, dev);
+                dev = nullptr;
+                const int dw = fz_pixmap_width(ctx, pix);
+                const int dh = fz_pixmap_height(ctx, pix);
+                const int stride = fz_pixmap_stride(ctx, pix);
+                unsigned char* sp = fz_pixmap_samples(ctx, pix);
+                int dark = 0;
+                for (int y = 0; y < dh; ++y) {
+                    unsigned char* row = sp + static_cast<std::size_t>(y) * stride;
+                    for (int x = 0; x < dw; ++x)
+                        if (row[x * 4] < 200) ++dark;
+                }
+                r.dark = dark;
+            }
         }
     }
     fz_always(ctx) {
+        if (dev) fz_drop_device(ctx, dev);
+        if (pix) fz_drop_pixmap(ctx, pix);
+        if (pg) fz_drop_page(ctx, pg);
         if (stm) {
             fz_drop_stream(ctx, stm);
             stm = nullptr;
@@ -81,8 +122,12 @@ void report(const char* magic, const Result& r) {
     char m2[16] = {};
     std::snprintf(m2, sizeof m2, "%s", magic[0] ? magic : "\"\"");
     if (r.opened) {
-        std::printf("      magic=%-7s => OPEN  format=%-16s pages=%-4d %.0fx%.0f pt\n",
-                    m2, r.format, r.pages, r.w, r.h);
+        char extra[96] = {};
+        if (r.needs_pw >= 0)
+            std::snprintf(extra, sizeof extra, "  pw=%d auth=%d dark=%d",
+                          r.needs_pw, r.auth, r.dark);
+        std::printf("      magic=%-7s => OPEN  format=%-16s pages=%-4d %.0fx%.0f pt%s\n",
+                    m2, r.format, r.pages, r.w, r.h, extra);
     } else {
         std::printf("      magic=%-7s => FAIL  err[%d] %s\n", m2, r.caught, r.message);
     }

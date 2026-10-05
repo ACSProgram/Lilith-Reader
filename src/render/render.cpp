@@ -124,6 +124,7 @@ struct Renderer::Impl {
         int           auto_retries = 0;      // 本轮失败已消耗的自动重试次数
         bool          manual_retry = false;  // UI 请求重试（点击失败占位）
         float         failed_scale = -1.0f;  // 定格失败时的倍率（用于识别"新请求"）
+        bool          stale = false;         // 视图变换已变、本纹理待重渲（仍可显示，不闪白）
     };
 
     std::vector<Entry>  pages;
@@ -240,15 +241,29 @@ struct Renderer::Impl {
             e.slot.error = DocError::Ok;
             e.auto_retries = 0;
             e.failed_scale = -1.0f;
+            e.stale = false;
         }
         for (Entry& e : thumbs) {
             retire_thumb_locked(e);
             e.slot.status = PageStatus::Unloaded;
             e.slot.error = DocError::Ok;
+            e.stale = false;
         }
         last_wants.clear();
         last_thumb_pages.clear();
         last_thumb_px = -1;
+    }
+
+    // 仅配色变化时调用（旋转会改版面，仍走 invalidate_all_locked）：
+    // **保留已驻留纹理继续显示**，只把它们标记为 stale 让下一轮调度重渲；
+    // 新纹理就绪后由 publish_loaded 原地换入 —— 全程无白屏（ADR-024 精神、ADR-042）。
+    void mark_all_stale_locked() {
+        for (Entry& e : pages) {
+            e.stale = true;
+            e.auto_retries = 0;    // 给重渲一次全新机会（含此前失败的页）
+            e.failed_scale = -1.0f;
+        }
+        for (Entry& e : thumbs) e.stale = true;
     }
 
     void publish_doc(const DocState& s) {
@@ -417,17 +432,19 @@ struct Renderer::Impl {
         // 2) 按字节预算逐出（纯策略：lilithreader.page_cache::select_evictions）
         evict_to_budget(wanted);
 
-        // 3) 渲染缺失/不够清晰的页（按 wants 顺序，可见页在前）
+        // 3) 渲染缺失/不够清晰/已因视图变换而 stale 的页（按 wants 顺序，可见页在前）
         for (const RenderWant& x : w) {
             if (x.page < 0 || !(x.scale > 0.0f)) continue;
             if (static_cast<std::size_t>(x.page) >= pages.size()) continue;
             PageSlot cur;
+            bool stale = false;
             {
                 std::lock_guard lock(mtx);
                 cur = pages[static_cast<std::size_t>(x.page)].slot;
+                stale = pages[static_cast<std::size_t>(x.page)].stale;
             }
-            if (cur.status == PageStatus::Loaded && cur.scale >= x.scale * 0.999f)
-                continue;  // 已够清晰
+            if (!stale && cur.status == PageStatus::Loaded && cur.scale >= x.scale * 0.999f)
+                continue;  // 已够清晰且未过期
             render_one(x.page, x.scale);
         }
     }
@@ -460,6 +477,7 @@ struct Renderer::Impl {
             e.slot.error = DocError::Ok;
             e.auto_retries = 0;          // 逐出即"从未渲染"，下次请求给全新额度
             e.failed_scale = -1.0f;
+            e.stale = false;
             ++evictions;
         }
     }
@@ -484,6 +502,7 @@ struct Renderer::Impl {
                 e.manual_retry = false;
                 e.auto_retries = 0;  // 手动重试重置额度
             }
+            e.stale = false;         // 本次已开始重渲：不再视为"待重渲"
             // 只改状态，绝不动 texture/scale —— 重渲染期间 UI 继续显示旧纹理，不闪白。
             e.slot.status = PageStatus::Loading;
             e.slot.error = DocError::Ok;
@@ -545,6 +564,7 @@ struct Renderer::Impl {
         e.auto_retries = 0;
         e.manual_retry = false;
         e.failed_scale = -1.0f;
+        e.stale = false;
         used_bytes += bytes;
     }
 
@@ -567,11 +587,13 @@ struct Renderer::Impl {
         for (int p : list) {
             if (p < 0 || static_cast<std::size_t>(p) >= thumbs.size()) continue;
             PageSlot cur;
+            bool stale = false;
             {
                 std::lock_guard lock(mtx);
                 cur = thumbs[static_cast<std::size_t>(p)].slot;
+                stale = thumbs[static_cast<std::size_t>(p)].stale;
             }
-            if (cur.status == PageStatus::Loaded && cur.scale > 0.0f) continue;
+            if (!stale && cur.status == PageStatus::Loaded && cur.scale > 0.0f) continue;
             render_thumb(p, target_px);
         }
     }
@@ -598,6 +620,7 @@ struct Renderer::Impl {
             Entry& e = thumbs[static_cast<std::size_t>(page)];
             if (e.slot.status == PageStatus::Failed) return;  // 已失败，不再重试
             e.slot.status = PageStatus::Loading;
+            e.stale = false;
         }
 
         PageBitmap bmp;
@@ -687,6 +710,11 @@ std::uint64_t Renderer::authenticate(std::string_view utf8_password) {
     c.password.assign(utf8_password);
     c.id = id;
     impl_->cmd = std::move(c);
+    // 与 open() 一致地把 phase 置为 Opening：否则 UI 会在工作线程真正处理之前，
+    // 读到上一次 open 失败时残留的 Failed，把"正在认证"误判成结果（时序竞态）。
+    impl_->doc.phase = DocPhase::Opening;
+    impl_->doc.error = DocError::Ok;
+    impl_->doc.detail_u8.clear();
     impl_->doc.id = id;
     impl_->cv.notify_all();
     return id;
@@ -787,20 +815,29 @@ void Renderer::set_view_transform(int rotation_deg, ColorMode color_mode) {
 
     std::lock_guard lock(impl_->mtx);
     if (impl_->rotation_ == rot && impl_->color_mode_ == mode) return;
+    const bool rot_changed = (impl_->rotation_ != rot);
     impl_->rotation_ = rot;
     impl_->color_mode_ = mode;
 
-    // 保留本帧请求，作废全部纹理后原样重新投递（触发整篇重渲）。
+    // 保留本帧请求，作废/标记全部纹理后原样重新投递（触发整篇重渲）。
     const std::vector<RenderWant> keep_wants = impl_->last_wants;
     const std::vector<int>        keep_thumbs = impl_->last_thumb_pages;
     const int                     keep_px = impl_->last_thumb_px;
-    impl_->invalidate_all_locked();
-    impl_->last_wants = keep_wants;
+
+    if (rot_changed) {
+        // 旋转会交换版面宽高：旧纹理贴进新框会拉伸错位，只能作废重渲（页码/滚动已在 UI 侧重定位）。
+        impl_->invalidate_all_locked();
+        impl_->last_wants = keep_wants;
+        impl_->last_thumb_pages = keep_thumbs;
+        impl_->last_thumb_px = keep_px;
+    } else {
+        // 仅配色变化：版面不变，**保留旧纹理继续显示**，只标记待重渲，避免整篇瞬间白屏（ADR-042）。
+        impl_->mark_all_stale_locked();
+        // last_wants / last_thumb_pages 保持原值：它们仍是"已投递"记录，去重语义不变。
+    }
     impl_->wants = keep_wants;
     impl_->wants_dirty = !keep_wants.empty();
-    impl_->last_thumb_pages = keep_thumbs;
     impl_->thumb_pages = keep_thumbs;
-    impl_->last_thumb_px = keep_px;
     impl_->thumb_target_px = keep_px > 0 ? keep_px : impl_->thumb_target_px;
     impl_->thumbs_dirty = !keep_thumbs.empty();
     impl_->cv.notify_all();

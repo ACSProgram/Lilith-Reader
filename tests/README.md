@@ -6,7 +6,7 @@
 ## 用法
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(55) + canvas_test(119) + page_cache_test(32) + reader_state_test(43)
+powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(55) + canvas_test(126) + page_cache_test(32) + reader_state_test(43)
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Probe   # 额外跑 MuPDF 诊断探针（打印 FZ_META_FORMAT 等）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # 复用已有 samples/
 ```
@@ -20,7 +20,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # �
 |---|---|
 | `make_samples.py` | 合成 28 个常规样本（合法/改名/归档冒充/损坏，含**异构页尺寸** `mixed_size.pdf` 与**带两级目录** `outline.pdf`）+ 3 个加密 PDF（需 PyMuPDF：`pip install pymupdf`，未装则跳过加密例） |
 | `doc_test.cpp` | 55 例断言表：合法格式、改名放行、归档冒充拒绝、加密三态、扩展名闸门、**逐页尺寸**（形变防线）、**目录解析**（顺序/层级/页号）、**旋转渲染**（0°/180° 尺寸不变、90° 宽高互换）、**配色**（反色背景白→黑且保留 alpha、护眼 R>B） |
-| `canvas_test.cpp` | 119 例断言：fit-width 派生、固定缩放居中、内容尺寸、滚动钳制、以鼠标为锚的缩放定点不变性、命中测试、可见范围、列切换锚定、非均匀页尺寸、缩放钳制、空文档、**翻页游标**（矮页视口不卡住 / 多列按行推进 / 与手动滚动同步）、**页间距随缩放**（ADR-029）、**双页对开**（ADR-038：封面单独居中 / 对开分列 / 按行推进 / `spread=false` 回归守卫 / 切换锚定） |
+| `canvas_test.cpp` | 126 例断言：fit-width 派生、固定缩放居中、内容尺寸、滚动钳制、以鼠标为锚的缩放定点不变性、命中测试、可见范围、列切换锚定、非均匀页尺寸、缩放钳制、空文档、**翻页游标**（矮页视口不卡住 / 多列按行推进 / 与手动滚动同步）、**页间距随缩放**（ADR-029）、**双页对开**（ADR-038：封面单独居中 / 对开分列 / 按行推进 / `spread=false` 回归守卫 / 切换锚定 / **对开与列数同层级互斥**：切列退出对开、`columns` 值保留） |
 | `page_cache_test.cpp` | 32 例断言：预算钳制（0/下限/上限/SIZE_MAX）、自动重试上限与 `should_render_failed`、**LRU 逐出**（最久未用先出、pinned 保护、同序号按下标定序、恰好达标即停、未驻留页跳过、按字节累计）（Phase 4，ADR-030/031） |
 | `reader_state_test.cpp` | 43 例断言（Phase 5，ADR-034）：序列化往返（含书签/确定性）、容器语义（find/upsert/erase）、**坏输入一律安全拒绝**（nullptr/magic/版本/超限/截断）、字段钳制（列/旋转/配色/非法 zoom）、文档键（不存在→0、同路径稳定） |
 | `mupdf_probe.cpp` | 诊断工具：打印 MuPDF 对每个样本的原始判定（页数、`FZ_META_FORMAT`），新增格式支持时先用它摸底 |
