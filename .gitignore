@@ -1,0 +1,25 @@
+# Visual Studio / MSVC
+.vs/
+x64/
+Debug/
+Release/
+*.user
+*.aps
+*.pdb
+*.ilk
+*.obj
+*.iobj
+*.ipdb
+*.log
+
+# Build output
+build/
+out/
+bin/
+
+# vcpkg local state
+vcpkg_installed/
+
+# OS
+Thumbs.db
+Desktop.ini
