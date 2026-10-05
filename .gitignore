@@ -17,6 +17,10 @@ build/
 out/
 bin/
 
+# 自动化测试的生成物（样本集与中间产物；生成脚本 tests/make_samples.py 入库）
+tests/samples/
+tests/_build/
+
 # vcpkg local state
 vcpkg_installed/
 

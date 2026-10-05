@@ -12,8 +12,14 @@ export module lilithreader.utils;
 export namespace lr {
 
 // ---- 受支持的文档格式（渲染核心 Phase 2 经 MuPDF 接入） ----
+//
+// 这是一道**策略闸门**（ADR-013）：只有清单内的扩展名才会进入后台线程，
+// 内容终究交给 MuPDF 按内容识别（识别结果与扩展名不符时如何处置见 ADR-016）。
+// 单页图片（png/jpg/gif/bmp/tif）在 MuPDF 里本就是"1 页文档"，故正式纳入清单。
 inline constexpr std::wstring_view kSupportedExtensions[] = {
     L".pdf", L".epub", L".mobi", L".fb2", L".cbz", L".xps",
+    // 单页图片（ADR-017）
+    L".png", L".jpg", L".jpeg", L".gif", L".bmp", L".tif", L".tiff",
 };
 
 inline std::wstring to_lower(std::wstring s) {

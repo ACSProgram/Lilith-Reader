@@ -53,16 +53,35 @@
     <VcpkgEnableManifest>true</VcpkgEnableManifest>
     <VcpkgTriplet>x64-windows-static</VcpkgTriplet>
     <VcpkgUseStatic>true</VcpkgUseStatic>
+    <!-- 依赖安装根目录（不含 triplet），必须满足两个条件，理由见 ADR-010：
+         1) 路径不含空格 —— meson 端口（harfbuzz）生成的链接命令行未给 /libpath:
+            加引号，路径含空格会被截断成两个参数，导致 LNK1181。
+         2) 不含 triplet —— vcpkg 的 MSBuild 集成把它当作安装根传给 vcpkg
+            （vcpkg 内部再拼一次 triplet），同时又在 _ZVcpkgCurrentInstalledDir
+            里再拼一次；写含 triplet 的路径会导致 include/lib 双重目录、找不到头文件。
+         实际生效路径 = $(VcpkgInstalledDir)\$(VcpkgTriplet)。 -->
+    <VcpkgInstalledDir>F:\programs\.Environment\vcpkg-roots\LilithReader</VcpkgInstalledDir>
+  </PropertyGroup>
+  <!-- MuPDF 兼容宏：vcpkg 的 libmupdf 端口把这些 FZ_ENABLE_ 开头的宏作为私有编译
+       定义传给库（见其 CMakeLists.txt），不会传播给消费方。因此本项目必须镜像
+       同样的取值，否则同一份头文件在两侧展开出不同的结构体布局（最典型的是
+       fz_context 里的 icc_enabled、fz_colorspace 里的 icc 成员），
+       一旦访问到受影响的成员就是静默的 ABI 错位。当前我们只通过指针传递这些
+       不透明类型、未访问任何受保护成员，但镜像成本极低，杜绝后续踩雷。
+       维护提示：升级 libmupdf 端口后需核对端口的 PRIVATE 定义是否变化。 -->
+  <PropertyGroup Label="MuPDFCompatibility">
+    <MupdfCompatDefines>FZ_ENABLE_ICC=0;FZ_ENABLE_JS=0;FZ_ENABLE_BROTLI=0;FZ_ENABLE_DOCX_OUTPUT=0;FZ_ENABLE_ODT_OUTPUT=0</MupdfCompatDefines>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;$(MupdfCompatDefines);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp23</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
-      <AdditionalOptions>%(AdditionalOptions) /utf-8 /bigobj</AdditionalOptions>
+      <AdditionalOptions>%(AdditionalOptions) /utf-8 /bigobj /external:anglebrackets</AdditionalOptions>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <MinimalRebuild>false</MinimalRebuild>
       <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\imgui;$(ProjectDir)..\third_party\implot;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -79,13 +98,14 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;$(MupdfCompatDefines);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp23</LanguageStandard>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
       <Optimization>MaxSpeed</Optimization>
-      <AdditionalOptions>%(AdditionalOptions) /utf-8 /bigobj</AdditionalOptions>
+      <AdditionalOptions>%(AdditionalOptions) /utf-8 /bigobj /external:anglebrackets</AdditionalOptions>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\imgui;$(ProjectDir)..\third_party\implot;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
@@ -100,6 +120,11 @@
   <ItemGroup>
     <ClCompile Include="app\main.cpp" />
     <ClCompile Include="utils\utils.ixx" />
+    <ClCompile Include="document\document.ixx" />
+    <ClCompile Include="document\document.cpp" />
+    <!-- 第三方源码不按本项目的 /W4 标准要求：
+         implot 在 C++23 下会对「不同类型枚举之间的 |」报 C5054（上游写法，非本项目问题）。
+         只关掉这一条，其余警告仍然可见。 -->
     <ClCompile Include="..\third_party\imgui\imgui.cpp" />
     <ClCompile Include="..\third_party\imgui\imgui_draw.cpp" />
     <ClCompile Include="..\third_party\imgui\imgui_tables.cpp" />
@@ -107,9 +132,13 @@
     <ClCompile Include="..\third_party\imgui\imgui_demo.cpp" />
     <ClCompile Include="..\third_party\imgui\backends\imgui_impl_dx11.cpp" />
     <ClCompile Include="..\third_party\imgui\backends\imgui_impl_win32.cpp" />
-    <ClCompile Include="..\third_party\implot\implot.cpp" />
+    <ClCompile Include="..\third_party\implot\implot.cpp">
+      <DisableSpecificWarnings>5054</DisableSpecificWarnings>
+    </ClCompile>
     <ClCompile Include="..\third_party\implot\implot_items.cpp" />
-    <ClCompile Include="..\third_party\implot\implot_demo.cpp" />
+    <ClCompile Include="..\third_party\implot\implot_demo.cpp">
+      <DisableSpecificWarnings>5054</DisableSpecificWarnings>
+    </ClCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
