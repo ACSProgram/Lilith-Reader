@@ -85,6 +85,7 @@ struct Graphics {
     }
 
     void render_frame() {
+        if (!rtv) return;  // resize 失败瞬间可能无渲染目标
         const float clear[4] = { 0.10f, 0.14f, 0.18f, 1.0f };
         context->OMSetRenderTargets(1, &rtv, nullptr);
         context->ClearRenderTargetView(rtv, clear);
@@ -236,7 +237,10 @@ void draw_debug_overlay() {
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNav |
                      ImGuiWindowFlags_NoSavedSettings |
                      ImGuiWindowFlags_NoFocusOnAppearing)) {
-        ImGui::Text("%.1f FPS / %.2f ms", io.Framerate, 1000.0f / io.Framerate);
+        if (io.Framerate > 0.0f)
+            ImGui::Text("%.1f FPS / %.2f ms", io.Framerate, 1000.0f / io.Framerate);
+        else
+            ImGui::TextUnformatted("-- FPS");
         ImGui::TextDisabled("%dx%d @ %.0f%%", (int)io.DisplaySize.x,
                             (int)io.DisplaySize.y, io.FontGlobalScale * 100.0f);
     }
@@ -244,7 +248,7 @@ void draw_debug_overlay() {
 }
 
 void draw_shell(HWND hwnd) {
-    if (ImGui::IsKeyPressed(ImGuiKey_F3)) g_show_debug ^= 1;
+    if (ImGui::IsKeyPressed(ImGuiKey_F3, false)) g_show_debug ^= 1;
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->Pos);
@@ -294,8 +298,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const HDROP drop = reinterpret_cast<HDROP>(wp);
         const UINT len = DragQueryFileW(drop, 0, nullptr, 0);
         if (len > 0 && len < 4096) {
-            std::wstring path(len, L'\0');
+            std::wstring path(len + 1, L'\0');  // 含终止符
             DragQueryFileW(drop, 0, path.data(), len + 1);
+            path.resize(len);
             g_app.open(hwnd, path);
         }
         DragFinish(drop);

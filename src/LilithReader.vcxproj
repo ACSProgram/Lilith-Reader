@@ -40,13 +40,14 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <IntDir>$(SolutionDir)build\LilithReader\$(Configuration)\</IntDir>
-    <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
+    <!-- 注意：不使用 $(SolutionDir)，build.bat 直接编译 vcxproj 时它会解析为 src\ -->
+    <IntDir>$(ProjectDir)..\build\LilithReader\$(Configuration)\</IntDir>
+    <OutDir>$(ProjectDir)..\bin\$(Configuration)\</OutDir>
     <TargetName>LilithReader (Debug)</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IntDir>$(SolutionDir)build\LilithReader\$(Configuration)\</IntDir>
-    <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\build\LilithReader\$(Configuration)\</IntDir>
+    <OutDir>$(ProjectDir)..\bin\$(Configuration)\</OutDir>
   </PropertyGroup>
   <PropertyGroup Label="Vcpkg">
     <VcpkgEnableManifest>true</VcpkgEnableManifest>
