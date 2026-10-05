@@ -23,6 +23,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <string>
 
 import lilithreader.utils;
@@ -297,6 +298,73 @@ void run_gate_cases() {
     }
 }
 
+// ---- 逐页尺寸（异构页尺寸 → 形变的防线）----
+//
+// PDF 允许各页尺寸/纵横比不同。画布按**逐页**尺寸布局；若 document 层只报首页尺寸，
+// 尺寸不一致的 PDF 会被拉伸成首页纵横比而形变（第三轮调试实测）。
+// 这里把"逐页尺寸"本身钉成规格：长度必须等于页数，每页一次 fz_bound_page，
+// 探测失败的页为 {0,0}（上层回退到首页尺寸）。
+struct SizeExpect { float w, h; };
+
+struct SizeCase {
+    const char* name;
+    const char* why;
+    int         count;
+    SizeExpect  pages[8];
+};
+
+const SizeCase kSizeCases[] = {
+    {"real.pdf", "均匀页：各页尺寸 = MediaBox 200x300", 3,
+     {{200, 300}, {200, 300}, {200, 300}}},
+    {"mixed_size.pdf", "异构页：三种纵横比，逐页尺寸必须各不相同", 4,
+     {{612, 792}, {792, 612}, {400, 600}, {612, 792}}},
+};
+
+void run_size_cases(const std::wstring& dir) {
+    std::printf("\n-- 逐页尺寸（异构页尺寸形变防线，%zu 例）--\n",
+                sizeof kSizeCases / sizeof kSizeCases[0]);
+    for (const SizeCase& c : kSizeCases) {
+        const std::wstring path = dir + L"\\" + std::wstring(c.name, c.name + std::strlen(c.name));
+        if (!file_exists(path)) { skip(c.name, c.why); continue; }
+
+        lr::Document doc;
+        if (doc.open(path) != lr::DocError::Ok) { fail(c.name, c.why, "打不开"); continue; }
+        lr::DocumentInfo info;
+        if (doc.info(info) != lr::DocError::Ok) { fail(c.name, c.why, "info 失败"); continue; }
+
+        if (info.page_count != c.count ||
+            static_cast<int>(info.page_sizes.size()) != info.page_count) {
+            char d[200];
+            std::snprintf(d, sizeof d, "逐页尺寸条目数 %zu / 页数 %d，期望 %d",
+                          info.page_sizes.size(), info.page_count, c.count);
+            fail(c.name, c.why, d);
+            continue;
+        }
+        bool ok = true;
+        char d[256] = {};
+        for (int i = 0; i < c.count; ++i) {
+            const float w = info.page_sizes[static_cast<std::size_t>(i)].width_pt;
+            const float h = info.page_sizes[static_cast<std::size_t>(i)].height_pt;
+            if (std::fabs(w - c.pages[i].w) > 0.5f || std::fabs(h - c.pages[i].h) > 0.5f) {
+                std::snprintf(d, sizeof d, "第 %d 页 %.1fx%.1f，期望 %.1fx%.1f",
+                              i, (double)w, (double)h,
+                              (double)c.pages[i].w, (double)c.pages[i].h);
+                ok = false;
+                break;
+            }
+        }
+        // 首页尺寸字段必须与 page_sizes[0] 一致（画布的 0 尺寸回退依赖它）
+        if (ok && (std::fabs(info.page_width_pt - c.pages[0].w) > 0.5f ||
+                   std::fabs(info.page_height_pt - c.pages[0].h) > 0.5f)) {
+            std::snprintf(d, sizeof d, "首页尺寸字段 %.1fx%.1f 与 page_sizes[0] 不一致",
+                          (double)info.page_width_pt, (double)info.page_height_pt);
+            ok = false;
+        }
+        if (ok) pass(c.name, c.why);
+        else    fail(c.name, c.why, d);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -322,6 +390,7 @@ int main(int argc, char** argv) {
     for (const EncCase& e : kEncCases) run_enc_case(dir, e, "lilith");
 
     run_gate_cases();
+    run_size_cases(dir);
 
     std::printf("\n=== 结果：%d 通过 / %d 失败 / %d 跳过 ===\n", g_pass, g_fail, g_skip);
     if (g_fail > 0) {

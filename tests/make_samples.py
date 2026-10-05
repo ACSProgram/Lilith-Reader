@@ -26,18 +26,29 @@ OWNER_PW = "owner"
 
 # ---------------------------------------------------------------- 基础构造
 
-def minimal_pdf(pages=1, mediabox="0 0 200 300"):
-    """结构合法、xref 正确的多页最小 PDF。"""
+def minimal_pdf(pages=1, mediabox="0 0 200 300", mediaboxes=None):
+    """结构合法、xref 正确的多页最小 PDF。
+
+    mediaboxes 给出时按页指定 MediaBox（用于构造**异构页尺寸**样本）；
+    否则所有页用同一个 mediabox。
+
+    对象编号约定（务必与下面的 append 顺序一致）：
+      1 Catalog / 2 Pages / 3 Resources / 4 Font
+      之后每页占两个对象：Page = 5+2i，Contents 流 = 6+2i
+    """
+    if mediaboxes is not None:
+        assert len(mediaboxes) == pages
     objs = []
-    kids = " ".join(f"{4 + 2 * i} 0 R" for i in range(pages))
+    kids = " ".join(f"{5 + 2 * i} 0 R" for i in range(pages))
     objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
     objs.append(f"<< /Type /Pages /Kids [ {kids} ] /Count {pages} >>".encode())
     objs.append(b"<< /Font << /F1 3 0 R >> >>")
     objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
     for i in range(pages):
+        mb = mediaboxes[i] if mediaboxes is not None else mediabox
         objs.append(
-            f"<< /Type /Page /Parent 2 0 R /MediaBox [ {mediabox} ] "
-            f"/Resources 3 0 R /Contents {5 + 2 * i} 0 R >>".encode()
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [ {mb} ] "
+            f"/Resources 3 0 R /Contents {6 + 2 * i} 0 R >>".encode()
         )
         stream = b"BT /F1 24 Tf 20 150 Td (page) Tj ET"
         objs.append(b"<< /Length " + str(len(stream)).encode()
@@ -202,6 +213,11 @@ def main():
 
     log("== 1. 合法文件 ==")
     write("real.pdf", pdf3)
+    # 异构页尺寸：PDF 允许各页 MediaBox 不同（封面/插页/横向页/扫描裁切不一）。
+    # 画布若只用首页尺寸统一布局，第 2、3 页会被拉伸成首页纵横比 → 形变。
+    # 尺寸刻意取三种不同纵横比（Letter 竖版 / 横版 / 3:2），便于断言逐页尺寸。
+    write("mixed_size.pdf", minimal_pdf(4, mediaboxes=[
+        "0 0 612 792", "0 0 792 612", "0 0 400 600", "0 0 612 792"]))
     write("real.epub", epub)
     write("real.fb2", FB2)
     write("real.xps", xps)

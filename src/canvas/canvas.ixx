@@ -10,8 +10,13 @@
 //   · 页面布局是**纯函数**：page_rect(index, state) → 屏幕矩形。
 //   · 坐标系：文档内部以**点（pt）**为单位，缩放 zoom 表示"每点占多少屏幕像素"
 //     （zoom = 1.0 即 72dpi 原始尺寸）。屏幕坐标 = 内容点坐标 × zoom + 原点偏移。
-//   · margin/gap 是**屏幕像素**常量，换算进文档坐标时除以 zoom，
-//     因此缩放时页间距在视觉上保持恒定（符合阅读器直觉）。
+//   · margin / gap 的单位是**刻意不同**的（ADR-029）：
+//       - margin_px 是**屏幕像素**：它是"窗口边缘的呼吸空间"，属于界面 chrome，
+//         不随缩放变化。缩小时内容通常小于视口而被居中，留白基本不可见。
+//       - gap_ratio 是**列宽的比例**（文档空间）：屏幕间距 = gap_ratio × 列宽 × zoom，
+//         故**随缩放线性变化** —— 缩小时页面变小、间距同比变小，视觉比例恒定。
+//         早期版本 gap 也是屏幕像素常量，缩小时页面变小而间距不变，看起来"间距过大"
+//         （第四轮反馈）。用比例而非固定 pt，是为了让不同页幅的文档视觉比例一致。
 //
 // 本期（Phase 3）简化：**所有页面按统一尺寸布局**（取首页尺寸）。
 //   PDF/EPUB/CBZ 绝大多数页面同尺寸；异构尺寸页的逐页布局留待后续阶段，
@@ -39,8 +44,9 @@ struct CanvasState {
     float scroll_y = 0.0f;
     int   columns = 1;        // 1~4 列
     bool  fit_width = true;   // true：zoom 由视口宽度派生（使整行恰好铺满宽度）
-    float margin_px = 16.0f;  // 内容四周留白（屏幕像素）
-    float gap_px = 12.0f;     // 页间/列间间距（屏幕像素）
+    float margin_px = 16.0f;   // 内容四周留白（**屏幕像素**；界面 chrome，不随缩放变化）
+    float gap_ratio = 0.013f;  // 页/列间距，占**列宽（最宽页）的比例**；屏幕间距 = 该值 × 列宽 × zoom，
+                               // 故随缩放线性变化（ADR-029）
 };
 
 // 页面在屏幕上的矩形
@@ -58,9 +64,15 @@ inline constexpr int   kMaxColumns = 4;
 
 // ---- 画布 ----
 //
-// 无隐藏状态：除一份**可失效的派生缓存**（内容尺寸、行顶前缀和）外，
-// 所有输出都由 (state, viewport, 页尺寸) 唯一决定。缓存只在影响布局的
+// 布局本身**无隐藏状态**：除一份可失效的派生缓存（内容尺寸、行顶前缀和）外，
+// 所有布局输出都由 (state, viewport, 页尺寸) 唯一决定。缓存只在影响布局的
 // 输入变化时失效；滚动不失效（滚动只影响原点，不影响布局）。
+//
+// 唯一的例外是**阅读游标 nav_row_**：它是"当前读第几行"，只服务于翻页与页码指示，
+// **不参与任何布局计算**。之所以必须存在，是因为当视口比"一行"还高时（横向页 /
+// 缩小 / 多列），末尾若干行的 row_top 会超过 max_scroll_y，**无法**被对齐到视口顶部；
+// 若翻页游标只能由滚动位置反推，就会在末行前反复无进展（"卡住"），
+// 或在"到底显示末页"与"反推回前一行"之间来回跳（详见 docs/history/phase3-画布.md §8）。
 class Canvas {
 public:
     Canvas() = default;
@@ -71,7 +83,7 @@ public:
     void set_page_sizes(std::vector<PageSizePt> sizes);      // 逐页尺寸（留待后续阶段）
     void set_default_size(PageSizePt size);                  // 未提供尺寸的页回退值
     void set_state(const CanvasState& s);                    // 原样写入（不钳制）
-    void set_margin_gap(float margin_px, float gap_px);
+    void set_margin_gap(float margin_px, float gap_ratio);   // 单位不同，见文件头 ADR-029
 
     [[nodiscard]] const CanvasState& state() const noexcept { return state_; }
     [[nodiscard]] CanvasState& mutable_state() noexcept { dirty_ = true; return state_; }
@@ -101,15 +113,26 @@ public:
     [[nodiscard]] float  row_height_px(int row) const;
     [[nodiscard]] PageRect page_rect(int index) const;
 
-    // 命中测试：内容坐标 y（px）落在哪一行 → 返回该行首页；越界返回 -1
+    // 命中测试：内容坐标 y（px）落在哪一行 / 哪一页；越界返回 -1
+    [[nodiscard]] int row_at_content_y(float content_y_px) const;
     [[nodiscard]] int page_at_content_y(float content_y_px) const;
     // 视口内可见页范围（含）；无内容返回 first>last
     [[nodiscard]] int visible_first() const;
     [[nodiscard]] int visible_last() const;
 
+    // ---- 阅读游标（翻页与页码指示用；不参与布局） ----
+    //
+    // current_row() 即 nav_row_：由翻页/跳页/列切换直接设定；手动滚动（滚轮/拖拽/
+    // 缩放）后按"视口顶部所在行"回同步，**已滚到底部时取末行**（到底时末行常常
+    // 够不到视口顶部，这样页码才会显示末页而不是倒数第二页）。
+    [[nodiscard]] int current_row() const;   // 空文档返回 -1
+    [[nodiscard]] int current_page() const;  // current_row() 的首个页；空文档返回 -1
+
     // ---- 操作（只改 state；内部按需钳制） ----
     void clamp_scroll();
     void scroll_by(float dx_px, float dy_px);
+    // 翻行：dir > 0 下一行，dir < 0 上一行（单列即翻页）。已在首/末行时为无操作。
+    void scroll_rows(int dir);
     // 以屏幕点 (anchor_sx, anchor_sy) 为不动点缩放到 z（切到固定缩放模式）
     void set_zoom(float z, float anchor_sx, float anchor_sy);
     // 以屏幕点为不动点乘以倍率
@@ -124,6 +147,8 @@ public:
 private:
     void ensure_layout() const;                 // 重算派生缓存
     [[nodiscard]] PageSizePt size_of(int i) const;
+    [[nodiscard]] int row_from_scroll() const;  // 由滚动位置反推当前行（到底取末行）
+    void sync_nav_row();                        // nav_row_ ← row_from_scroll()
 
     // ---- 输入 ----
     float viewport_w_ = 0.0f;
@@ -131,6 +156,9 @@ private:
     CanvasState state_{};
     std::vector<PageSizePt> sizes_;
     PageSizePt default_{ 595.0f, 842.0f };      // 缺省 A4（仅 sizes_ 为空或条目为 0 时使用）
+
+    // 阅读游标（行号）：只服务翻页与页码指示，**不参与布局**。见类头说明。
+    int nav_row_ = 0;
 
     // ---- 派生缓存（mutable：ensure_layout 为 const） ----
     mutable bool  dirty_ = true;

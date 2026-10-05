@@ -26,6 +26,7 @@ module;
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 export module lilithreader.document;
 
@@ -59,6 +60,14 @@ enum class DocError : std::int32_t {
                                             std::string_view ext_utf8) noexcept;
 
 // ---- 文档元信息 ----
+
+// 单页尺寸（点）。与 canvas 的 PageSizePt 是**同名不同型**的两个结构：
+// 两模块互不 import（ADR-003），由 app 层做一次转换。
+struct PageSize {
+    float width_pt = 0.0f;
+    float height_pt = 0.0f;
+};
+
 struct DocumentInfo {
     int    page_count = 0;
     float  page_width_pt = 0.0f;   // 首页宽度（点，1 点 = 1/72 英寸）
@@ -70,6 +79,18 @@ struct DocumentInfo {
     // "PDF 1.7" / "EPUB" / "FictionBook2" / "XPS" / "zip"（CBZ 报归档格式）/ "Image"。
     // 有了它，UI 就能在"扩展名与实际不符"时如实告知用户（ADR-016）。
     std::string format;
+    // **逐页**尺寸（点）。**长度 = page_count**；探测失败的那一页为 {0,0}；
+    // **整表为空**表示未探测（页数超过上限，见 document.cpp 的 kMaxSizeProbePages），
+    // 上层应回退到"用首页尺寸统一布局"。
+    //
+    // 为什么必须有：PDF 允许各页尺寸/纵横比不同（封面页、插页、横向页、扫描裁切不一）。
+    // 画布若只用首页尺寸统一布局，渲染出的各页纹理会被拉伸进"首页纵横比"的矩形，
+    // 于是**尺寸不一致的 PDF 会形变**（第三轮调试实测确认）。上层用本表调
+    // canvas.set_page_sizes()，行高取行内最大、每页按自身纵横比绘制，形变消失。
+    //
+    // 探测成本：每页一次 fz_load_page + fz_bound_page（不跑内容流，不解码图像），
+    // 实测约 20µs/页；单页损坏只让该页回退为 {0,0}，不影响整篇打开。
+    std::vector<PageSize> page_sizes;
 };
 
 class Document;  // 前向声明：PageBitmap 需要它作为工厂友元

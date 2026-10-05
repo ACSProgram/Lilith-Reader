@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <shellscalingapi.h>
+#include <imm.h>          // ImmAssociateContext：让阅读窗口脱离输入法（ADR-028）
 #include <d3d11.h>
 #include <dxgi.h>
 
@@ -48,12 +49,55 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"LilithReaderWnd";
 constexpr wchar_t kWindowTitle[] = L"Lilith Reader";
 
-// ---- 画布交互参数 ----
+// ---- 界面缩放（DPI）----
+//
+// 所有"屏幕像素"设计值都以 **100% 缩放（96dpi）** 为基准，运行时统一过 px()。
+//   · g_dpi_scale  自动：窗口所在显示器的 DPI（WM_DPICHANGED 时刷新）
+//   · g_user_scale 手动：用户字号/界面缩放（将来的"全局设置"驱动，现固定 1.0）
+// 字体不在这里乘，而是交给 ImGui 的 style.FontScaleDpi / FontScaleMain —— 1.92 起的
+// 动态字体系统会按新尺寸重新栅格化，比手工改字号更不容易漏掉某处文本。
+float g_dpi_scale = 1.0f;
+float g_user_scale = 1.0f;
+
+inline float ui_scale() { return g_dpi_scale * g_user_scale; }
+inline float px(float base) { return base * ui_scale(); }
+
+HWND g_hwnd = nullptr;
+
+// 未缩放的 ImGui 基准样式（CreateContext 后立即留底；每次缩放都从它重算，避免累积）
+ImGuiStyle g_base_style;
+bool g_base_style_ready = false;
+
+void apply_ui_scale() {
+    if (!g_base_style_ready) return;
+    ImGuiStyle& st = ImGui::GetStyle();
+    st = g_base_style;
+    st.ScaleAllSizes(ui_scale());      // 内边距/间距/圆角/滚动条（不含字体）
+    st.FontScaleMain = g_user_scale;   // 字体：主缩放（将来交给用户设置）
+    st.FontScaleDpi = g_dpi_scale;     // 字体：DPI 缩放（自动）
+}
+
+// 读取窗口所在显示器的 DPI 缩放；变化时重算样式。仅在帧间调用（改样式不能跨帧）。
+void refresh_dpi_scale() {
+    if (!g_hwnd) return;
+    const float dpi = ImGui_ImplWin32_GetDpiScaleForHwnd(g_hwnd);
+    if (dpi > 0.0f && std::fabs(dpi - g_dpi_scale) > 0.001f) {
+        g_dpi_scale = dpi;
+        apply_ui_scale();
+    }
+}
+
+// ---- 画布交互参数（基准像素，用前过 px()）----
+constexpr float  kUiFontBasePx = 20.0f;    // UI 基准字号（×FontScaleMain×FontScaleDpi 后为实际像素）
 constexpr float  kScrollStepPx = 120.0f;   // 每格滚轮滚动的屏幕像素
 constexpr float  kKeyScrollPx = 80.0f;     // 方向键每次滚动的屏幕像素
 constexpr float  kZoomStep = 1.15f;        // 每格 Ctrl+滚轮 / 每次 +/- 的缩放倍率
 constexpr double kZoomDebounceSec = 0.15;  // 缩放稳定后触发高清重渲染的等待时间
-constexpr float  kStatusBarH = 30.0f;      // 底部状态栏高度
+constexpr float  kStatusBarH = 34.0f;      // 底部状态栏高度
+constexpr float  kCanvasMarginPx = 18.0f;   // 画布四周留白（**屏幕像素**，随 DPI 缩放）
+// 页/列间距：占**列宽**的比例（文档空间，ADR-029）。屏幕间距 = 比例 × 列宽 × zoom，
+// 故随缩放线性变化；**刻意不过 px()**：它要与页面同比例，不该随 DPI 单独放大。
+constexpr float  kCanvasGapRatio = 0.013f;
 
 // ---- 主题色（浅色阅读器） ----
 constexpr ImU32 kColBackdrop = IM_COL32(228, 231, 235, 255);  // 页面区背景
@@ -149,12 +193,21 @@ struct ImGuiRaii {
         // LilithReader.ini 自管，故直接禁用。
         io.IniFilename = nullptr;
 
-        // 中文字体：系统微软雅黑（Phase 6 换为 exe 内嵌子集字体）
-        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 18.0f,
+        // 留底未缩放的基准样式：apply_ui_scale() 每次从它重算，避免多次缩放累积。
+        g_base_style = ImGui::GetStyle();
+        g_base_style_ready = true;
+
+        // 中文字体：系统微软雅黑（Phase 6 换为 exe 内嵌子集字体）。
+        // 这里给的是**基准字号**；实际渲染尺寸 = 基准 × FontScaleMain × FontScaleDpi。
+        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", kUiFontBasePx,
             nullptr, io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
 
         win32 = ImGui_ImplWin32_Init(hwnd);
         dx11 = ImGui_ImplDX11_Init(g_gfx.device, g_gfx.context);
+
+        // DPI：按窗口所在显示器缩放字体与界面度量（100% 时为 1.0，等价于旧行为）
+        refresh_dpi_scale();
+        apply_ui_scale();
     }
 
     void new_frame() {
@@ -185,7 +238,6 @@ struct UiDoc {
     std::uint64_t request_id = 0;
 } g_doc;
 
-HWND g_hwnd = nullptr;
 std::wstring g_ini_path;
 bool g_show_debug = false;
 bool g_fullscreen = false;
@@ -195,6 +247,16 @@ WINDOWPLACEMENT g_prev_placement{ sizeof(WINDOWPLACEMENT) };
 float  g_want_scale = -1.0f;         // 已投递给渲染层的倍率；<0 表示尚未初始化
 float  g_last_target_scale = -1.0f;  // 上一帧的目标倍率
 double g_zoom_dirty_since = -1.0;    // 目标倍率最后一次变化的时刻；<0 表示无待定
+
+// 画布留白/间距当前所依据的界面缩放值；与 ui_scale() 不一致时才重新下发
+// （set_margin_gap 会让布局缓存失效，不能每帧无条件调用）。
+float g_canvas_scale = -1.0f;
+
+// 画布悬停/焦点状态：**仅供 F3 诊断显示**，不参与任何逻辑分支。
+// 键盘快捷键不再以焦点为门（见 handle_canvas_input 上方注释），保留这两个量是为了
+// 将来再遇到"某个键没反应"时能一眼看出是焦点问题还是别的（第四轮就是靠它排除了焦点假设）。
+bool g_canvas_hovered = false;
+bool g_canvas_focused = false;
 
 // 跳页弹窗
 bool g_open_jump = false;
@@ -225,6 +287,7 @@ void reset_doc_state() {
     g_want_scale = -1.0f;
     g_last_target_scale = -1.0f;
     g_zoom_dirty_since = -1.0;
+    g_canvas_scale = -1.0f;
     update_title();
 }
 
@@ -235,15 +298,35 @@ void enter_reading() {
     sz.h = g_doc.info.page_height_pt > 0.0f ? g_doc.info.page_height_pt : 842.0f;
 
     lr::CanvasState st;  // 默认：fit_width=true, columns=1
+    st.margin_px = px(kCanvasMarginPx);   // 屏幕像素 → 随 DPI
+    st.gap_ratio = kCanvasGapRatio;       // 列宽比例 → 随缩放（ADR-029），不随 DPI
+
     g_canvas = lr::Canvas{};
     g_canvas.set_default_size(sz);
-    g_canvas.set_uniform(g_doc.info.page_count, sz);
+
+    // 逐页真实尺寸：PDF 允许各页尺寸/纵横比不同（封面、插页、横向页、扫描裁切不一）。
+    // 若只用首页尺寸统一布局，各页纹理会被拉伸进"首页纵横比"的矩形 → 异构 PDF 形变。
+    // 尺寸探测失败的页为 {0,0}，此处按首页尺寸回退。
+    std::vector<lr::PageSizePt> sizes;
+    sizes.reserve(g_doc.info.page_sizes.size());
+    for (const lr::PageSize& ps : g_doc.info.page_sizes) {
+        lr::PageSizePt e;
+        e.w = ps.width_pt > 0.0f ? ps.width_pt : sz.w;
+        e.h = ps.height_pt > 0.0f ? ps.height_pt : sz.h;
+        sizes.push_back(e);
+    }
+    if (sizes.empty())
+        g_canvas.set_uniform(g_doc.info.page_count, sz);
+    else
+        g_canvas.set_page_sizes(std::move(sizes));
+
     g_canvas.set_state(st);
     g_canvas.clamp_scroll();
 
     g_want_scale = -1.0f;  // 首帧立即采用目标倍率，不走防抖
     g_last_target_scale = -1.0f;
     g_zoom_dirty_since = -1.0;
+    g_canvas_scale = ui_scale();  // 留白已按当前缩放写入
 }
 
 void request_open_document(std::wstring path) {
@@ -345,19 +428,37 @@ void toggle_fullscreen() {
 }
 
 // ---------------- 画布输入 ----------------
-void scroll_by_rows(int dir) {
-    const int cur = g_canvas.visible_first();
-    const int row = g_canvas.row_of(cur);
-    const int target_row = row + dir;
-    if (target_row < 0) { g_canvas.scroll_to_page(0, 0.0f); return; }
-    if (target_row >= g_canvas.rows()) {
-        g_canvas.scroll_to_page(g_canvas.page_count() - 1, 0.0f);
-        return;
-    }
-    g_canvas.scroll_to_page(g_canvas.first_page_in_row(target_row), 0.0f);
+// 翻行/翻页的几何计算全在画布层（纯函数、可单测，见 canvas_test 的 scroll_rows 用例）。
+// UI 层只做转发：不再像早期版本那样用 visible_first() 自行推算目标行 —— 那正是
+// "视口高于一行时末页反复卡住"的根因（已由阅读游标修掉，见 ADR-023 与 canvas.ixx）。
+void scroll_by_rows(int dir) { g_canvas.scroll_rows(dir); }
+
+// 列数快捷键：主键盘 1~4 与小键盘 1~4；未按返回 0。
+// 两者在 ImGui 里是**不同的键**（主键盘 ImGuiKey_1..9、小键盘 ImGuiKey_Keypad1..9），
+// 必须分别判断 —— 否则"小键盘按了没反应"（第四轮反馈点名了这一点）。
+int pressed_column_key() {
+    if (ImGui::IsKeyPressed(ImGuiKey_1, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_Keypad1, false)) return 1;
+    if (ImGui::IsKeyPressed(ImGuiKey_2, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_Keypad2, false)) return 2;
+    if (ImGui::IsKeyPressed(ImGuiKey_3, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_Keypad3, false)) return 3;
+    if (ImGui::IsKeyPressed(ImGuiKey_4, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_Keypad4, false)) return 4;
+    return 0;
 }
 
-void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered, bool focused) {
+// 键盘快捷键**刻意不以 ImGui 窗口焦点为门**（第四轮调试修复，ADR-026）：
+//   1. 窗口结构是「无边框 shell 根窗口 + ##canvas 子窗口」，两者都带
+//      ImGuiWindowFlags_NoNav（= NoNavInputs | NoNavFocus）。NoNavFocus 使 ImGui
+//      在窗口出现时**不**把它设为 g.NavWindow，于是**启动后、首次点进画布之前
+//      ImGui::IsWindowFocused() 恒为 false** —— 这段时间里所有快捷键（含 1/2/3/4
+//      切列）全是死的，必须先点一下画布。用户反馈"按 1234 不切列"即由此而来。
+//   2. 快捷键是**应用级语义**（整个窗口只有一个阅读视图），本就不该由 ImGui 的窗口
+//      焦点决定；跳页弹窗/调试浮层出现时焦点会移走，同样会让快捷键莫名失效。
+// 故此处只以「无文本输入（io.WantTextInput）」为门；阅读态与跳页弹窗由调用方保证。
+// 鼠标（滚轮/拖拽）仍需悬停在画布上，与键盘分开判断。
+void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered) {
     ImGuiIO& io = ImGui::GetIO();
     const float cx = size.x * 0.5f;
     const float cy = size.y * 0.5f;
@@ -368,20 +469,20 @@ void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered,
             g_canvas.zoom_by(std::pow(kZoomStep, io.MouseWheel),
                              io.MousePos.x - origin.x, io.MousePos.y - origin.y);
         } else {
-            g_canvas.scroll_by(0.0f, -io.MouseWheel * kScrollStepPx);
+            g_canvas.scroll_by(0.0f, -io.MouseWheel * px(kScrollStepPx));
         }
     }
 
-    // 左键拖拽平移
+    // 左键拖拽平移（位移直接取鼠标物理像素增量，不做缩放换算）
     if (hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
         g_canvas.scroll_by(-io.MouseDelta.x, -io.MouseDelta.y);
     }
 
-    if (!focused) return;
+    if (io.WantTextInput) return;  // 有文本输入在跑：键盘归它（正常情况被 g_open_jump 拦住）
 
     const float vh = size.y;
-    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true))  g_canvas.scroll_by(0.0f, kKeyScrollPx);
-    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true))    g_canvas.scroll_by(0.0f, -kKeyScrollPx);
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true))  g_canvas.scroll_by(0.0f, px(kKeyScrollPx));
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true))    g_canvas.scroll_by(0.0f, -px(kKeyScrollPx));
     if (ImGui::IsKeyPressed(ImGuiKey_PageDown, true))   g_canvas.scroll_by(0.0f, vh * 0.9f);
     if (ImGui::IsKeyPressed(ImGuiKey_PageUp, true))     g_canvas.scroll_by(0.0f, -vh * 0.9f);
     if (ImGui::IsKeyPressed(ImGuiKey_Home, false))      g_canvas.scroll_to_page(0, 0.0f);
@@ -390,23 +491,21 @@ void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered,
     if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) scroll_by_rows(+1);
     if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true))  scroll_by_rows(-1);
 
-    if (ImGui::IsKeyPressed(ImGuiKey_1, false)) g_canvas.set_columns(1);
-    if (ImGui::IsKeyPressed(ImGuiKey_2, false)) g_canvas.set_columns(2);
-    if (ImGui::IsKeyPressed(ImGuiKey_3, false)) g_canvas.set_columns(3);
-    if (ImGui::IsKeyPressed(ImGuiKey_4, false)) g_canvas.set_columns(4);
+    const int cols = pressed_column_key();
+    if (cols != 0) g_canvas.set_columns(cols);
 
     if (ImGui::IsKeyPressed(ImGuiKey_F, false)) g_canvas.fit_to_width();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_0, false)) g_canvas.fit_to_width();
     if (ImGui::IsKeyPressed(ImGuiKey_Equal, true) ||
-        (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, true)))
+        ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, true))
         g_canvas.zoom_by(kZoomStep, cx, cy);
     if (ImGui::IsKeyPressed(ImGuiKey_Minus, true) ||
-        (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, true)))
+        ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, true))
         g_canvas.zoom_by(1.0f / kZoomStep, cx, cy);
 
     if (ImGui::IsKeyPressed(ImGuiKey_G, false)) {
         g_open_jump = true;
-        g_jump_page = g_canvas.visible_first() + 1;
+        g_jump_page = g_canvas.current_page() + 1;
     }
     if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) toggle_fullscreen();
 }
@@ -479,21 +578,29 @@ void draw_page_placeholder(ImDrawList* dl, const ImVec2& pmin, const ImVec2& pma
 
 void draw_canvas_area() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::BeginChild("##canvas", ImVec2(0, -kStatusBarH), false,
+    ImGui::BeginChild("##canvas", ImVec2(0, -px(kStatusBarH)), false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
                       ImGuiWindowFlags_NoNav);
     ImGui::PopStyleVar();
 
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const ImVec2 size = ImGui::GetContentRegionAvail();
+
+    // DPI/界面缩放变化时同步画布留白（只在不一致时下发：set_margin_gap 会让布局缓存失效，
+    // 每帧无条件调用会毁掉"滚动不重算布局"的 O(1) 性质）。间距是列宽比例，与 DPI 无关。
+    if (g_canvas_scale != ui_scale()) {
+        g_canvas.set_margin_gap(px(kCanvasMarginPx), kCanvasGapRatio);
+        g_canvas_scale = ui_scale();
+    }
     g_canvas.set_viewport(size.x, size.y);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(origin, ImVec2(origin.x + size.x, origin.y + size.y), kColBackdrop);
 
     const bool hovered = ImGui::IsWindowHovered();
-    const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-    if (!g_open_jump) handle_canvas_input(origin, size, hovered, focused);
+    g_canvas_hovered = hovered;
+    g_canvas_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    if (!g_open_jump) handle_canvas_input(origin, size, hovered);
 
     update_want_scale();
     emit_wants();
@@ -525,8 +632,9 @@ void draw_canvas_area() {
 }
 
 void draw_status_bar() {
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 4));
-    ImGui::BeginChild("##status", ImVec2(0, kStatusBarH), false,
+    const float bar_h = px(kStatusBarH);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(10), px(4)));
+    ImGui::BeginChild("##status", ImVec2(0, bar_h), false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
                       ImGuiWindowFlags_NoNav);
     ImGui::PopStyleVar();
@@ -537,7 +645,9 @@ void draw_status_bar() {
     dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + ws.y), kColChrome);
 
     const int total = g_canvas.page_count();
-    const int cur = std::min(total, g_canvas.visible_first() + 1);
+    // 页码用画布游标（到底时即末行首页），而不是 visible_first()：后者在
+    // 视口高于一行时会停在末行前一行，页码会与所见不符（详见 canvas.ixx）。
+    const int cur = std::min(total, std::max(1, g_canvas.current_page() + 1));
 
     std::string left = g_doc.name_u8.empty() ? "(未命名)" : g_doc.name_u8;
     if (!g_doc.info.format.empty() &&
@@ -555,11 +665,11 @@ void draw_status_bar() {
                   static_cast<int>(std::lround(g_canvas.effective_zoom() * 100.0f)),
                   g_canvas.state().columns);
 
-    ImGui::SetCursorPos(ImVec2(10, (kStatusBarH - ImGui::GetTextLineHeight()) * 0.5f));
+    ImGui::SetCursorPos(ImVec2(px(10), (bar_h - ImGui::GetTextLineHeight()) * 0.5f));
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColChromeText), "%s", left.c_str());
 
     const float rw = ImGui::CalcTextSize(right).x;
-    ImGui::SetCursorPos(ImVec2(ws.x - rw - 10.0f, (kStatusBarH - ImGui::GetTextLineHeight()) * 0.5f));
+    ImGui::SetCursorPos(ImVec2(ws.x - rw - px(10), (bar_h - ImGui::GetTextLineHeight()) * 0.5f));
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColChromeDim), "%s", right);
 
     ImGui::EndChild();
@@ -574,7 +684,8 @@ constexpr ImVec4 kColWarn{ 0.95f, 0.72f, 0.42f, 1.0f };
 void centered_text(const char* text, float dy, const ImVec4& col) {
     const ImVec2 ws = ImGui::GetWindowSize();
     const ImVec2 ts = ImGui::CalcTextSize(text);
-    ImGui::SetCursorPos(ImVec2((ws.x - ts.x) * 0.5f, (ws.y - ts.y) * 0.5f + dy));
+    // dy 是基准像素偏移，随界面缩放（否则高 DPI 下多行文本会挤在一起）
+    ImGui::SetCursorPos(ImVec2((ws.x - ts.x) * 0.5f, (ws.y - ts.y) * 0.5f + dy * ui_scale()));
     ImGui::TextColored(col, "%s", text);
 }
 
@@ -625,7 +736,7 @@ void draw_rejected() {
 // ---------------- 调试浮层 ----------------
 void draw_debug_overlay() {
     const ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(px(12), px(12)), ImGuiCond_Always);
     if (ImGui::Begin("##debug", nullptr, ImGuiWindowFlags_NoDecoration |
                      ImGuiWindowFlags_AlwaysAutoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNav |
@@ -635,8 +746,10 @@ void draw_debug_overlay() {
             ImGui::Text("%.1f FPS / %.2f ms", io.Framerate, 1000.0f / io.Framerate);
         else
             ImGui::TextUnformatted("-- FPS");
-        ImGui::TextDisabled("%dx%d @ %.0f%%", (int)io.DisplaySize.x,
-                            (int)io.DisplaySize.y, io.FontGlobalScale * 100.0f);
+        ImGui::TextDisabled("%dx%d  dpi %.0f%%  ui %.0f%%  font %.0fpx",
+                            (int)io.DisplaySize.x, (int)io.DisplaySize.y,
+                            (double)(g_dpi_scale * 100.0f), (double)(g_user_scale * 100.0f),
+                            (double)ImGui::GetFontSize());
 
         static const char* kKindNames[] = { "none", "rejected", "opening", "reading", "failed" };
         ImGui::Separator();
@@ -653,11 +766,17 @@ void draw_debug_overlay() {
             ImGui::Text("zoom: %.3f (want %.3f)", g_canvas.effective_zoom(), g_want_scale);
             ImGui::Text("vis: %d..%d  rows: %d", g_canvas.visible_first(),
                         g_canvas.visible_last(), g_canvas.rows());
+            ImGui::Text("cur: page %d  row %d", g_canvas.current_page(),
+                        g_canvas.current_row());
             ImGui::Text("scroll: %.0f, %.0f / %.0f, %.0f", g_canvas.state().scroll_x,
                         g_canvas.state().scroll_y, g_canvas.max_scroll_x(),
                         g_canvas.max_scroll_y());
             ImGui::Text("cols: %d  fit: %d", g_canvas.state().columns,
                         g_canvas.state().fit_width ? 1 : 0);
+            // 快捷键**不**看这两个量（ADR-026），列出仅为排查"某个键没反应"时定位用
+            ImGui::TextDisabled("canvas hover %d  focus %d  text-input %d",
+                                g_canvas_hovered ? 1 : 0, g_canvas_focused ? 1 : 0,
+                                ImGui::GetIO().WantTextInput ? 1 : 0);
         }
         if (g_doc.kind == UiDoc::Kind::Failed && !g_doc.detail_u8.empty())
             ImGui::TextDisabled("last_error: %.120s", g_doc.detail_u8.c_str());
@@ -672,7 +791,7 @@ void draw_jump_popup() {
     if (ImGui::BeginPopupModal("跳转页码", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         const int total = std::max(1, g_canvas.page_count());
         ImGui::Text("页码 (1 - %d)", total);
-        ImGui::SetNextItemWidth(140);
+        ImGui::SetNextItemWidth(px(140));
         if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
         const bool enter = ImGui::InputInt("##page", &g_jump_page, 0, 0,
                                            ImGuiInputTextFlags_EnterReturnsTrue);
@@ -751,6 +870,10 @@ void draw_shell() {
 
 // ---------------- 窗口过程 ----------------
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    // 切换输入语言（Alt+Shift / Win+Space）时，系统会给窗口**重新关联**输入法，
+    // 把 ImmAssociateContext(hwnd, nullptr) 的脱离顶掉 —— 这里再脱一次（ADR-028）。
+    // 必须放在 ImGui 后端处理器**之前**：后端会消费 WM_INPUTLANGCHANGE 并 return 1。
+    if (msg == WM_INPUTLANGCHANGE) ImmAssociateContext(hwnd, nullptr);
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return 1;
     switch (msg) {
     case WM_SIZE:
@@ -758,7 +881,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
-        mmi->ptMinTrackSize = { 480, 320 };
+        // 最小窗口尺寸也随界面缩放，否则高 DPI 下会小到放不下内容
+        mmi->ptMinTrackSize = { static_cast<LONG>(px(480)), static_cast<LONG>(px(320)) };
         return 0;
     }
     case WM_DROPFILES: {
@@ -774,6 +898,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_DPICHANGED:
+        // 移到不同 DPI 的显示器：先按新 DPI 重算字体/样式，再按系统建议矩形调整窗口。
+        // 本消息在帧间（消息泵）到达，改样式安全。
+        refresh_dpi_scale();
         if (const RECT* r = reinterpret_cast<const RECT*>(lp))
             SetWindowPos(hwnd, nullptr, r->left, r->top,
                          r->right - r->left, r->bottom - r->top,
@@ -839,6 +966,15 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
     g_renderer = std::make_unique<lr::Renderer>(g_gfx.device);
     g_ui.initialize(g_hwnd);
     DragAcceptFiles(g_hwnd, TRUE);
+
+    // 让阅读窗口脱离输入法（ADR-028）。
+    // 输入法启用时，Windows 会把字母/数字键的 WM_KEYDOWN 换成 VK_PROCESSKEY(0xE5)，
+    // 而 ImGui 的 win32 后端不映射这个键码 → 这些键在 ImGui 里**完全不置位**，
+    // 所有字母/数字快捷键（1~4 切列、F 回 fit-width、G 跳页…）静默失效。
+    // 第四轮实测证据：WM_KEYDOWN 收到 E5 E5 E5 E5、WM_CHAR 收到正常的 '2'。
+    // 本阶段没有任何需要输入法的文本输入（唯一的文本框是纯数字页码），故整窗脱离输入法，
+    // 让键盘回归原生语义。将来加入中文输入（搜索/批注）时，改为"仅在文本输入激活时关联输入法"。
+    ImmAssociateContext(g_hwnd, nullptr);
 
     if (!doc_path.empty()) request_open_document(std::move(doc_path));
 

@@ -157,9 +157,28 @@ struct Renderer::Impl {
         doc = s;
     }
 
-    void set_slot(int page, const PageSlot& s) {
+    // 标记某页进入 Loading：**只改状态，绝不动 texture / scale**。
+    //
+    // 这里是"缩放闪烁"的根因所在（第三轮调试实测）：旧实现在此用 PageSlot{} 覆盖
+    // 整个槽位，于是重渲染一开始旧纹理就从快照里消失 —— UI 先退回"载入中…"占位框，
+    // 等新纹理就绪再换入，肉眼就是闪一下。保留旧纹理后，UI 在重渲染期间继续显示它
+    // （双线性放大，略糊但不闪），新纹理就绪时在同一把锁内原子替换。
+    // 顺带修掉一个更严重的隐患：旧实现把旧 SRV 指针直接覆盖掉、且不入退役队列，
+    // **每重渲染一次就泄漏一个纹理**（缩放越频繁，显存涨得越快）。
+    void mark_loading(int page) {
         std::lock_guard lock(mtx);
-        if (page >= 0 && static_cast<std::size_t>(page) < slots.size()) slots[page] = s;
+        if (page >= 0 && static_cast<std::size_t>(page) < slots.size())
+            slots[page].status = PageStatus::Loading;
+    }
+
+    // 标记某页渲染失败：**保留已有纹理**（若曾成功渲染过），宁可继续显示旧图，
+    // 也不要闪回"渲染失败"占位框；从未渲染成功的页 texture 为空，UI 自然显示失败占位。
+    // 下一次 wants 变化会再尝试（Phase 4 补退避与重试次数上限）。
+    void mark_failed(int page, DocError err) {
+        std::lock_guard lock(mtx);
+        if (page < 0 || static_cast<std::size_t>(page) >= slots.size()) return;
+        slots[page].status = PageStatus::Failed;
+        slots[page].error = err;
     }
 
     PageSlot slot_snapshot(int page) const {
@@ -315,29 +334,19 @@ struct Renderer::Impl {
     }
 
     void render_one(int page, float scale) {
-        {
-            PageSlot loading;
-            loading.status = PageStatus::Loading;
-            set_slot(page, loading);
-        }
+        mark_loading(page);  // 保留旧纹理，见 mark_loading 注释
 
         PageBitmap bmp;
         const DocError err = doc_engine.render_page(page, scale, bmp);
         if (err != DocError::Ok) {
-            PageSlot failed;
-            failed.status = PageStatus::Failed;
-            failed.error = err;
-            set_slot(page, failed);
+            mark_failed(page, err);
             return;
         }
 
         ID3D11ShaderResourceView* srv = nullptr;
         if (!create_page_texture(device, bmp.samples(), bmp.width(), bmp.height(),
                                  bmp.stride(), &srv)) {
-            PageSlot failed;
-            failed.status = PageStatus::Failed;
-            failed.error = DocError::Internal;
-            set_slot(page, failed);
+            mark_failed(page, DocError::Internal);
             return;
         }
 
@@ -350,7 +359,7 @@ struct Renderer::Impl {
 
         std::lock_guard lock(mtx);
         if (page >= 0 && static_cast<std::size_t>(page) < slots.size()) {
-            retire_locked(slots[page].texture);
+            retire_locked(slots[page].texture);  // 旧纹理入退役队列（由 UI 帧首释放）
             slots[page] = loaded;
         } else {
             retired.push_back(srv);  // 文档已切换，结果作废

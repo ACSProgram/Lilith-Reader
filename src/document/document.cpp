@@ -147,6 +147,46 @@ float clamp_scale(fz_rect bounds, float scale, int max_dimension) noexcept {
     return s;
 }
 
+// 单页尺寸（点）。失败返回 false，调用方把该页留成 {0,0} 由上层回退。
+//
+// 每页一次独立的 fz_try：页树里混入坏对象（实测有 "non-page object in page tree"）
+// 只让**那一页**探测失败，不会把整篇 info() 拖成错误 —— 与渲染路径的容错粒度一致。
+// 块内只有 fz_* 裸指针 / fz_rect / int 等平凡类型，符合 ADR-009 的 setjmp 纪律。
+bool bound_page_pt(fz_context* ctx, fz_document* doc, int index,
+                   float& w, float& h) noexcept {
+    fz_page* page = nullptr;
+    fz_rect  bounds{};
+    int      ok = 0;
+    fz_try(ctx) {
+        fz_var(page);
+        fz_var(bounds);
+        fz_var(ok);
+        page = fz_load_page(ctx, doc, index);
+        bounds = fz_bound_page(ctx, page);
+        ok = 1;
+    }
+    fz_always(ctx) {
+        if (page) fz_drop_page(ctx, page);
+    }
+    fz_catch(ctx) {
+        ok = 0;
+    }
+    if (ok != 0) {
+        w = bounds.x1 - bounds.x0;
+        h = bounds.y1 - bounds.y0;
+    }
+    return ok != 0;
+}
+
+// 逐页尺寸探测的页数上限。
+//
+// 探测是 O(页数) 的（每页一次 fz_load_page + fz_bound_page，不跑内容流）。
+// 实测代价约 20µs/页（1000 页 ≈ 18ms），正常书籍可忽略；但**损坏或构造的文档**
+// 可能上报天文数字的页数（页树随文件大小膨胀），不设上限就会在"打开"阶段长时间卡住。
+// 超过上限时**不填** page_sizes，上层自然回退到"统一尺寸"布局（该文档的形变防线失效，
+// 但真实书籍远小于此阈值）。
+constexpr int kMaxSizeProbePages = 10000;
+
 // ---- 格式实测（ADR-016） ----
 //
 // MuPDF 的识别比扩展名"聪明"得多：它给每个处理器同时算**内容分**与**扩展名分**，
@@ -680,6 +720,22 @@ DocError Document::info(DocumentInfo& out) const noexcept {
     out.page_height_pt = bounds.y1 - bounds.y0;
     out.title.assign(title);    // C++ 对象操作一律放在 fz_try 之外
     out.format.assign(format);
+
+    // ---- 逐页尺寸 ----
+    // 放在 fz_try 之外：这里要构造 std::vector（longjmp 不会析构它）。
+    // 页 0 直接复用上面已取到的 bounds，省一次 load_page。
+    // 探测失败的页留 {0,0}，上层按首页尺寸回退 —— 画布对 0 尺寸页已有回退逻辑。
+    // 页数超过上限则整表留空（上层回退统一尺寸），理由见 kMaxSizeProbePages。
+    if (pages > 0 && pages <= kMaxSizeProbePages) {
+        out.page_sizes.assign(static_cast<std::size_t>(pages), PageSize{});
+        if (bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0)
+            out.page_sizes[0] = PageSize{ bounds.x1 - bounds.x0, bounds.y1 - bounds.y0 };
+        for (int i = 1; i < pages; ++i) {
+            float w = 0.0f, h = 0.0f;
+            if (bound_page_pt(s.ctx, s.doc, i, w, h))
+                out.page_sizes[static_cast<std::size_t>(i)] = PageSize{ w, h };
+        }
+    }
     return DocError::Ok;
 }
 
