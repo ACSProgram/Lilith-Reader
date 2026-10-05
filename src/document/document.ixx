@@ -148,9 +148,7 @@ public:
     [[nodiscard]] int width() const noexcept;       // 像素
     [[nodiscard]] int height() const noexcept;      // 像素
     [[nodiscard]] int stride() const noexcept;      // 字节/行（= width * 4）
-    [[nodiscard]] int components() const noexcept;  // 恒为 4
     [[nodiscard]] const std::uint8_t* samples() const noexcept;  // 行主序 RGBA
-    [[nodiscard]] std::size_t size_bytes() const noexcept;
 
     // 实际使用的缩放：若因尺寸上限被下调，这里返回下调后的值
     [[nodiscard]] float effective_scale() const noexcept;
@@ -193,9 +191,6 @@ public:
     // 读取文档目录（outline）。展平为前序序列（depth 表层级，见 OutlineItem）。
     // 无目录时返回 Ok 且 out 为空（不是错误）。需已打开且已解锁。
     DocError outline(std::vector<OutlineItem>& out) const noexcept;
-
-    // 读取第 index 页的尺寸（点）。index 从 0 开始。注意：PDF 各页尺寸可以不同。
-    DocError page_size(int index, float& width_pt, float& height_pt) const noexcept;
 
     // 渲染第 index 页为 RGBA8 位图。
     //   scale        : 1.0 = 72dpi 原始尺寸；2.0 = 144dpi

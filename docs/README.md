@@ -6,13 +6,13 @@
 
 | 任务 | 必读 | 代码起点 |
 | --- | --- | --- |
-| 总体架构、模块边界、线程模型 | [架构设计](02-架构设计.md) | `src/app/main.cpp` |
+| 总体架构、模块边界、线程模型 | [架构设计](02-架构设计.md) | `src/app/app_internal.h`（应用层四 TU 分区）、各 `src/*/*.ixx` |
 | 画布布局（缩放/滚动/网格/阅读游标） | [架构设计 §2](02-架构设计.md) | `src/canvas/canvas.ixx`、`tests/canvas_test.cpp` |
 | 渲染调度、纹理生命周期、页状态机 | [架构设计 §3](02-架构设计.md) | `src/render/render.ixx`、`render.cpp` |
 | MuPDF 封装、错误码、格式识别 | [架构设计 §3](02-架构设计.md)、[决策记录 ADR-009~017](03-决策记录.md) | `src/document/document.ixx`、`document.cpp` |
-| 输入映射与快捷键排查 | [架构设计 §2.2](02-架构设计.md) | `main.cpp` 的 `handle_canvas_input` |
-| 阅读功能（阅读位置/目录/书签/缩略图/旋转/对开/配色/密码） | [架构设计 §6](02-架构设计.md)、[决策记录 ADR-034~040](03-决策记录.md) | `src/app/main.cpp`、`src/state/reader_state.ixx` |
-| 界面外壳（顶栏/主菜单/右键菜单/设置/帮助/主题/图标/动效） | [架构设计 §7](02-架构设计.md)、[决策记录 ADR-045](03-决策记录.md) | `src/app/main.cpp`、`src/app/app.rc` |
+| 输入映射与快捷键排查 | [架构设计 §2.2](02-架构设计.md) | `src/app/session.cpp` 的 `handle_canvas_input` |
+| 阅读功能（阅读位置/目录/书签/缩略图/旋转/对开/配色/密码） | [架构设计 §6](02-架构设计.md)、[决策记录 ADR-034~040](03-决策记录.md) | `src/app/session.cpp`、`src/app/ui.cpp`、`src/state/reader_state.ixx` |
+| 界面外壳（顶栏/主菜单/右键菜单/设置/帮助/主题/图标/动效） | [架构设计 §7](02-架构设计.md)、[决策记录 ADR-045](03-决策记录.md) | `src/app/ui.cpp`、`src/app/platform.cpp`、`src/app/app.rc` |
 | 阶段计划、下一步做什么、风险 | [迁移计划](01-迁移计划.md) | 规划项明确列出的文件 |
 | 体积构成、裁剪手段 | [体积预算](05-体积预算.md) | — |
 | 某个选型"为什么这么做" | [决策记录](03-决策记录.md)（追加式台账，按 ADR 编号查） | — |

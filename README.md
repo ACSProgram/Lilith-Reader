@@ -4,9 +4,9 @@
 
 ## 目标特性
 
-- 单文件 exe（/MT 静态链接，MuPDF 静态库，无 DLL/运行时依赖）；当前 **40.5MB**，其中约 34MB 是
-  MuPDF 内置的 CJK 兜底字体（思源宋体）——中文文档未内嵌字体时的必需资源，构成与裁剪手段见
-  [体积预算](docs/05-体积预算.md)
+- 单文件 exe（/MT 静态链接，MuPDF 静态库，无 DLL/运行时依赖）；当前 **40.8MB**（40,802,816 字节），
+  其中约 34MB 是 MuPDF 内置的 CJK 兜底字体（思源宋体）——中文文档未内嵌字体时的必需资源，
+  构成与裁剪手段见 [体积预算](docs/05-体积预算.md)
 - `LilithReader.exe <文件路径>` 直接打开，可注册"打开方式"双击关联
 - 支持格式：PDF、EPUB、MOBI、FB2、CBZ、XPS 及常见图片（png/jpg/jpeg/gif/bmp/tif/tiff，
   按单页文档打开；`.webp` 无 MuPDF 解码器，不支持）；识别策略为**内容优先**（扩展名不符时
@@ -45,13 +45,14 @@
 ├── AGENTS.md             AI 助手工作规约（文档写入纪律、项目纪律——先读这个）
 ├── docs/                 项目文档（导航见 docs/README.md）
 ├── src/
-│   ├── app/              入口、Win32 窗口、D3D11/ImGui 初始化、命令行参数
+│   ├── app/              应用层（非模块）：入口/窗口、平台底座、会话状态、全部绘制
+│   │                     （main / platform / session / ui + app_internal.h，见架构设计 §1）
 │   ├── document/         MuPDF 封装（Document/页面渲染/线程模型）
 │   ├── canvas/           自研画布（纯布局数学：缩放、平移、网格、滚动、命中测试）
 │   ├── render/           渲染调度：工作线程、页状态机、字节预算 LRU、纹理上传与两段式退役队列、缩略图
 │   ├── state/            阅读状态持久化（reader_state.bin：阅读位置、书签；纯序列化 + 原子写入）
 │   └── utils/            通用工具（路径、编码、扩展名闸门、ini 持久化）
-├── third_party/imgui/    ImGui 源码（从 Lilith 复制后随仓库提交）
+├── third_party/imgui/    ImGui 源码（从 Lilith 复制后随仓库提交；ImPlot 与 imgui_demo 不在构建内）
 ├── tests/                自动化测试（样本合成 + document/canvas 模块断言，`run_tests.ps1` 一键运行）
 ├── assets/               图标、字体子集、资源脚本
 └── vcpkg.json
@@ -63,7 +64,7 @@
 - vcpkg，manifest 模式，triplet `x64-windows-static`；依赖 `libmupdf` 1.26.10
 - MSVC `/MT`（静态 CRT）+ `/O2` + `/utf-8`
 - 构建：VS 打开 `LilithReader.slnx` 直接 F5，或命令行运行 `build.bat`
-- 产出：`bin\Release\LilithReader.exe`（40.5MB，静态 CRT，仅依赖系统组件 DLL）
+- 产出：`bin\Release\LilithReader.exe`（40.8MB，静态 CRT，仅依赖系统组件 DLL）
 
 ### 依赖安装位置（重要）
 

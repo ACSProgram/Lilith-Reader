@@ -104,12 +104,6 @@ int Canvas::row_page_count(int row) const {
     return cnt < cap ? cnt : cap;
 }
 
-int Canvas::row_col_of(int index) const {
-    if (index < 0) return 0;
-    const int row = row_of(index);
-    return index - row_first_page(row);
-}
-
 // ---- 派生缓存 ----
 
 void Canvas::ensure_layout() const {
@@ -134,7 +128,7 @@ void Canvas::ensure_layout() const {
 
     // 解析 zoom。fit_width 把**文档空间**的间距算进分母（ADR-029）：
     //   viewport_w = 2·margin_px + (cols·maxw + (cols−1)·gap_pt) · zoom
-    // 由此仍严格满足"内容宽度恰等于视口宽"（见文件尾的推导注释）。
+    // 解得下面的 z，代回 content_w_px_ 即得 content_w_px_ == viewport_w_（恰铺满宽度）。
     if (state_.fit_width) {
         const float doc_w = static_cast<float>(cols) * maxw +
                             static_cast<float>(cols - 1) * gap_pt;
@@ -149,8 +143,6 @@ void Canvas::ensure_layout() const {
     if (!(eff_zoom_ > 0.0f)) eff_zoom_ = 1.0f;
 
     const float margin_pt = state_.margin_px / eff_zoom_;  // 屏幕像素 → 文档点
-    const float col_w_pt = maxw;
-    const float col_pitch_pt = col_w_pt + gap_pt;
 
     rows_ = compute_rows(n);
     row_heights_pt_.assign(static_cast<std::size_t>(rows_), 0.0f);
@@ -177,11 +169,11 @@ void Canvas::ensure_layout() const {
     }
 
     const float inner_w_pt =
-        static_cast<float>(cols) * col_w_pt + static_cast<float>(cols - 1) * gap_pt;
+        static_cast<float>(cols) * maxw + static_cast<float>(cols - 1) * gap_pt;
     const float inner_h_pt =
         rows_ > 0 ? (row_tops_pt_[static_cast<std::size_t>(rows_)] - margin_pt - gap_pt) : 0.0f;
 
-    // 内容像素尺寸。fit-width 下 content_w_px_ 恒等于 viewport_w_（见头文件注释）。
+    // 内容像素尺寸。fit-width 下由上面的解保证 content_w_px_ == viewport_w_。
     // margin 是屏幕像素，故不参与 × zoom，直接相加。
     content_w_px_ = inner_w_pt * eff_zoom_ + 2.0f * state_.margin_px;
     content_h_px_ = inner_h_pt * eff_zoom_ + 2.0f * state_.margin_px;
@@ -189,29 +181,9 @@ void Canvas::ensure_layout() const {
         content_w_px_ = 0.0f;
         content_h_px_ = 0.0f;
     }
-    (void)col_pitch_pt;
 }
 
 float Canvas::effective_zoom() const { ensure_layout(); return eff_zoom_; }
-
-float Canvas::fit_width_zoom() const {
-    // 独立于当前 fit_width 开关，供 UI 显示与测试使用
-    const int cols = eff_cols();
-    const int n = static_cast<int>(sizes_.size());
-    float maxw = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        const float w = size_of(i).w;
-        if (w > maxw) maxw = w;
-    }
-    if (!(maxw > 0.0f)) maxw = default_.w > 0.0f ? default_.w : 595.0f;
-    const float gap_pt = state_.gap_ratio * maxw;
-    const float doc_w = static_cast<float>(cols) * maxw +
-                        static_cast<float>(cols - 1) * gap_pt;
-    if (!(doc_w > 0.0f)) return 1.0f;
-    const float z = (viewport_w_ - 2.0f * state_.margin_px) / doc_w;
-    if (!(z > 0.0f)) return 0.01f;
-    return clampf(z, 0.01f, 100.0f);
-}
 
 float Canvas::content_width_px() const { ensure_layout(); return content_w_px_; }
 float Canvas::content_height_px() const { ensure_layout(); return content_h_px_; }
@@ -247,8 +219,6 @@ int Canvas::row_of(int index) const {
 }
 
 int Canvas::first_page_in_row(int row) const { return row_first_page(row); }
-
-int Canvas::row_page_begin(int row) const { return first_page_in_row(row); }
 
 int Canvas::row_page_end(int row) const {
     if (row < 0) return -1;

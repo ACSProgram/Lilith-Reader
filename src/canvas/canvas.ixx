@@ -101,7 +101,6 @@ public:
 
     // ---- 派生量 ----
     [[nodiscard]] float effective_zoom() const;              // fit_width 时解析为派生值
-    [[nodiscard]] float fit_width_zoom() const;              // 使整行铺满视口宽度的 zoom
     [[nodiscard]] float content_width_px() const;
     [[nodiscard]] float content_height_px() const;
     [[nodiscard]] float max_scroll_x() const;
@@ -112,8 +111,7 @@ public:
     // ---- 布局 ----
     [[nodiscard]] int    rows() const;
     [[nodiscard]] int    row_of(int index) const;
-    [[nodiscard]] int    first_page_in_row(int row) const;
-    [[nodiscard]] int    row_page_begin(int row) const;      // 同 first_page_in_row
+    [[nodiscard]] int    first_page_in_row(int row) const;   // 该行第一个页
     [[nodiscard]] int    row_page_end(int row) const;        // 该行最后一个页（含）
     [[nodiscard]] float  row_top_px(int row) const;          // 内容坐标
     [[nodiscard]] float  row_height_px(int row) const;
@@ -167,7 +165,6 @@ private:
     [[nodiscard]] int compute_rows(int n) const;
     [[nodiscard]] int row_first_page(int row) const;
     [[nodiscard]] int row_page_count(int row) const;  // 该行页数（1 或 2；网格下 ≤ eff_cols）
-    [[nodiscard]] int row_col_of(int index) const;    // 页在行内的列号（0 基）
 
     // ---- 输入 ----
     float viewport_w_ = 0.0f;

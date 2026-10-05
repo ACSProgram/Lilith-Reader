@@ -726,12 +726,6 @@ DocState Renderer::doc_state() const {
     return impl_->doc;
 }
 
-int Renderer::page_count() const {
-    if (!impl_) return 0;
-    std::lock_guard lock(impl_->mtx);
-    return static_cast<int>(impl_->pages.size());
-}
-
 PageSlot Renderer::slot(int page) const {
     if (!impl_) return {};
     return impl_->slot_snapshot(page);
@@ -841,18 +835,6 @@ void Renderer::set_view_transform(int rotation_deg, ColorMode color_mode) {
     impl_->thumb_target_px = keep_px > 0 ? keep_px : impl_->thumb_target_px;
     impl_->thumbs_dirty = !keep_thumbs.empty();
     impl_->cv.notify_all();
-}
-
-int Renderer::rotation() const {
-    if (!impl_) return 0;
-    std::lock_guard lock(impl_->mtx);
-    return impl_->rotation_;
-}
-
-ColorMode Renderer::color_mode() const {
-    if (!impl_) return ColorMode::Normal;
-    std::lock_guard lock(impl_->mtx);
-    return static_cast<ColorMode>(impl_->color_mode_);
 }
 
 // ---- 缩略图通道（Phase 5）----

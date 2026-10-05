@@ -1,5 +1,5 @@
 // utils.ixx — Lilith Reader 通用工具模块（Phase 1）
-// 路径/扩展名/编码转换/窗口状态 ini 持久化。
+// 路径/编码转换/扩展名闸门 + ini 读写（窗口状态 [window] 与用户偏好 [ui]/[cache]）。
 // 纪律：不抛异常跨边界，所有 Win32 调用失败均有合理回退。
 
 module;
@@ -95,17 +95,11 @@ struct WindowState {
     bool valid = false;  // ini 中存在完整记录
 };
 
-inline int read_ini_int(const std::wstring& ini, const wchar_t* key, int fallback) {
-    wchar_t buf[32]{};
-    const DWORD n = GetPrivateProfileStringW(L"window", key, L"", buf, 32, ini.c_str());
-    if (n == 0 || n >= 31) return fallback;
-    wchar_t* end = nullptr;
-    const long v = wcstol(buf, &end, 10);
-    if (end == buf) return fallback;
-    return static_cast<int>(v);
-}
+// ---- 通用 ini 读写（exe 同目录；节/键由调用方给出） ----
 
-// 通用 ini 整数读取（指定节）。供 [cache] BudgetMB 等设置项使用（Phase 4）。
+inline int read_ini_int(const std::wstring& ini, const wchar_t* key, int fallback);
+
+// 通用 ini 整数读取（指定节）。供 [cache] BudgetMB 与 [window] 等设置项使用。
 // 缺键/非法值返回 fallback；负数与超范围由调用方钳制。
 inline int read_ini_int_ex(const std::wstring& ini, const wchar_t* section,
                            const wchar_t* key, int fallback) {
@@ -116,6 +110,11 @@ inline int read_ini_int_ex(const std::wstring& ini, const wchar_t* section,
     const long v = wcstol(buf, &end, 10);
     if (end == buf) return fallback;
     return static_cast<int>(v);
+}
+
+// [window] 节的整数读取（窗口状态专用，见 load_window_state）。
+inline int read_ini_int(const std::wstring& ini, const wchar_t* key, int fallback) {
+    return read_ini_int_ex(ini, L"window", key, fallback);
 }
 
 // 通用 ini 浮点读取（指定节）。缺键/非法值返回 fallback；范围钳制由调用方负责。

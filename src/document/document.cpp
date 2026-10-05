@@ -460,19 +460,8 @@ int PageBitmap::stride() const noexcept {
     return valid() ? fz_pixmap_stride(impl_->ctx(), impl_->pix) : 0;
 }
 
-int PageBitmap::components() const noexcept {
-    return valid() ? fz_pixmap_components(impl_->ctx(), impl_->pix) : 0;
-}
-
 const std::uint8_t* PageBitmap::samples() const noexcept {
     return valid() ? fz_pixmap_samples(impl_->ctx(), impl_->pix) : nullptr;
-}
-
-std::size_t PageBitmap::size_bytes() const noexcept {
-    const int s = stride();
-    const int h = height();
-    if (s <= 0 || h <= 0) return 0;
-    return static_cast<std::size_t>(s) * static_cast<std::size_t>(h);
 }
 
 float PageBitmap::effective_scale() const noexcept {
@@ -916,41 +905,6 @@ DocError Document::outline(std::vector<OutlineItem>& out) const noexcept {
     delete[] buf;
 
     s.last_error.clear();
-    return DocError::Ok;
-}
-
-DocError Document::page_size(int index, float& width_pt, float& height_pt) const noexcept {
-    width_pt = 0.0f;
-    height_pt = 0.0f;
-    if (!impl_ || !impl_->doc || !impl_->ctx) return DocError::NotOpen;
-    if (index < 0) return DocError::Internal;
-
-    Impl& s = *impl_;
-    fz_page* page = nullptr;
-    fz_rect  bounds{};
-    DocError result = DocError::Ok;
-    char     err[kErrCap] = {};
-
-    fz_try(s.ctx) {
-        fz_var(page);
-        fz_var(bounds);
-        page = fz_load_page(s.ctx, s.doc, index);
-        bounds = fz_bound_page(s.ctx, page);
-    }
-    fz_always(s.ctx) {
-        if (page) fz_drop_page(s.ctx, page);
-    }
-    fz_catch(s.ctx) {
-        result = classify(s.ctx);
-        copy_caught_message(s.ctx, err, kErrCap);
-    }
-
-    if (result != DocError::Ok) {
-        set_error(s.last_error, err);
-        return result;
-    }
-    width_pt = bounds.x1 - bounds.x0;
-    height_pt = bounds.y1 - bounds.y0;
     return DocError::Ok;
 }
 

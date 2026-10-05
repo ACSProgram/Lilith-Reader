@@ -107,7 +107,6 @@ public:
 
     // 读取快照（UI 线程）
     [[nodiscard]] DocState doc_state() const;
-    [[nodiscard]] int      page_count() const;
     [[nodiscard]] PageSlot slot(int page) const;
     // 目录（outline）快照。打开/解锁成功后由工作线程一次性加载；UI 进入阅读态时取一次即可。
     // 无目录返回空表。**不要每帧调用**（会拷贝整个目录表）。
@@ -134,8 +133,6 @@ public:
     // 并重新排队——因为变换结果已固化进纹理像素，必须整篇重渲。
     // 页纹理与缩略图纹理都会失效重渲。
     void set_view_transform(int rotation_deg, ColorMode color_mode);
-    [[nodiscard]] int       rotation() const;
-    [[nodiscard]] ColorMode color_mode() const;
 
     // ---- 缩略图通道（Phase 5）----
     // 声明侧栏需要的缩略图页（低 DPI）。与页纹理**互不干扰、独立缓存**，
