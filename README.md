@@ -4,7 +4,7 @@
 
 ## 目标特性
 
-- 单文件 exe（/MT 静态链接，MuPDF 静态库，无 DLL/运行时依赖）；当前 40.4MB，其中约 34MB 是
+- 单文件 exe（/MT 静态链接，MuPDF 静态库，无 DLL/运行时依赖）；当前 40.5MB，其中约 34MB 是
   MuPDF 内置的 CJK 兜底字体（思源宋体）——中文文档未内嵌字体时的必需资源，裁剪计划见迁移计划 §4
 - `reader.exe <文件路径>` 直接打开，可注册"打开方式"双击关联
 - 支持格式：PDF、epub、mobi、fb2、cbz、xps 及常见图片（png/jpg/gif/bmp/tif，
@@ -31,22 +31,22 @@
 ├── src/
 │   ├── app/              入口、Win32 窗口、D3D11/ImGui 初始化、命令行参数
 │   ├── document/         MuPDF 封装（Document/页面渲染/线程模型）
-│   ├── canvas/           自研画布（缩放、平移、网格、滚动、渲染请求调度）
-│   ├── render/           纹理管理、LRU 页缓存、后台线程池
+│   ├── canvas/           自研画布（纯布局数学：缩放、平移、网格、滚动、命中测试）
+│   ├── render/           渲染调度：工作线程、页状态机、纹理上传与退役队列
 │   └── utils/            通用工具（字符串、路径、日志）
 ├── third_party/imgui/    ImGui 源码（从 Lilith 复制后随仓库提交）
-├── tests/                自动化测试（样本合成 + document 模块断言，`run_tests.ps1` 一键运行）
+├── tests/                自动化测试（样本合成 + document/canvas 模块断言，`run_tests.ps1` 一键运行）
 ├── assets/               图标、字体子集、资源脚本
 └── vcpkg.json
 ```
 
-## 构建（当前状态：Phase 2 文档核心已完成 ✅）
+## 构建（当前状态：Phase 3 自研画布已完成 ✅）
 
 - Visual Studio 18 (2026) Community，PlatformToolset v145（MSVC 14.51）
 - vcpkg，manifest 模式，triplet `x64-windows-static`；依赖 `libmupdf` 1.26.10
 - MSVC `/MT`（静态 CRT）+ `/O2` + `/utf-8`
 - 构建：VS 打开 `LilithReader.slnx` 直接 F5，或命令行运行 `build.bat`
-- 产出：`bin\Release\LilithReader.exe`（40.4MB，静态 CRT，仅依赖系统组件 DLL）
+- 产出：`bin\Release\LilithReader.exe`（40.5MB，静态 CRT，仅依赖系统组件 DLL）
 
 ### 依赖安装位置（重要）
 
@@ -65,9 +65,11 @@ triplet 的独立目录可一并消除，故在 `src/LilithReader.vcxproj` 中�
 `overlay-ports/gumbo/` 是修正上游归档哈希的覆盖端口（[ADR-011](docs/03-决策记录.md)）；
 项目里若残留旧的 `vcpkg_installed/` 目录，已不再使用，可安全删除。
 
-- 当前程序：应用外壳 + 文档核心——拖放/命令行打开文档、后台线程异步打开、
-  真实元信息（页数/首页尺寸/标题/目录/加密状态）、结构化错误分类、窗口状态持久化、
-  F3 调试浮层（UI 字体暂用系统微软雅黑，Phase 6 换内嵌子集字体）
+- 当前程序：应用外壳 + 文档核心 + **自研画布**——拖放/命令行打开文档、后台线程异步打开、
+  真实元信息（页数/首页尺寸/标题/目录/加密状态）、结构化错误分类、窗口状态持久化；
+  **阅读态**支持连续滚动、以鼠标为中心的平滑缩放（防抖后高清重渲染）、1~4 列网格、
+  键盘翻页/跳页/全屏，底部状态栏显示页码/缩放/列数；F3 调试浮层
+  （UI 字体暂用系统微软雅黑，Phase 6 换内嵌子集字体）
 
 ## 状态
 
@@ -76,7 +78,8 @@ triplet 的独立目录可一并消除，故在 `src/LilithReader.vcxproj` 中�
 | Phase 0 骨架与环境 | ✅ 完成（2026-10-05） |
 | Phase 1 应用外壳 | ✅ 完成并人工验证通过（2026-10-05） |
 | Phase 2 MuPDF 文档核心 | ✅ 完成，编译已验证；运行期验收待人工执行（2026-10-05） |
-| Phase 3 自研画布 | 未开始（下一阶段） |
+| Phase 3 自研画布 | ✅ 完成，编译 + 61 例画布断言通过；运行期验收待人工执行（2026-10-05） |
+| Phase 4 渲染调度与纹理管理 | 未开始（下一阶段） |
 
 ## 已知问题
 

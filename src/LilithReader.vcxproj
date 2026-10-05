@@ -84,7 +84,7 @@
       <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <MinimalRebuild>false</MinimalRebuild>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\imgui;$(ProjectDir)..\third_party\implot;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\imgui;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -107,7 +107,7 @@
       <AdditionalOptions>%(AdditionalOptions) /utf-8 /bigobj /external:anglebrackets</AdditionalOptions>
       <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\imgui;$(ProjectDir)..\third_party\implot;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\imgui;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -122,9 +122,12 @@
     <ClCompile Include="utils\utils.ixx" />
     <ClCompile Include="document\document.ixx" />
     <ClCompile Include="document\document.cpp" />
-    <!-- 第三方源码不按本项目的 /W4 标准要求：
-         implot 在 C++23 下会对「不同类型枚举之间的 |」报 C5054（上游写法，非本项目问题）。
-         只关掉这一条，其余警告仍然可见。 -->
+    <!-- Phase 3：自研画布（纯布局，可单测）与渲染调度层 -->
+    <ClCompile Include="canvas\canvas.ixx" />
+    <ClCompile Include="canvas\canvas.cpp" />
+    <ClCompile Include="render\render.ixx" />
+    <ClCompile Include="render\render.cpp" />
+    <!-- Phase 3 起 ImPlot 已从构建中移除（自研画布取代其调试用途，见 ADR-018） -->
     <ClCompile Include="..\third_party\imgui\imgui.cpp" />
     <ClCompile Include="..\third_party\imgui\imgui_draw.cpp" />
     <ClCompile Include="..\third_party\imgui\imgui_tables.cpp" />
@@ -132,13 +135,6 @@
     <ClCompile Include="..\third_party\imgui\imgui_demo.cpp" />
     <ClCompile Include="..\third_party\imgui\backends\imgui_impl_dx11.cpp" />
     <ClCompile Include="..\third_party\imgui\backends\imgui_impl_win32.cpp" />
-    <ClCompile Include="..\third_party\implot\implot.cpp">
-      <DisableSpecificWarnings>5054</DisableSpecificWarnings>
-    </ClCompile>
-    <ClCompile Include="..\third_party\implot\implot_items.cpp" />
-    <ClCompile Include="..\third_party\implot\implot_demo.cpp">
-      <DisableSpecificWarnings>5054</DisableSpecificWarnings>
-    </ClCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

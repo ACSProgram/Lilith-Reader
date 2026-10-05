@@ -1,34 +1,36 @@
-// main.cpp — Lilith Reader 应用外壳（Phase 1 外壳 + Phase 2 文档核心接入）
-// Win32 + D3D11 + ImGui：命令行打开、拖放打开、窗口状态持久化。
-// Phase 2 起真正打开文档（MuPDF 文档核心），展示元信息或结构化错误。
+// main.cpp — Lilith Reader 应用外壳（Phase 1 外壳 + Phase 2 文档核心 + Phase 3 自研画布）
+// Win32 + D3D11 + ImGui：命令行/拖放打开、窗口状态持久化、画布阅读（滚动/缩放/多列网格）。
+//
+// 分层（架构文档 §1）：main 只做 UI 与输入；文档经 render 调度层访问（UI 线程零 fz_*、
+// 零阻塞）；布局数学全在 lilithreader.canvas（纯函数，可单测）。
 //
 // 项目纪律：不在开发中实际运行本软件做测试（编译/自动化测试除外）；
 // 人工运行验证项统一记录在 docs/04-人工验证.md。
 
+#define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
 #include <shellscalingapi.h>
 #include <d3d11.h>
 #include <dxgi.h>
 
-#include <condition_variable>
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <mutex>
-#include <optional>
-#include <stop_token>
+#include <memory>
 #include <string>
 #include <string_view>
-#include <thread>
-#include <utility>
+#include <vector>
 
 import lilithreader.utils;
 import lilithreader.document;
+import lilithreader.canvas;
+import lilithreader.render;
 
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
-#include "implot.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -46,7 +48,26 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"LilithReaderWnd";
 constexpr wchar_t kWindowTitle[] = L"Lilith Reader";
 
-// ---------------- D3D11（RAII，Phase 0 原样保留） ----------------
+// ---- 画布交互参数 ----
+constexpr float  kScrollStepPx = 120.0f;   // 每格滚轮滚动的屏幕像素
+constexpr float  kKeyScrollPx = 80.0f;     // 方向键每次滚动的屏幕像素
+constexpr float  kZoomStep = 1.15f;        // 每格 Ctrl+滚轮 / 每次 +/- 的缩放倍率
+constexpr double kZoomDebounceSec = 0.15;  // 缩放稳定后触发高清重渲染的等待时间
+constexpr float  kStatusBarH = 30.0f;      // 底部状态栏高度
+
+// ---- 主题色（浅色阅读器） ----
+constexpr ImU32 kColBackdrop = IM_COL32(228, 231, 235, 255);  // 页面区背景
+constexpr ImU32 kColChrome = IM_COL32(242, 244, 246, 255);    // 状态栏背景
+constexpr ImU32 kColPageBorder = IM_COL32(0, 0, 0, 46);
+constexpr ImU32 kColPlaceholder = IM_COL32(246, 247, 249, 255);
+constexpr ImU32 kColPlaceholderBorder = IM_COL32(200, 204, 210, 255);
+constexpr ImU32 kColPlaceholderText = IM_COL32(130, 134, 140, 255);
+constexpr ImU32 kColFailed = IM_COL32(252, 238, 238, 255);
+constexpr ImU32 kColFailedBorder = IM_COL32(220, 150, 150, 255);
+constexpr ImU32 kColChromeText = IM_COL32(60, 64, 70, 255);
+constexpr ImU32 kColChromeDim = IM_COL32(120, 126, 134, 255);
+
+// ---------------- D3D11（RAII） ----------------
 struct Graphics {
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -111,9 +132,9 @@ struct Graphics {
     }
 } g_gfx;
 
-// ---------------- ImGui（RAII） ----------------
+// ---------------- ImGui（RAII；Phase 3 起不再依赖 ImPlot） ----------------
 struct ImGuiRaii {
-    bool win32 = false, dx11 = false, ctx = false, plot = false;
+    bool win32 = false, dx11 = false, ctx = false;
 
     void initialize(HWND hwnd) {
         IMGUI_CHECKVERSION();
@@ -122,20 +143,16 @@ struct ImGuiRaii {
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-        // 关掉 ImGui 自己的 imgui.ini 持久化。
-        // 默认值是相对路径 "imgui.ini"，即落在**当前工作目录**；而「把文件拖到 exe 上
-        // 打开」时 Explorer 会把工作目录设成被拖文件所在目录，于是封面文件夹里会凭空
-        // 多出一个 imgui.ini（先启动窗口再拖入则落在 exe 目录，所以现象不一致）。
-        // 本项目的窗口/布局状态一律由自己的 LilithReader.ini 管理，不需要 ImGui 的
-        // 窗口状态（所有窗口都带 NoSavedSettings），故直接禁用，避免污染用户目录。
+        // 关掉 ImGui 自己的 imgui.ini 持久化（详见 Phase 2 记录）：
+        // 「把文件拖到 exe 上」时 Explorer 会把工作目录设为被拖文件目录，
+        // 默认相对路径会在用户目录里凭空生成 imgui.ini。窗口/布局状态由
+        // LilithReader.ini 自管，故直接禁用。
         io.IniFilename = nullptr;
 
         // 中文字体：系统微软雅黑（Phase 6 换为 exe 内嵌子集字体）
         io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 18.0f,
             nullptr, io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
 
-        ImPlot::CreateContext();
-        plot = true;
         win32 = ImGui_ImplWin32_Init(hwnd);
         dx11 = ImGui_ImplDX11_Init(g_gfx.device, g_gfx.context);
     }
@@ -149,159 +166,39 @@ struct ImGuiRaii {
     void shutdown() {
         if (dx11) ImGui_ImplDX11_Shutdown();
         if (win32) ImGui_ImplWin32_Shutdown();
-        if (plot) ImPlot::DestroyContext();
         if (ctx) ImGui::DestroyContext();
     }
 } g_ui;
 
-// ---------------- 文档会话（Phase 2 临时实现） ----------------
-//
-// Phase 2 只做「打开 + 元信息」，引擎不含渲染。为了让 UI 线程永不阻塞
-// （架构文档 §3.1 的硬约束：UI 线程零阻塞、绝不碰 fz_* 与磁盘），
-// 打开动作交给一个专用工作线程串行执行，该线程独占唯一的 Document 实例。
-//
-// Phase 2 明确选择了「单渲染线程串行」而非「线程池 + fz_clone_context」：
-// MuPDF 单线程渲染已足够流畅，且彻底规避共享 fz_document 的并发风险（ADR-006）。
-//
-// TODO(Phase 3/4)：这里的裸线程将由 render 调度层（任务队列 + 页状态机 +
-//   纹理 LRU + 字节预算缓存）接管；届时 Document 迁入调度层，本结构删除。
-class DocSession {
-public:
-    enum class Phase { Idle, Opening, Ready, Failed };
+// ---------------- 全局状态 ----------------
+std::unique_ptr<lr::Renderer> g_renderer;  // 渲染调度层（Phase 3 取代 DocSession）
+lr::Canvas g_canvas;
 
-    struct Snapshot {
-        Phase phase = Phase::Idle;
-        lr::DocError error = lr::DocError::Ok;
-        lr::DocumentInfo info{};
-        std::string detail_u8;   // 失败时的原始错误信息（UTF-8）
-        std::uint64_t id = 0;    // 请求序号，UI 用它丢弃过期结果
-    };
-
-    DocSession() : worker_([this](std::stop_token st) { run(std::move(st)); }) {}
-
-    ~DocSession() {
-        worker_.request_stop();
-        cv_.notify_all();  // jthread 析构时 join；必须先唤醒再等
-    }
-
-    DocSession(const DocSession&) = delete;
-    DocSession& operator=(const DocSession&) = delete;
-
-    // 投递打开请求（UI 线程）。返回请求序号。
-    std::uint64_t request_open(std::wstring path) {
-        std::lock_guard lock(mtx_);
-        const std::uint64_t id = ++next_id_;
-        pending_ = Request{ Kind::Open, std::move(path), id };
-        snap_.phase = Phase::Opening;
-        snap_.error = lr::DocError::Ok;
-        snap_.detail_u8.clear();
-        snap_.id = id;
-        cv_.notify_all();
-        return id;
-    }
-
-    // 投递关闭请求（UI 线程）。返回请求序号。
-    std::uint64_t request_close() {
-        std::lock_guard lock(mtx_);
-        const std::uint64_t id = ++next_id_;
-        pending_ = Request{ Kind::Close, {}, id };
-        snap_.phase = Phase::Idle;
-        snap_.error = lr::DocError::Ok;
-        snap_.detail_u8.clear();
-        snap_.info = lr::DocumentInfo{};
-        snap_.id = id;
-        cv_.notify_all();
-        return id;
-    }
-
-    Snapshot snapshot() const {
-        std::lock_guard lock(mtx_);
-        return snap_;
-    }
-
-private:
-    enum class Kind { Open, Close };
-
-    struct Request {
-        Kind kind = Kind::Close;
-        std::wstring path;
-        std::uint64_t id = 0;
-    };
-
-    void run(std::stop_token stop) {
-        for (;;) {
-            Request req;
-            {
-                std::unique_lock lock(mtx_);
-                cv_.wait(lock, stop, [this] { return pending_.has_value(); });
-                if (stop.stop_requested()) return;
-                req = std::move(*pending_);
-                pending_.reset();
-            }
-
-            if (req.kind == Kind::Close) {
-                doc_.close();  // 只有工作线程碰 Document
-                publish(req.id, Phase::Idle, lr::DocError::Ok, {}, {}, "close requested");
-                continue;
-            }
-
-            const lr::DocError err = doc_.open(req.path);
-            if (err == lr::DocError::Ok) {
-                lr::DocumentInfo info;
-                const lr::DocError info_err = doc_.info(info);
-                if (info_err == lr::DocError::Ok)
-                    publish(req.id, Phase::Ready, lr::DocError::Ok, std::move(info), {},
-                            "opened");
-                else
-                    publish(req.id, Phase::Failed, info_err, {}, to_utf8(doc_.last_error()),
-                            "info failed");
-            } else {
-                publish(req.id, Phase::Failed, err, {}, to_utf8(doc_.last_error()),
-                        "open failed");
-            }
-        }
-    }
-
-    // 只有请求没有被更新的请求顶掉时才发布结果
-    void publish(std::uint64_t id, Phase phase, lr::DocError error, lr::DocumentInfo info,
-                 std::string detail_u8, const char* /*why*/) {
-        std::lock_guard lock(mtx_);
-        if (snap_.id != id) return;  // 已被更新的请求取代，丢弃过期结果
-        snap_.phase = phase;
-        snap_.error = error;
-        snap_.info = std::move(info);
-        snap_.detail_u8 = std::move(detail_u8);
-    }
-
-    static std::string to_utf8(std::string_view sv) { return std::string(sv); }
-
-    // ---- 成员声明顺序即析构顺序的逆序：先 join 线程，再释放 Document ----
-    mutable std::mutex mtx_;
-    std::condition_variable_any cv_;
-    Snapshot snap_;
-    std::optional<Request> pending_;
-    std::uint64_t next_id_ = 0;
-
-    lr::Document doc_;              // 仅工作线程访问
-    std::jthread worker_;           // 最后声明 ⇒ 最先析构（join）
-};
-
-// ---------------- UI 侧文档状态（UI 线程独占） ----------------
 struct UiDoc {
-    enum class Kind { None, Rejected, Opening, Ready, Failed };
-    Kind kind = Kind::None;
+    enum class Kind { None, Rejected, Opening, Reading, Failed };
+    Kind         kind = Kind::None;
     std::wstring path_w;
-    std::string name_u8, ext_u8;
+    std::string  name_u8, ext_u8;
     lr::DocError error = lr::DocError::Ok;  // Rejected / Failed 时的具体原因
-    std::string detail_u8;                  // MuPDF 原始错误信息
+    std::string  detail_u8;                 // MuPDF 原始错误信息
     lr::DocumentInfo info{};
     std::uint64_t request_id = 0;
 } g_doc;
 
-DocSession g_session;
 HWND g_hwnd = nullptr;
 std::wstring g_ini_path;
-bool g_show_debug = false;  // F3 切换调试浮层
+bool g_show_debug = false;
+bool g_fullscreen = false;
+WINDOWPLACEMENT g_prev_placement{ sizeof(WINDOWPLACEMENT) };
+
+// 缩放防抖状态（详见 update_want_scale）
+float  g_want_scale = -1.0f;         // 已投递给渲染层的倍率；<0 表示尚未初始化
+float  g_last_target_scale = -1.0f;  // 上一帧的目标倍率
+double g_zoom_dirty_since = -1.0;    // 目标倍率最后一次变化的时刻；<0 表示无待定
+
+// 跳页弹窗
+bool g_open_jump = false;
+int  g_jump_page = 1;
 
 void update_title() {
     if (!g_hwnd) return;
@@ -313,7 +210,8 @@ void update_title() {
     SetWindowTextW(g_hwnd, title.c_str());
 }
 
-// 清空为"无文档"状态
+// ---------------- 文档状态机（UI 侧） ----------------
+
 void reset_doc_state() {
     g_doc.kind = UiDoc::Kind::None;
     g_doc.path_w.clear();
@@ -323,10 +221,31 @@ void reset_doc_state() {
     g_doc.detail_u8.clear();
     g_doc.info = lr::DocumentInfo{};
     g_doc.request_id = 0;
+    g_canvas = lr::Canvas{};
+    g_want_scale = -1.0f;
+    g_last_target_scale = -1.0f;
+    g_zoom_dirty_since = -1.0;
     update_title();
 }
 
-// 请求打开某文档（UI 线程）
+// 文档打开成功 → 初始化画布并进入阅读态
+void enter_reading() {
+    lr::PageSizePt sz;
+    sz.w = g_doc.info.page_width_pt > 0.0f ? g_doc.info.page_width_pt : 595.0f;
+    sz.h = g_doc.info.page_height_pt > 0.0f ? g_doc.info.page_height_pt : 842.0f;
+
+    lr::CanvasState st;  // 默认：fit_width=true, columns=1
+    g_canvas = lr::Canvas{};
+    g_canvas.set_default_size(sz);
+    g_canvas.set_uniform(g_doc.info.page_count, sz);
+    g_canvas.set_state(st);
+    g_canvas.clamp_scroll();
+
+    g_want_scale = -1.0f;  // 首帧立即采用目标倍率，不走防抖
+    g_last_target_scale = -1.0f;
+    g_zoom_dirty_since = -1.0;
+}
+
 void request_open_document(std::wstring path) {
     path = lr::to_absolute(path);
     g_doc.path_w = path;
@@ -335,9 +254,9 @@ void request_open_document(std::wstring path) {
     g_doc.error = lr::DocError::Ok;
     g_doc.detail_u8.clear();
     g_doc.info = lr::DocumentInfo{};
+    g_canvas = lr::Canvas{};
 
     // 本地即时判定：不存在 / 不在支持清单内（不必浪费一次线程往返）
-    // 注意：支持清单是"策略"，MuPDF 本身能认更多格式；放开只需改 utils 的清单。
     if (!lr::file_exists(path)) {
         g_doc.kind = UiDoc::Kind::Rejected;
         g_doc.error = lr::DocError::NotFound;
@@ -352,31 +271,31 @@ void request_open_document(std::wstring path) {
     }
 
     g_doc.kind = UiDoc::Kind::Opening;
-    g_doc.request_id = g_session.request_open(path);
+    g_doc.request_id = g_renderer->open(path);
     update_title();
 }
 
-// 关闭当前文档（UI 线程）
 void close_document() {
-    if (g_doc.kind == UiDoc::Kind::Opening) g_session.request_close();
+    if (g_doc.kind == UiDoc::Kind::Opening || g_doc.kind == UiDoc::Kind::Reading)
+        g_renderer->close();
     reset_doc_state();
 }
 
-// 把工作线程的结果同步到 UI 状态（每帧调用）
 void poll_document() {
     if (g_doc.kind != UiDoc::Kind::Opening) return;
 
-    const DocSession::Snapshot snap = g_session.snapshot();
+    const lr::DocState snap = g_renderer->doc_state();
     if (snap.id != g_doc.request_id) return;  // 已被更新的请求取代
-    if (snap.phase == DocSession::Phase::Opening) return;
+    if (snap.phase == lr::DocPhase::Opening) return;
 
     switch (snap.phase) {
-    case DocSession::Phase::Ready:
-        g_doc.kind = UiDoc::Kind::Ready;
+    case lr::DocPhase::Ready:
+        g_doc.kind = UiDoc::Kind::Reading;
         g_doc.info = snap.info;
         g_doc.error = lr::DocError::Ok;
+        enter_reading();
         break;
-    case DocSession::Phase::Failed:
+    case lr::DocPhase::Failed:
         g_doc.kind = UiDoc::Kind::Failed;
         g_doc.error = snap.error;
         g_doc.detail_u8 = snap.detail_u8;
@@ -389,7 +308,6 @@ void poll_document() {
 }
 
 // ---------------- 窗口状态校验 ----------------
-// 保存的窗口矩形是否仍可用（至少 100x100 落在虚拟屏幕内，最小 400x300）
 bool placement_usable(const lr::WindowState& s) {
     if (s.w < 400 || s.h < 300) return false;
     const LONG vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -403,7 +321,251 @@ bool placement_usable(const lr::WindowState& s) {
     return (rx - ix) >= 100 && (ry - iy) >= 100;
 }
 
-// ---------------- UI ----------------
+void toggle_fullscreen() {
+    if (!g_hwnd) return;
+    if (!g_fullscreen) {
+        GetWindowPlacement(g_hwnd, &g_prev_placement);
+        MONITORINFO mi{ sizeof(mi) };
+        if (GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+            SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowPos(g_hwnd, HWND_TOP,
+                         mi.rcMonitor.left, mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_FRAMECHANGED | SWP_NOZORDER);
+            g_fullscreen = true;
+        }
+    } else {
+        SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPlacement(g_hwnd, &g_prev_placement);
+        SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        g_fullscreen = false;
+    }
+}
+
+// ---------------- 画布输入 ----------------
+void scroll_by_rows(int dir) {
+    const int cur = g_canvas.visible_first();
+    const int row = g_canvas.row_of(cur);
+    const int target_row = row + dir;
+    if (target_row < 0) { g_canvas.scroll_to_page(0, 0.0f); return; }
+    if (target_row >= g_canvas.rows()) {
+        g_canvas.scroll_to_page(g_canvas.page_count() - 1, 0.0f);
+        return;
+    }
+    g_canvas.scroll_to_page(g_canvas.first_page_in_row(target_row), 0.0f);
+}
+
+void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered, bool focused) {
+    ImGuiIO& io = ImGui::GetIO();
+    const float cx = size.x * 0.5f;
+    const float cy = size.y * 0.5f;
+
+    // 滚轮：Ctrl 缩放（以鼠标为不动点），否则滚动
+    if (hovered && io.MouseWheel != 0.0f) {
+        if (io.KeyCtrl) {
+            g_canvas.zoom_by(std::pow(kZoomStep, io.MouseWheel),
+                             io.MousePos.x - origin.x, io.MousePos.y - origin.y);
+        } else {
+            g_canvas.scroll_by(0.0f, -io.MouseWheel * kScrollStepPx);
+        }
+    }
+
+    // 左键拖拽平移
+    if (hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
+        g_canvas.scroll_by(-io.MouseDelta.x, -io.MouseDelta.y);
+    }
+
+    if (!focused) return;
+
+    const float vh = size.y;
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true))  g_canvas.scroll_by(0.0f, kKeyScrollPx);
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true))    g_canvas.scroll_by(0.0f, -kKeyScrollPx);
+    if (ImGui::IsKeyPressed(ImGuiKey_PageDown, true))   g_canvas.scroll_by(0.0f, vh * 0.9f);
+    if (ImGui::IsKeyPressed(ImGuiKey_PageUp, true))     g_canvas.scroll_by(0.0f, -vh * 0.9f);
+    if (ImGui::IsKeyPressed(ImGuiKey_Home, false))      g_canvas.scroll_to_page(0, 0.0f);
+    if (ImGui::IsKeyPressed(ImGuiKey_End, false))
+        g_canvas.scroll_to_page(g_canvas.page_count() - 1, 0.0f);
+    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) scroll_by_rows(+1);
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true))  scroll_by_rows(-1);
+
+    if (ImGui::IsKeyPressed(ImGuiKey_1, false)) g_canvas.set_columns(1);
+    if (ImGui::IsKeyPressed(ImGuiKey_2, false)) g_canvas.set_columns(2);
+    if (ImGui::IsKeyPressed(ImGuiKey_3, false)) g_canvas.set_columns(3);
+    if (ImGui::IsKeyPressed(ImGuiKey_4, false)) g_canvas.set_columns(4);
+
+    if (ImGui::IsKeyPressed(ImGuiKey_F, false)) g_canvas.fit_to_width();
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_0, false)) g_canvas.fit_to_width();
+    if (ImGui::IsKeyPressed(ImGuiKey_Equal, true) ||
+        (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, true)))
+        g_canvas.zoom_by(kZoomStep, cx, cy);
+    if (ImGui::IsKeyPressed(ImGuiKey_Minus, true) ||
+        (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, true)))
+        g_canvas.zoom_by(1.0f / kZoomStep, cx, cy);
+
+    if (ImGui::IsKeyPressed(ImGuiKey_G, false)) {
+        g_open_jump = true;
+        g_jump_page = g_canvas.visible_first() + 1;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) toggle_fullscreen();
+}
+
+// 缩放防抖：目标倍率稳定 150ms 后，才按新倍率请求高清重渲染；
+// 期间 g_want_scale 保持旧值，页面用现有纹理显示（双线性放大，不闪白）。
+void update_want_scale() {
+    const float target = g_canvas.effective_zoom();
+    const double now = ImGui::GetTime();
+
+    if (g_want_scale < 0.0f) {  // 首帧（刚进入阅读态）：立即采用
+        g_want_scale = target;
+        g_last_target_scale = target;
+        g_zoom_dirty_since = -1.0;
+        return;
+    }
+    if (std::fabs(target - g_want_scale) <= 0.002f) {  // 已与投递倍率一致
+        g_last_target_scale = target;
+        g_zoom_dirty_since = -1.0;
+        return;
+    }
+    if (std::fabs(target - g_last_target_scale) > 0.002f) {
+        g_last_target_scale = target;
+        g_zoom_dirty_since = now;  // 倍率仍在变化，重置计时（真防抖）
+    }
+    if (g_zoom_dirty_since >= 0.0 && (now - g_zoom_dirty_since) >= kZoomDebounceSec) {
+        g_want_scale = target;
+        g_zoom_dirty_since = -1.0;
+    }
+}
+
+// 可见页 + 上下各一行预加载 → 渲染请求（可见页优先）
+void emit_wants() {
+    const int n = g_canvas.page_count();
+    if (n <= 0) return;
+    const float scale = g_want_scale > 0.0f ? g_want_scale : g_canvas.effective_zoom();
+
+    const int first = g_canvas.visible_first();
+    const int last = g_canvas.visible_last();
+    if (first < 0 || last < first) return;
+
+    const int cols = g_canvas.state().columns;
+    const int r0 = g_canvas.row_of(first);
+    const int r1 = g_canvas.row_of(last);
+    const int pf = g_canvas.first_page_in_row(std::max(0, r0 - 1));
+    const int pl = std::min(n - 1, (r1 + 2) * cols - 1);
+
+    std::vector<lr::RenderWant> wants;
+    wants.reserve(static_cast<std::size_t>(pl - pf + 1));
+    for (int i = first; i <= last && i < n; ++i) wants.push_back({ i, scale });
+    for (int i = pf; i <= pl; ++i)
+        if (i < first || i > last) wants.push_back({ i, scale });
+
+    g_renderer->set_wanted(std::move(wants));
+}
+
+// ---------------- 画布绘制 ----------------
+void draw_page_placeholder(ImDrawList* dl, const ImVec2& pmin, const ImVec2& pmax,
+                           const lr::PageSlot& s) {
+    const bool failed = (s.status == lr::PageStatus::Failed);
+    dl->AddRectFilled(pmin, pmax, failed ? kColFailed : kColPlaceholder);
+    dl->AddRect(pmin, pmax, failed ? kColFailedBorder : kColPlaceholderBorder);
+    const char* txt = failed ? "渲染失败" : (s.status == lr::PageStatus::Loading ? "载入中…" : "");
+    if (txt[0] != '\0') {
+        const ImVec2 ts = ImGui::CalcTextSize(txt);
+        dl->AddText(ImVec2((pmin.x + pmax.x - ts.x) * 0.5f, (pmin.y + pmax.y - ts.y) * 0.5f),
+                    kColPlaceholderText, txt);
+    }
+}
+
+void draw_canvas_area() {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::BeginChild("##canvas", ImVec2(0, -kStatusBarH), false,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                      ImGuiWindowFlags_NoNav);
+    ImGui::PopStyleVar();
+
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const ImVec2 size = ImGui::GetContentRegionAvail();
+    g_canvas.set_viewport(size.x, size.y);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(origin, ImVec2(origin.x + size.x, origin.y + size.y), kColBackdrop);
+
+    const bool hovered = ImGui::IsWindowHovered();
+    const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    if (!g_open_jump) handle_canvas_input(origin, size, hovered, focused);
+
+    update_want_scale();
+    emit_wants();
+
+    const int n = g_canvas.page_count();
+    const int first = g_canvas.visible_first();
+    const int last = g_canvas.visible_last();
+    const ImVec2 clip_max(origin.x + size.x, origin.y + size.y);
+    dl->PushClipRect(origin, clip_max, true);
+    for (int i = first; i <= last && i < n; ++i) {
+        const lr::PageRect r = g_canvas.page_rect(i);
+        const ImVec2 pmin(origin.x + r.x, origin.y + r.y);
+        const ImVec2 pmax(pmin.x + r.w, pmin.y + r.h);
+        if (pmax.x < origin.x || pmin.x > clip_max.x ||
+            pmax.y < origin.y || pmin.y > clip_max.y)
+            continue;
+        const lr::PageSlot s = g_renderer->slot(i);
+        if (s.texture != nullptr) {
+            dl->AddImage(static_cast<ImTextureID>(reinterpret_cast<std::intptr_t>(s.texture)),
+                         pmin, pmax);
+            dl->AddRect(pmin, pmax, kColPageBorder);
+        } else {
+            draw_page_placeholder(dl, pmin, pmax, s);
+        }
+    }
+    dl->PopClipRect();
+
+    ImGui::EndChild();
+}
+
+void draw_status_bar() {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 4));
+    ImGui::BeginChild("##status", ImVec2(0, kStatusBarH), false,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                      ImGuiWindowFlags_NoNav);
+    ImGui::PopStyleVar();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 wp = ImGui::GetWindowPos();
+    const ImVec2 ws = ImGui::GetWindowSize();
+    dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + ws.y), kColChrome);
+
+    const int total = g_canvas.page_count();
+    const int cur = std::min(total, g_canvas.visible_first() + 1);
+
+    std::string left = g_doc.name_u8.empty() ? "(未命名)" : g_doc.name_u8;
+    if (!g_doc.info.format.empty() &&
+        !lr::format_matches_extension(g_doc.info.format, g_doc.ext_u8)) {
+        left += "  ·  实际格式 ";
+        left += g_doc.info.format;
+        left += "（扩展名 ";
+        left += g_doc.ext_u8;
+        left += " 不符）";
+    }
+
+    char right[160];
+    std::snprintf(right, sizeof right, "%d / %d   ·   %d%%   ·   %d 列",
+                  cur, total,
+                  static_cast<int>(std::lround(g_canvas.effective_zoom() * 100.0f)),
+                  g_canvas.state().columns);
+
+    ImGui::SetCursorPos(ImVec2(10, (kStatusBarH - ImGui::GetTextLineHeight()) * 0.5f));
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColChromeText), "%s", left.c_str());
+
+    const float rw = ImGui::CalcTextSize(right).x;
+    ImGui::SetCursorPos(ImVec2(ws.x - rw - 10.0f, (kStatusBarH - ImGui::GetTextLineHeight()) * 0.5f));
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColChromeDim), "%s", right);
+
+    ImGui::EndChild();
+}
+
+// ---------------- 引导 / 状态页（Phase 1/2 保留） ----------------
 constexpr const char* kFormatsLine = "支持 PDF · EPUB · MOBI · FB2 · CBZ · XPS · 图片(PNG/JPG/GIF/BMP/TIFF)";
 constexpr ImVec4 kColBright{ 0.92f, 0.93f, 0.95f, 1.0f };
 constexpr ImVec4 kColDim{ 0.58f, 0.62f, 0.66f, 1.0f };
@@ -425,40 +587,10 @@ void draw_drop_guide() {
 
 void draw_opening() {
     centered_text(g_doc.name_u8.c_str(), -44.0f, kColBright);
-    // 简易进度指示（Phase 6 换成正式动效）
     static const char* kDots[] = { "正在打开 ．", "正在打开 ．．", "正在打开 ．．．" };
     const int frame = static_cast<int>(ImGui::GetTime() * 3.0) % 3;
     centered_text(kDots[frame], 0.0f, kColDim);
     centered_text("按 Esc 取消", 44.0f, kColDim);
-}
-
-void draw_ready() {
-    const char* title = !g_doc.info.title.empty() ? g_doc.info.title.c_str()
-                                                  : g_doc.name_u8.c_str();
-    centered_text(title, -96.0f, kColBright);
-
-    char line[256];
-    snprintf(line, sizeof line, "%d 页 · %.0f × %.0f pt",
-             g_doc.info.page_count,
-             static_cast<double>(g_doc.info.page_width_pt),
-             static_cast<double>(g_doc.info.page_height_pt));
-    centered_text(line, -54.0f, kColDim);
-
-    std::string facts = "已打开 · 实际格式 ";
-    facts += g_doc.info.format.empty() ? g_doc.ext_u8 : g_doc.info.format;
-    // 扩展名与实际不符时如实告知（内容优先策略下不拦，但要说明白）
-    if (!g_doc.info.format.empty() &&
-        !lr::format_matches_extension(g_doc.info.format, g_doc.ext_u8)) {
-        facts += "（扩展名 ";
-        facts += g_doc.ext_u8;
-        facts += " 不符）";
-    }
-    if (g_doc.info.has_outline) facts += " · 含目录";
-    if (g_doc.info.needs_password) facts += " · 已加密";
-    centered_text(facts.c_str(), -18.0f, kColDim);
-
-    centered_text("页面渲染与画布将在 Phase 3 接入", 18.0f, kColDim);
-    centered_text("按 Esc 返回", 54.0f, kColDim);
 }
 
 void draw_failed() {
@@ -468,12 +600,9 @@ void draw_failed() {
     if (g_doc.error == lr::DocError::Unsupported) {
         centered_text(kFormatsLine, 0.0f, kColDim);
     } else if (g_doc.error == lr::DocError::Mismatched) {
-        // 唯一被拒的"内容与扩展名不符"：压缩包冒充单文档。给出可操作的建议，
-        // 而不是把 MuPDF 的英文原文丢给用户（原文仍在 F3 调试浮层的 last_error 里可查）
         centered_text("实际内容是一个压缩包（zip/tar）", 0.0f, kColDim);
         centered_text("若是图片集，请把扩展名改回 .cbz；否则请先解压", 36.0f, kColDim);
     } else if (!g_doc.detail_u8.empty()) {
-        // MuPDF 原始信息（英文）——上限截断，避免超长行撑破布局
         std::string detail = g_doc.detail_u8;
         if (detail.size() > 160) detail = detail.substr(0, 160) + "…";
         centered_text(detail.c_str(), 0.0f, kColDim);
@@ -493,6 +622,7 @@ void draw_rejected() {
     centered_text("按 Esc 返回", 44.0f, kColDim);
 }
 
+// ---------------- 调试浮层 ----------------
 void draw_debug_overlay() {
     const ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
@@ -508,18 +638,26 @@ void draw_debug_overlay() {
         ImGui::TextDisabled("%dx%d @ %.0f%%", (int)io.DisplaySize.x,
                             (int)io.DisplaySize.y, io.FontGlobalScale * 100.0f);
 
-        // Phase 2：文档核心状态
-        static const char* kKindNames[] = { "none", "rejected", "opening", "ready", "failed" };
+        static const char* kKindNames[] = { "none", "rejected", "opening", "reading", "failed" };
         ImGui::Separator();
         ImGui::Text("doc: %s", kKindNames[static_cast<int>(g_doc.kind)]);
         ImGui::TextDisabled("err: %.*s", (int)lr::to_string(g_doc.error).size(),
                             lr::to_string(g_doc.error).data());
-        if (g_doc.kind == UiDoc::Kind::Ready) {
+        if (g_doc.kind == UiDoc::Kind::Reading) {
             ImGui::Text("pages: %d / %.0fx%.0f pt", g_doc.info.page_count,
                         (double)g_doc.info.page_width_pt, (double)g_doc.info.page_height_pt);
             ImGui::TextDisabled("fmt: %s / ext: %s",
                                 g_doc.info.format.empty() ? "?" : g_doc.info.format.c_str(),
                                 g_doc.ext_u8.c_str());
+            ImGui::Separator();
+            ImGui::Text("zoom: %.3f (want %.3f)", g_canvas.effective_zoom(), g_want_scale);
+            ImGui::Text("vis: %d..%d  rows: %d", g_canvas.visible_first(),
+                        g_canvas.visible_last(), g_canvas.rows());
+            ImGui::Text("scroll: %.0f, %.0f / %.0f, %.0f", g_canvas.state().scroll_x,
+                        g_canvas.state().scroll_y, g_canvas.max_scroll_x(),
+                        g_canvas.max_scroll_y());
+            ImGui::Text("cols: %d  fit: %d", g_canvas.state().columns,
+                        g_canvas.state().fit_width ? 1 : 0);
         }
         if (g_doc.kind == UiDoc::Kind::Failed && !g_doc.detail_u8.empty())
             ImGui::TextDisabled("last_error: %.120s", g_doc.detail_u8.c_str());
@@ -527,8 +665,39 @@ void draw_debug_overlay() {
     ImGui::End();
 }
 
+// ---------------- 跳页弹窗 ----------------
+void draw_jump_popup() {
+    if (!g_open_jump) return;
+    if (!ImGui::IsPopupOpen("跳转页码")) ImGui::OpenPopup("跳转页码");
+    if (ImGui::BeginPopupModal("跳转页码", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const int total = std::max(1, g_canvas.page_count());
+        ImGui::Text("页码 (1 - %d)", total);
+        ImGui::SetNextItemWidth(140);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        const bool enter = ImGui::InputInt("##page", &g_jump_page, 0, 0,
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+        const bool do_jump = enter || ImGui::Button("跳转");
+        ImGui::SameLine();
+        const bool cancel = ImGui::Button("取消");
+        if (do_jump) {
+            int p = g_jump_page - 1;
+            if (p < 0) p = 0;
+            if (p >= g_canvas.page_count()) p = g_canvas.page_count() - 1;
+            g_canvas.scroll_to_page(p, 0.0f);
+            g_open_jump = false;
+            ImGui::CloseCurrentPopup();
+        } else if (cancel) {
+            g_open_jump = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+// ---------------- 顶层 UI ----------------
 void draw_shell() {
     poll_document();
+    g_renderer->drain_retired();  // 帧首：释放上一帧退役的纹理
 
     if (ImGui::IsKeyPressed(ImGuiKey_F3, false)) g_show_debug ^= 1;
 
@@ -542,26 +711,41 @@ void draw_shell() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
                  ImGuiWindowFlags_NoBringToFrontOnFocus |
-                 ImGuiWindowFlags_NoScrollbar);
+                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar(3);
 
     switch (g_doc.kind) {
-    case UiDoc::Kind::None:     draw_drop_guide(); break;
-    case UiDoc::Kind::Opening:  draw_opening();    break;
-    case UiDoc::Kind::Ready:    draw_ready();      break;
-    case UiDoc::Kind::Failed:   draw_failed();     break;
-    case UiDoc::Kind::Rejected: draw_rejected();   break;
+    case UiDoc::Kind::None:
+        draw_drop_guide();
+        break;
+    case UiDoc::Kind::Opening:
+        draw_opening();
+        break;
+    case UiDoc::Kind::Reading:
+        draw_canvas_area();
+        draw_status_bar();
+        break;
+    case UiDoc::Kind::Failed:
+        draw_failed();
+        break;
+    case UiDoc::Kind::Rejected:
+        draw_rejected();
+        break;
     }
     ImGui::End();
 
     if (g_show_debug) draw_debug_overlay();
+    draw_jump_popup();
 
-    // Esc：有文档 → 关闭返回引导页；无文档 → 退出
+    // Esc：跳页弹窗 → 关闭弹窗；有文档 → 关闭返回引导页；无文档 → 退出
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-        if (g_doc.kind != UiDoc::Kind::None)
+        if (g_open_jump) {
+            g_open_jump = false;
+        } else if (g_doc.kind != UiDoc::Kind::None) {
             close_document();
-        else
+        } else {
             PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+        }
     }
 }
 
@@ -590,24 +774,24 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_DPICHANGED:
-        // Per-Monitor DPI v2：按系统建议矩形调整窗口
         if (const RECT* r = reinterpret_cast<const RECT*>(lp))
             SetWindowPos(hwnd, nullptr, r->left, r->top,
                          r->right - r->left, r->bottom - r->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
         return 0;
     case WM_DESTROY: {
-        // 退出前持久化窗口状态（正常态矩形 + 是否最大化）
-        WINDOWPLACEMENT placement{ sizeof(placement) };
-        if (GetWindowPlacement(hwnd, &placement)) {
-            lr::WindowState s;
-            s.x = placement.rcNormalPosition.left;
-            s.y = placement.rcNormalPosition.top;
-            s.w = placement.rcNormalPosition.right - placement.rcNormalPosition.left;
-            s.h = placement.rcNormalPosition.bottom - placement.rcNormalPosition.top;
-            s.maximized = (placement.showCmd == SW_SHOWMAXIMIZED);
-            s.valid = true;
-            lr::save_window_state(g_ini_path, s);
+        if (!g_fullscreen) {  // 全屏态不覆盖保存的正常态矩形
+            WINDOWPLACEMENT placement{ sizeof(placement) };
+            if (GetWindowPlacement(hwnd, &placement)) {
+                lr::WindowState s;
+                s.x = placement.rcNormalPosition.left;
+                s.y = placement.rcNormalPosition.top;
+                s.w = placement.rcNormalPosition.right - placement.rcNormalPosition.left;
+                s.h = placement.rcNormalPosition.bottom - placement.rcNormalPosition.top;
+                s.maximized = (placement.showCmd == SW_SHOWMAXIMIZED);
+                s.valid = true;
+                lr::save_window_state(g_ini_path, s);
+            }
         }
         PostQuitMessage(0);
         return 0;
@@ -616,14 +800,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-} // namespace
+}  // namespace
 
 int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
                     _In_ LPWSTR cmd_line, _In_ int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    // 命令行解析：LilithReader.exe <文档路径>
-    // 注意 wWinMain 的 cmd_line 不含程序名，argv[0] 即第一个实参
+    // 命令行解析：LilithReader.exe <文档路径>（wWinMain 的 cmd_line 不含程序名）
     std::wstring doc_path;
     if (cmd_line && *cmd_line) {
         int argc = 0;
@@ -643,7 +826,6 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
     wc.lpszClassName = kWindowClass;
     RegisterClassExW(&wc);
 
-    // 恢复上次的窗口位置/尺寸（无效则用默认值）
     const lr::WindowState saved = lr::load_window_state(g_ini_path);
     int x = CW_USEDEFAULT, y = CW_USEDEFAULT, w = 1280, h = 800;
     if (saved.valid && placement_usable(saved)) {
@@ -653,13 +835,14 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
     g_hwnd = CreateWindowExW(0, kWindowClass, kWindowTitle, WS_OVERLAPPEDWINDOW,
                              x, y, w, h, nullptr, nullptr, inst, nullptr);
     if (!g_hwnd || !g_gfx.initialize(g_hwnd)) return 1;
+
+    g_renderer = std::make_unique<lr::Renderer>(g_gfx.device);
     g_ui.initialize(g_hwnd);
     DragAcceptFiles(g_hwnd, TRUE);
 
     if (!doc_path.empty()) request_open_document(std::move(doc_path));
 
-    ShowWindow(g_hwnd,
-               (saved.valid && saved.maximized) ? SW_MAXIMIZE : show);
+    ShowWindow(g_hwnd, (saved.valid && saved.maximized) ? SW_MAXIMIZE : show);
     UpdateWindow(g_hwnd);
 
     MSG msg{};
@@ -675,6 +858,7 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
         g_gfx.render_frame();
     }
 quit:
+    g_renderer.reset();  // 必须先于 gfx 释放：纹理依赖 D3D11 设备
     g_ui.shutdown();
     g_gfx.shutdown();
     return 0;

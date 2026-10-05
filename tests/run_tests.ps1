@@ -131,6 +131,14 @@ Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\utils.ifc",
     "/reference", "$out\document.ifc", "/Fo$out\doc_test.obj",
     (Join-Path $tests "doc_test.cpp"))) "编译 doc_test.cpp"
 
+# Phase 3：画布是纯布局数学（不依赖 MuPDF），单独编译成 canvas_test.exe
+Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\canvas.ifc", "/Fo$out\canvas.ixx.obj",
+    (Join-Path $src "canvas\canvas.ixx"))) "编译 canvas.ixx"
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\canvas.ifc",
+    "/Fo$out\canvas.obj", (Join-Path $src "canvas\canvas.cpp"))) "编译 canvas.cpp"
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\canvas.ifc",
+    "/Fo$out\canvas_test.obj", (Join-Path $tests "canvas_test.cpp"))) "编译 canvas_test.cpp"
+
 # 依赖库清单取自 unofficial-libmupdf 的 INTERFACE_LINK_LIBRARIES（不能改成"链上 lib\*.lib"：
 # jpeg.lib 与 turbojpeg.lib 会符号冲突）
 $libs = @("libmupdf.lib", "freetype.lib", "harfbuzz.lib", "jbig2dec.lib", "jpeg.lib",
@@ -143,6 +151,11 @@ $libdirs = @("/LIBPATH:$lib", "/LIBPATH:$(Join-Path $msvc.FullName 'lib\x64')",
              "/LIBPATH:$(Join-Path $sdkLib $sdkVer)\um\x64")
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\doc_test.exe", "$out\doc_test.obj", "$out\document.obj",
     "/link") + $libdirs + $libs) "链接 doc_test.exe"
+
+# 画布测试只用 C++ 标准库，无需 MuPDF 依赖库。
+# 必须一并链接 canvas.ixx.obj：接口单元里的内联成员（如 Canvas::state）由它发射。
+Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\canvas_test.exe", "$out\canvas_test.obj",
+    "$out\canvas.obj", "$out\canvas.ixx.obj", "/link") + $libdirs) "链接 canvas_test.exe"
 
 # ---- 4. 运行测试 ---------------------------------------------------------------
 
@@ -158,6 +171,16 @@ try {
 $testExit = $LASTEXITCODE
 Write-Host "  doc_test.exe 退出码 = $testExit"
 
+Step "运行画布测试"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & "$out\canvas_test.exe"
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$canvasExit = $LASTEXITCODE
+Write-Host "  canvas_test.exe 退出码 = $canvasExit"
+
 if ($Probe) {
     Step "编译并运行 MuPDF 诊断探针"
     Invoke-Cl ($defs + $incs + @("/c", "/Fo$out\mupdf_probe.obj",
@@ -168,9 +191,10 @@ if ($Probe) {
 }
 
 Step "结束"
-if ($testExit -eq 0) {
+if ($testExit -eq 0 -and $canvasExit -eq 0) {
     Write-Host "全部通过。" -ForegroundColor Green
 } else {
     Write-Host "存在失败用例。" -ForegroundColor Red
 }
-exit $testExit
+if ($testExit -ne 0) { exit $testExit }
+exit $canvasExit
