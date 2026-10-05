@@ -70,6 +70,67 @@ def minimal_pdf(pages=1, mediabox="0 0 200 300", mediaboxes=None):
     return out.getvalue()
 
 
+def pdf_with_outline(pages=3):
+    """带两级目录（outline）的最小 PDF，供 doc_test 断言 outline() 解析。
+
+    对象编号：
+      1 Catalog / 2 Pages / 3 Resources / 4 Font
+      之后每页两个对象：Page = 5+2i，Contents = 6+2i
+      目录对象：root = n_base+1，item1 = n_base+2，child1 = n_base+3，item2 = n_base+4
+    目录结构（前序）：Chapter 1（→页0，含子项） / Section 1.1（→页1） / Chapter 2（→页2）
+    """
+    assert pages >= 2
+    page_obj = [5 + 2 * i for i in range(pages)]
+    n_base = 4 + 2 * pages
+    root_no, item1_no, child1_no, item2_no = n_base + 1, n_base + 2, n_base + 3, n_base + 4
+
+    objs = []
+    kids = " ".join(f"{page_obj[i]} 0 R" for i in range(pages))
+    objs.append(f"<< /Type /Catalog /Pages 2 0 R /Outlines {root_no} 0 R >>".encode())
+    objs.append(f"<< /Type /Pages /Kids [ {kids} ] /Count {pages} >>".encode())
+    objs.append(b"<< /Font << /F1 4 0 R >> >>")
+    objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    for i in range(pages):
+        objs.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 200 300 ] "
+            f"/Resources 3 0 R /Contents {6 + 2 * i} 0 R >>".encode()
+        )
+        stream = b"BT /F1 24 Tf 20 150 Td (page) Tj ET"
+        objs.append(b"<< /Length " + str(len(stream)).encode()
+                    + b" >>\nstream\n" + stream + b"\nendstream")
+    # 目录对象（ASCII 标题，避免断言里的编码问题）
+    objs.append(f"<< /Type /Outlines /First {item1_no} 0 R /Last {item2_no} 0 R "
+                f"/Count 3 >>".encode())
+    objs.append(
+        f"<< /Title (Chapter 1) /Parent {root_no} 0 R /Next {item2_no} 0 R "
+        f"/First {child1_no} 0 R /Last {child1_no} 0 R /Count 2 "
+        f"/Dest [ {page_obj[0]} 0 R /Fit ] >>".encode()
+    )
+    objs.append(
+        f"<< /Title (Section 1.1) /Parent {item1_no} 0 R "
+        f"/Dest [ {page_obj[1]} 0 R /Fit ] >>".encode()
+    )
+    objs.append(
+        f"<< /Title (Chapter 2) /Parent {root_no} 0 R /Prev {item1_no} 0 R "
+        f"/Dest [ {page_obj[2]} 0 R /Fit ] >>".encode()
+    )
+
+    out = io.BytesIO()
+    out.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(out.tell())
+        out.write(f"{i} 0 obj\n".encode() + body + b"\nendobj\n")
+    xref = out.tell()
+    n = len(objs) + 1
+    out.write(f"xref\n0 {n}\n".encode())
+    out.write(b"0000000000 65535 f \n")
+    for off in offsets:
+        out.write(f"{off:010d} 00000 n \n".encode())
+    out.write(f"trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return out.getvalue()
+
+
 def png_1x1(gray=200):
     """最小合法 PNG（1x1 RGB）。"""
     def chunk(tag, data):
@@ -223,6 +284,8 @@ def main():
     write("real.xps", xps)
     write("real.png", png)
     write("comic.cbz", zip_of([("1.png", png), ("2.png", png_1x1(120)), ("3.png", png_1x1(60))]))
+    # 带两级目录的 PDF：供 doc_test 断言 outline() 的层级/页号解析
+    write("outline.pdf", pdf_with_outline(3))
 
     log("== 2. 改名但内容可正常读（应打开，界面提示不符） ==")
     write("img_named_pdf.pdf", png)

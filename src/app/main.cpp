@@ -1,5 +1,5 @@
 // main.cpp — Lilith Reader 应用外壳（Phase 1 外壳 + Phase 2 文档核心 + Phase 3 自研画布
-// + Phase 4 渲染调度：失败重试 / 方向感知预加载 / 缓存预算）
+// + Phase 4 渲染调度 + Phase 5 阅读功能：阅读位置/目录/书签/缩略图/旋转/双页对开/反色护眼/密码）
 // Win32 + D3D11 + ImGui：命令行/拖放打开、窗口状态持久化、画布阅读（滚动/缩放/多列网格）。
 //
 // 分层（架构文档 §1）：main 只做 UI 与输入；文档经 render 调度层访问（UI 线程零 fz_*、
@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -30,6 +31,7 @@ import lilithreader.utils;
 import lilithreader.document;
 import lilithreader.canvas;
 import lilithreader.render;
+import lilithreader.reader_state;
 
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
@@ -230,7 +232,7 @@ std::unique_ptr<lr::Renderer> g_renderer;  // 渲染调度层（Phase 3 取代 D
 lr::Canvas g_canvas;
 
 struct UiDoc {
-    enum class Kind { None, Rejected, Opening, Reading, Failed };
+    enum class Kind { None, Rejected, Opening, Reading, Failed, NeedsPassword };
     Kind         kind = Kind::None;
     std::wstring path_w;
     std::string  name_u8, ext_u8;
@@ -244,6 +246,42 @@ std::wstring g_ini_path;
 bool g_show_debug = false;
 bool g_fullscreen = false;
 WINDOWPLACEMENT g_prev_placement{ sizeof(WINDOWPLACEMENT) };
+
+// ---- 阅读状态持久化（Phase 5）----
+lr::ReaderState g_state;          // exe 同目录 reader_state.bin 的全部记录
+std::wstring    g_state_path;
+std::uint64_t   g_doc_key = 0;    // 当前文档键（0 = 无效，不参与存取）
+
+// ---- 侧栏（Phase 5）：目录 / 书签 / 缩略图 ----
+bool  g_show_sidebar = false;
+int   g_sidebar_tab = 0;          // 0 目录 / 1 书签 / 2 缩略图
+constexpr float kSidebarWidthPx = 300.0f;   // 基准像素，用前过 px()
+constexpr int   kThumbTargetPx = 150;       // 缩略图最长边目标像素
+
+// ---- 视图变换（Phase 5）----
+int g_rotation = 0;               // 0/90/180/270
+int g_color_mode = 0;             // 0 正常 / 1 反色 / 2 护眼
+// 未旋转的逐页尺寸（点）；旋转 90/270 时交换宽高后再交给画布。
+std::vector<lr::PageSizePt> g_raw_sizes;
+lr::PageSizePt g_raw_default{ 595.0f, 842.0f };
+
+// 打开后待恢复的阅读位置（首帧视口就绪后再应用，否则 fit-width 派生 zoom 尚未成立）
+bool g_restore_pending = false;
+int  g_restore_page = 0;
+
+// ---- 目录（Phase 5）----
+std::vector<lr::OutlineItem> g_outline;
+
+// ---- 加密密码对话框（Phase 5）----
+bool        g_open_password = false;
+char        g_password_buf[256] = {};
+std::string g_password_error;
+
+// ---- 输入法关联（Phase 5）----
+// ADR-028 要求：整窗脱离输入法的代价是"将来加入中文输入时必须改回仅在文本输入激活时关联"。
+// Phase 5 引入了密码框/书签标签等文本输入，故在此落实：WantTextInput 变化时切换关联状态。
+HIMC g_saved_ime = nullptr;       // 启动时保存的默认输入法上下文
+bool g_ime_attached = false;      // 当前是否已关联（文本输入激活）
 
 // 缩放防抖状态（详见 update_want_scale）
 float  g_want_scale = -1.0f;         // 已投递给渲染层的倍率；<0 表示尚未初始化
@@ -286,6 +324,99 @@ void update_title() {
 
 // ---------------- 文档状态机（UI 侧） ----------------
 
+// ---------------- 视图变换 / 页尺寸（Phase 5） ----------------
+
+// 把（可能已旋转的）页尺寸交给画布：90/270 交换宽高。
+// 画布本身不感知旋转——旋转被折算成"页尺寸宽高互换"，布局/翻页/缩放全部复用。
+void push_canvas_sizes() {
+    const bool swap = (g_rotation == 90 || g_rotation == 270);
+    auto conv = [swap](lr::PageSizePt s) {
+        if (swap) { const float t = s.w; s.w = s.h; s.h = t; }
+        return s;
+    };
+    const lr::PageSizePt def = conv(g_raw_default);
+    g_canvas.set_default_size(def);
+    if (g_raw_sizes.empty()) {
+        g_canvas.set_uniform(g_doc.info.page_count, def);
+    } else {
+        std::vector<lr::PageSizePt> v;
+        v.reserve(g_raw_sizes.size());
+        for (const lr::PageSizePt& s : g_raw_sizes) v.push_back(conv(s));
+        g_canvas.set_page_sizes(std::move(v));
+    }
+}
+
+// 把当前旋转/配色下发给渲染层（变化即让全部纹理失效并整篇重渲）。
+void apply_view_transform() {
+    g_renderer->set_view_transform(g_rotation, static_cast<lr::ColorMode>(g_color_mode));
+}
+
+void rotate_view(int delta) {
+    g_rotation = (g_rotation + delta + 360) % 360;
+    const int anchor = g_canvas.current_page();
+    push_canvas_sizes();                                   // 尺寸宽高互换 → 布局变化
+    g_canvas.scroll_to_page(anchor < 0 ? 0 : anchor, 0.0f);
+    apply_view_transform();
+}
+
+void toggle_color_mode(int mode) {
+    g_color_mode = (g_color_mode == mode) ? 0 : mode;
+    apply_view_transform();
+}
+
+// ---------------- 阅读位置与书签（Phase 5） ----------------
+
+void save_reading_state() {
+    if (g_doc_key == 0 || g_doc.kind != UiDoc::Kind::Reading) return;
+    lr::DocRecord& r = g_state.upsert(g_doc_key);
+    const int page = g_canvas.current_page();
+    r.page = page < 0 ? 0 : page;
+    r.zoom = g_canvas.state().zoom;
+    r.columns = g_canvas.state().columns;
+    r.rotation = g_rotation;
+    r.fit_width = g_canvas.state().fit_width;
+    r.spread = g_canvas.state().spread;
+    r.color_mode = g_color_mode;
+    (void)lr::save_state(g_state_path, g_state);  // 书签在增删时已写入 g_state，这里不覆盖
+}
+
+bool current_page_has_bookmark() {
+    const lr::DocRecord* r = g_state.find(g_doc_key);
+    if (!r) return false;
+    const int page = g_canvas.current_page();
+    for (const lr::Bookmark& b : r->bookmarks)
+        if (b.page == page) return true;
+    return false;
+}
+
+void toggle_bookmark_current() {
+    if (g_doc_key == 0 || g_doc.kind != UiDoc::Kind::Reading) return;
+    const int page = g_canvas.current_page();
+    if (page < 0) return;
+    lr::DocRecord& r = g_state.upsert(g_doc_key);
+    for (auto it = r.bookmarks.begin(); it != r.bookmarks.end(); ++it) {
+        if (it->page == page) {
+            r.bookmarks.erase(it);
+            (void)lr::save_state(g_state_path, g_state);
+            return;
+        }
+    }
+    r.bookmarks.push_back(lr::Bookmark{ page, {} });
+    (void)lr::save_state(g_state_path, g_state);
+}
+
+void remove_bookmark_at(int index) {
+    if (g_doc_key == 0) return;
+    lr::DocRecord* r = nullptr;
+    for (auto& kv : g_state.docs)
+        if (kv.first == g_doc_key) { r = &kv.second; break; }
+    if (r == nullptr || index < 0 || index >= static_cast<int>(r->bookmarks.size())) return;
+    r->bookmarks.erase(r->bookmarks.begin() + index);
+    (void)lr::save_state(g_state_path, g_state);
+}
+
+// ---------------- 文档状态机（UI 侧） ----------------
+
 void reset_doc_state() {
     g_doc.kind = UiDoc::Kind::None;
     g_doc.path_w.clear();
@@ -302,47 +433,65 @@ void reset_doc_state() {
     g_canvas_scale = -1.0f;
     g_scroll_dir = 0;
     g_prev_scroll_y = 0.0f;
+    g_doc_key = 0;
+    g_outline.clear();
+    g_raw_sizes.clear();
+    g_restore_pending = false;
+    g_rotation = 0;
+    g_color_mode = 0;
+    g_show_sidebar = false;
+    g_open_password = false;
+    g_password_buf[0] = '\0';
+    g_password_error.clear();
     update_title();
 }
 
-// 文档打开成功 → 初始化画布并进入阅读态
+// 文档打开成功 → 初始化画布并进入阅读态（恢复该文档记忆的阅读位置与视图参数）
 void enter_reading() {
-    lr::PageSizePt sz;
-    sz.w = g_doc.info.page_width_pt > 0.0f ? g_doc.info.page_width_pt : 595.0f;
-    sz.h = g_doc.info.page_height_pt > 0.0f ? g_doc.info.page_height_pt : 842.0f;
+    g_raw_default.w = g_doc.info.page_width_pt > 0.0f ? g_doc.info.page_width_pt : 595.0f;
+    g_raw_default.h = g_doc.info.page_height_pt > 0.0f ? g_doc.info.page_height_pt : 842.0f;
+    g_raw_sizes.clear();
+    g_raw_sizes.reserve(g_doc.info.page_sizes.size());
+    for (const lr::PageSize& ps : g_doc.info.page_sizes) {
+        lr::PageSizePt e;
+        e.w = ps.width_pt > 0.0f ? ps.width_pt : g_raw_default.w;
+        e.h = ps.height_pt > 0.0f ? ps.height_pt : g_raw_default.h;
+        g_raw_sizes.push_back(e);
+    }
+
+    // 恢复记忆状态（无记录则用默认：fit-width / 单列 / 不旋转 / 正常配色）
+    const lr::DocRecord* rec = g_state.find(g_doc_key);
+    g_rotation = rec ? rec->rotation : 0;
+    g_color_mode = rec ? rec->color_mode : 0;
 
     lr::CanvasState st;  // 默认：fit_width=true, columns=1
     st.margin_px = px(kCanvasMarginPx);   // 屏幕像素 → 随 DPI
     st.gap_ratio = kCanvasGapRatio;       // 列宽比例 → 随缩放（ADR-029），不随 DPI
+    if (rec) {
+        st.zoom = rec->zoom;
+        st.columns = rec->columns;
+        st.fit_width = rec->fit_width;
+        st.spread = rec->spread;
+    }
 
     g_canvas = lr::Canvas{};
-    g_canvas.set_default_size(sz);
-
-    // 逐页真实尺寸：PDF 允许各页尺寸/纵横比不同（封面、插页、横向页、扫描裁切不一）。
-    // 若只用首页尺寸统一布局，各页纹理会被拉伸进"首页纵横比"的矩形 → 异构 PDF 形变。
-    // 尺寸探测失败的页为 {0,0}，此处按首页尺寸回退。
-    std::vector<lr::PageSizePt> sizes;
-    sizes.reserve(g_doc.info.page_sizes.size());
-    for (const lr::PageSize& ps : g_doc.info.page_sizes) {
-        lr::PageSizePt e;
-        e.w = ps.width_pt > 0.0f ? ps.width_pt : sz.w;
-        e.h = ps.height_pt > 0.0f ? ps.height_pt : sz.h;
-        sizes.push_back(e);
-    }
-    if (sizes.empty())
-        g_canvas.set_uniform(g_doc.info.page_count, sz);
-    else
-        g_canvas.set_page_sizes(std::move(sizes));
-
+    g_canvas.set_margin_gap(st.margin_px, st.gap_ratio);
+    push_canvas_sizes();   // 逐页真实尺寸（旋转折算），异构 PDF 不形变
     g_canvas.set_state(st);
-    g_canvas.clamp_scroll();
 
     g_want_scale = -1.0f;  // 首帧立即采用目标倍率，不走防抖
     g_last_target_scale = -1.0f;
     g_zoom_dirty_since = -1.0;
     g_canvas_scale = ui_scale();  // 留白已按当前缩放写入
     g_scroll_dir = 0;             // 方向未定：首帧两侧都预取
-    g_prev_scroll_y = g_canvas.state().scroll_y;
+    g_prev_scroll_y = 0.0f;
+
+    // 阅读位置待首帧视口就绪后恢复（fit-width 派生 zoom 依赖视口尺寸，此刻视口还是 0）
+    g_restore_pending = true;
+    g_restore_page = rec ? rec->page : 0;
+
+    apply_view_transform();            // 旋转/配色下发（首次会触发整篇重渲）
+    g_outline = g_renderer->outline(); // 目录快照（一次性）
 }
 
 void request_open_document(std::wstring path) {
@@ -354,6 +503,9 @@ void request_open_document(std::wstring path) {
     g_doc.detail_u8.clear();
     g_doc.info = lr::DocumentInfo{};
     g_canvas = lr::Canvas{};
+    g_outline.clear();
+    g_show_sidebar = false;
+    g_doc_key = lr::document_key(path);  // 0 = 取不到属性（不存在等）
 
     // 本地即时判定：不存在 / 不在支持清单内（不必浪费一次线程往返）
     if (!lr::file_exists(path)) {
@@ -375,7 +527,9 @@ void request_open_document(std::wstring path) {
 }
 
 void close_document() {
-    if (g_doc.kind == UiDoc::Kind::Opening || g_doc.kind == UiDoc::Kind::Reading)
+    save_reading_state();  // 关闭前落盘阅读位置（书签已实时落盘）
+    if (g_doc.kind == UiDoc::Kind::Opening || g_doc.kind == UiDoc::Kind::Reading ||
+        g_doc.kind == UiDoc::Kind::NeedsPassword)
         g_renderer->close();
     reset_doc_state();
 }
@@ -395,15 +549,34 @@ void poll_document() {
         enter_reading();
         break;
     case lr::DocPhase::Failed:
-        g_doc.kind = UiDoc::Kind::Failed;
         g_doc.error = snap.error;
         g_doc.detail_u8 = snap.detail_u8;
+        if (snap.error == lr::DocError::NeedsPassword) {
+            // 加密文档：弹密码框（文档仍处于打开态，可继续 authenticate）
+            g_doc.kind = UiDoc::Kind::NeedsPassword;
+            g_open_password = true;
+            g_password_buf[0] = '\0';
+            g_password_error = snap.detail_u8.find("invalid password") != std::string::npos
+                                   ? "密码错误，请重试"
+                                   : std::string();
+        } else {
+            g_doc.kind = UiDoc::Kind::Failed;
+        }
         break;
     default:  // Idle：被显式关闭
         reset_doc_state();
         return;
     }
     update_title();
+}
+
+void submit_password() {
+    if (g_password_buf[0] == '\0') { g_password_error = "请输入密码"; return; }
+    g_doc.kind = UiDoc::Kind::Opening;
+    g_doc.request_id = g_renderer->authenticate(g_password_buf);
+    g_open_password = false;
+    g_password_error.clear();
+    std::memset(g_password_buf, 0, sizeof g_password_buf);
 }
 
 // ---------------- 窗口状态校验 ----------------
@@ -524,6 +697,18 @@ void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered)
         g_jump_page = g_canvas.current_page() + 1;
     }
     if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) toggle_fullscreen();
+
+    // ---- Phase 5 快捷键 ----
+    if (ImGui::IsKeyPressed(ImGuiKey_R, false)) rotate_view(90);           // 旋转 +90°
+    if (ImGui::IsKeyPressed(ImGuiKey_D, false))                            // 双页对开（书籍模式）
+        g_canvas.set_spread(!g_canvas.state().spread);
+    if (ImGui::IsKeyPressed(ImGuiKey_I, false)) toggle_color_mode(1);      // 反色
+    if (ImGui::IsKeyPressed(ImGuiKey_E, false)) toggle_color_mode(2);      // 护眼
+    if (ImGui::IsKeyPressed(ImGuiKey_O, false)) {                          // 侧栏（目录/书签/缩略图）
+        g_show_sidebar = !g_show_sidebar;
+        if (g_show_sidebar) g_sidebar_tab = 0;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_B, false)) toggle_bookmark_current(); // 当前页书签增删
 }
 
 // 缩放防抖：目标倍率稳定 150ms 后，才按新倍率请求高清重渲染；
@@ -617,6 +802,13 @@ void draw_canvas_area() {
     }
     g_canvas.set_viewport(size.x, size.y);
 
+    // 首帧视口就绪后恢复阅读位置（fit-width 派生 zoom 依赖视口尺寸，打开时视口还是 0）
+    if (g_restore_pending) {
+        g_restore_pending = false;
+        g_canvas.scroll_to_page(g_restore_page, 0.0f);
+        g_prev_scroll_y = g_canvas.state().scroll_y;  // 避免首帧被误判为滚动
+    }
+
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(origin, ImVec2(origin.x + size.x, origin.y + size.y), kColBackdrop);
 
@@ -644,7 +836,7 @@ void draw_canvas_area() {
         }
     }
 
-    if (!g_open_jump) handle_canvas_input(origin, size, hovered);
+    if (!g_open_jump && !g_open_password) handle_canvas_input(origin, size, hovered);
 
     // 滚动方向（供方向感知预加载）：以内容坐标 scroll_y 的变化判定。
     // 阈值 0.5px 抑制浮点抖动导致的假翻转。
@@ -712,18 +904,23 @@ void draw_status_bar() {
         left += " 不符）";
     }
 
-    char right[160];
-    std::snprintf(right, sizeof right, "%d / %d   ·   %d%%   ·   %d 列",
-                  cur, total,
-                  static_cast<int>(std::lround(g_canvas.effective_zoom() * 100.0f)),
-                  g_canvas.state().columns);
+    const int cols_shown = g_canvas.state().spread ? 2 : g_canvas.state().columns;
+    std::string right = std::to_string(cur) + " / " + std::to_string(total) + "   ·   " +
+                        std::to_string(static_cast<int>(
+                            std::lround(g_canvas.effective_zoom() * 100.0f))) + "%   ·   " +
+                        std::to_string(cols_shown) + " 列";
+    if (g_canvas.state().spread) right += "   ·   对开";
+    if (g_rotation != 0) right += "   ·   旋转 " + std::to_string(g_rotation) + "°";
+    if (g_color_mode == 1) right += "   ·   反色";
+    else if (g_color_mode == 2) right += "   ·   护眼";
+    if (current_page_has_bookmark()) right += "   ·   ★";
 
     ImGui::SetCursorPos(ImVec2(px(10), (bar_h - ImGui::GetTextLineHeight()) * 0.5f));
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColChromeText), "%s", left.c_str());
 
-    const float rw = ImGui::CalcTextSize(right).x;
+    const float rw = ImGui::CalcTextSize(right.c_str()).x;
     ImGui::SetCursorPos(ImVec2(ws.x - rw - px(10), (bar_h - ImGui::GetTextLineHeight()) * 0.5f));
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColChromeDim), "%s", right);
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kColChromeDim), "%s", right.c_str());
 
     ImGui::EndChild();
 }
@@ -804,7 +1001,8 @@ void draw_debug_overlay() {
                             (double)(g_dpi_scale * 100.0f), (double)(g_user_scale * 100.0f),
                             (double)ImGui::GetFontSize());
 
-        static const char* kKindNames[] = { "none", "rejected", "opening", "reading", "failed" };
+        static const char* kKindNames[] = { "none", "rejected", "opening", "reading", "failed",
+                                            "needs-password" };
         ImGui::Separator();
         ImGui::Text("doc: %s", kKindNames[static_cast<int>(g_doc.kind)]);
         ImGui::TextDisabled("err: %.*s", (int)lr::to_string(g_doc.error).size(),
@@ -826,6 +1024,14 @@ void draw_debug_overlay() {
                         g_canvas.max_scroll_y());
             ImGui::Text("cols: %d  fit: %d", g_canvas.state().columns,
                         g_canvas.state().fit_width ? 1 : 0);
+            // Phase 5：视图变换与侧栏
+            ImGui::Text("rot: %d  color: %d  spread: %d",
+                        g_rotation, g_color_mode, g_canvas.state().spread ? 1 : 0);
+            const lr::DocRecord* rec = g_state.find(g_doc_key);
+            ImGui::TextDisabled("outline: %d  bookmarks: %d  sidebar: %d tab %d",
+                                static_cast<int>(g_outline.size()),
+                                rec ? static_cast<int>(rec->bookmarks.size()) : 0,
+                                g_show_sidebar ? 1 : 0, g_sidebar_tab);
             // 缓存统计（Phase 4）：驻留字节/预算、驻留页数、累计逐出页数
             const lr::CacheStats cs = g_renderer->cache_stats();
             ImGui::Text("cache: %.1f / %.0f MB  pages %d  evict %d",
@@ -874,10 +1080,146 @@ void draw_jump_popup() {
     }
 }
 
+// ---------------- 侧栏（Phase 5）：目录 / 书签 / 缩略图 ----------------
+
+void draw_outline_tab() {
+    if (g_outline.empty()) { ImGui::TextDisabled("本文档没有目录"); return; }
+    ImGui::BeginChild("##outline_list", ImVec2(0, 0), false);
+    const int cur = g_canvas.current_page();
+    for (int i = 0; i < static_cast<int>(g_outline.size()); ++i) {
+        const lr::OutlineItem& it = g_outline[i];
+        const char* label = it.title.empty() ? "(无标题)" : it.title.c_str();
+        ImGui::PushID(i);
+        if (it.depth > 0) ImGui::Indent(px(14.0f) * static_cast<float>(it.depth));
+        const bool selected = (it.page >= 0 && it.page == cur);
+        if (ImGui::Selectable(label, selected) && it.page >= 0)
+            g_canvas.scroll_to_page(it.page, 0.0f);
+        if (it.depth > 0) ImGui::Unindent(px(14.0f) * static_cast<float>(it.depth));
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+}
+
+void draw_bookmarks_tab() {
+    const int cur = g_canvas.current_page();
+    if (ImGui::Button(current_page_has_bookmark() ? "删除当前页书签" : "添加当前页书签"))
+        toggle_bookmark_current();
+    ImGui::Separator();
+
+    const lr::DocRecord* r = g_state.find(g_doc_key);
+    if (r == nullptr || r->bookmarks.empty()) {
+        ImGui::TextDisabled("暂无书签");
+        ImGui::TextDisabled("（按 B 在当前页增删）");
+        return;
+    }
+    ImGui::BeginChild("##bm_list", ImVec2(0, 0), false);
+    int del = -1;
+    for (int i = 0; i < static_cast<int>(r->bookmarks.size()); ++i) {
+        const lr::Bookmark& b = r->bookmarks[i];
+        ImGui::PushID(i);
+        char label[64];
+        std::snprintf(label, sizeof label, "第 %d 页", b.page + 1);
+        if (ImGui::Selectable(label, b.page == cur)) g_canvas.scroll_to_page(b.page, 0.0f);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("×")) del = i;
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    if (del >= 0) remove_bookmark_at(del);  // 循环外删除，避免迭代器失效
+}
+
+void draw_thumbnails_tab() {
+    const int n = g_canvas.page_count();
+    if (n <= 0) { ImGui::TextDisabled("无页面"); return; }
+
+    // 只请求当前页附近一段（±40 页）：既够滚动浏览，又不至于一次性渲染整本书。
+    const int cur = std::max(0, g_canvas.current_page());
+    const int lo = std::max(0, cur - 40);
+    const int hi = std::min(n - 1, cur + 40);
+    std::vector<int> want;
+    want.reserve(static_cast<std::size_t>(hi - lo + 1));
+    for (int i = lo; i <= hi; ++i) want.push_back(i);
+    g_renderer->set_thumbs_wanted(std::move(want), kThumbTargetPx);
+
+    ImGui::BeginChild("##thumb_list", ImVec2(0, 0), false);
+    for (int i = lo; i <= hi; ++i) {
+        const lr::PageSlot s = g_renderer->thumb_slot(i);
+        ImGui::PushID(i);
+        char label[32];
+        std::snprintf(label, sizeof label, "第 %d 页", i + 1);
+        if (ImGui::Selectable(label, i == cur)) g_canvas.scroll_to_page(i, 0.0f);
+        if (s.texture != nullptr && s.pixel_w > 0 && s.pixel_h > 0) {
+            const float w = px(130.0f);
+            const float h = w * static_cast<float>(s.pixel_h) / static_cast<float>(s.pixel_w);
+            ImGui::Image(static_cast<ImTextureID>(reinterpret_cast<std::intptr_t>(s.texture)),
+                         ImVec2(w, h));
+        } else {
+            ImGui::TextDisabled(s.status == lr::PageStatus::Failed ? "（缩略图失败）" : "载入中…");
+        }
+        ImGui::Separator();
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+}
+
+void draw_sidebar() {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(8), px(8)));
+    ImGui::BeginChild("##sidebar", ImVec2(px(kSidebarWidthPx), -px(kStatusBarH)), false,
+                      ImGuiWindowFlags_NoNav);
+    ImGui::PopStyleVar();
+    if (ImGui::BeginTabBar("##sidebar_tabs")) {
+        if (ImGui::BeginTabItem("目录")) { g_sidebar_tab = 0; draw_outline_tab(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("书签")) { g_sidebar_tab = 1; draw_bookmarks_tab(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("缩略图")) { g_sidebar_tab = 2; draw_thumbnails_tab(); ImGui::EndTabItem(); }
+        ImGui::EndTabBar();
+    }
+    ImGui::EndChild();
+}
+
+// ---------------- 密码对话框（Phase 5） ----------------
+void draw_password_popup() {
+    if (!g_open_password) return;
+    if (!ImGui::IsPopupOpen("需要密码")) ImGui::OpenPopup("需要密码");
+    if (ImGui::BeginPopupModal("需要密码", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("此文档已加密，请输入密码：");
+        ImGui::TextDisabled("%s", g_doc.name_u8.c_str());
+        ImGui::SetNextItemWidth(px(260));
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        const bool enter = ImGui::InputText("##pwd", g_password_buf, sizeof g_password_buf,
+                                            ImGuiInputTextFlags_Password |
+                                            ImGuiInputTextFlags_EnterReturnsTrue);
+        if (!g_password_error.empty())
+            ImGui::TextColored(ImVec4(0.9f, 0.35f, 0.35f, 1.0f), "%s", g_password_error.c_str());
+        const bool ok = enter || ImGui::Button("解锁");
+        ImGui::SameLine();
+        const bool cancel = ImGui::Button("取消");
+        if (ok) {
+            submit_password();
+            ImGui::CloseCurrentPopup();
+        } else if (cancel) {
+            g_open_password = false;
+            ImGui::CloseCurrentPopup();
+            close_document();  // 取消即关闭该文档，回到引导页
+        }
+        ImGui::EndPopup();
+    }
+}
+
+// 输入法关联随文本输入激活状态切换（落实 ADR-028 的后续要求）：
+// 阅读窗口平时脱离输入法（让字母/数字快捷键生效）；密码框/文本输入激活时临时关联回来，
+// 否则中文打不进去。
+void update_ime_association() {
+    const bool want = ImGui::GetIO().WantTextInput;
+    if (want == g_ime_attached) return;
+    g_ime_attached = want;
+    ImmAssociateContext(g_hwnd, want ? g_saved_ime : nullptr);
+}
+
 // ---------------- 顶层 UI ----------------
 void draw_shell() {
     poll_document();
     g_renderer->drain_retired();  // 帧首：释放上一帧退役的纹理
+    update_ime_association();     // 输入法关联随文本输入激活状态切换（ADR-028）
 
     if (ImGui::IsKeyPressed(ImGuiKey_F3, false)) g_show_debug ^= 1;
 
@@ -902,11 +1244,18 @@ void draw_shell() {
         draw_opening();
         break;
     case UiDoc::Kind::Reading:
+        if (g_show_sidebar) {
+            draw_sidebar();
+            ImGui::SameLine(0.0f, 0.0f);
+        }
         draw_canvas_area();
         draw_status_bar();
         break;
     case UiDoc::Kind::Failed:
         draw_failed();
+        break;
+    case UiDoc::Kind::NeedsPassword:
+        draw_failed();  // 背景铺失败页，密码框浮在其上
         break;
     case UiDoc::Kind::Rejected:
         draw_rejected();
@@ -916,10 +1265,14 @@ void draw_shell() {
 
     if (g_show_debug) draw_debug_overlay();
     draw_jump_popup();
+    draw_password_popup();
 
-    // Esc：跳页弹窗 → 关闭弹窗；有文档 → 关闭返回引导页；无文档 → 退出
+    // Esc：密码框 → 关闭并放弃文档；跳页弹窗 → 关弹窗；有文档 → 关闭返回引导页；无文档 → 退出
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-        if (g_open_jump) {
+        if (g_open_password) {
+            g_open_password = false;
+            close_document();
+        } else if (g_open_jump) {
             g_open_jump = false;
         } else if (g_doc.kind != UiDoc::Kind::None) {
             close_document();
@@ -932,9 +1285,10 @@ void draw_shell() {
 // ---------------- 窗口过程 ----------------
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     // 切换输入语言（Alt+Shift / Win+Space）时，系统会给窗口**重新关联**输入法，
-    // 把 ImmAssociateContext(hwnd, nullptr) 的脱离顶掉 —— 这里再脱一次（ADR-028）。
+    // 把 ImmAssociateContext(hwnd, nullptr) 的脱离顶掉 —— 这里按当前状态再脱/再关联一次。
     // 必须放在 ImGui 后端处理器**之前**：后端会消费 WM_INPUTLANGCHANGE 并 return 1。
-    if (msg == WM_INPUTLANGCHANGE) ImmAssociateContext(hwnd, nullptr);
+    if (msg == WM_INPUTLANGCHANGE)
+        ImmAssociateContext(hwnd, g_ime_attached ? g_saved_ime : nullptr);
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return 1;
     switch (msg) {
     case WM_SIZE:
@@ -968,6 +1322,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                          SWP_NOZORDER | SWP_NOACTIVATE);
         return 0;
     case WM_DESTROY: {
+        save_reading_state();  // 退出时落盘阅读位置（书签已实时落盘）
         if (!g_fullscreen) {  // 全屏态不覆盖保存的正常态矩形
             WINDOWPLACEMENT placement{ sizeof(placement) };
             if (GetWindowPlacement(hwnd, &placement)) {
@@ -1005,6 +1360,8 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
     }
 
     g_ini_path = lr::exe_dir() + L"LilithReader.ini";
+    g_state_path = lr::exe_dir() + L"reader_state.bin";
+    g_state = lr::load_state(g_state_path);  // 阅读位置/书签（损坏则安全忽略为空）
 
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1044,10 +1401,10 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
     // 输入法启用时，Windows 会把字母/数字键的 WM_KEYDOWN 换成 VK_PROCESSKEY(0xE5)，
     // 而 ImGui 的 win32 后端不映射这个键码 → 这些键在 ImGui 里**完全不置位**，
     // 所有字母/数字快捷键（1~4 切列、F 回 fit-width、G 跳页…）静默失效。
-    // 第四轮实测证据：WM_KEYDOWN 收到 E5 E5 E5 E5、WM_CHAR 收到正常的 '2'。
-    // 本阶段没有任何需要输入法的文本输入（唯一的文本框是纯数字页码），故整窗脱离输入法，
-    // 让键盘回归原生语义。将来加入中文输入（搜索/批注）时，改为"仅在文本输入激活时关联输入法"。
-    ImmAssociateContext(g_hwnd, nullptr);
+    // Phase 5 起：保存默认输入法上下文，平时脱离；仅在文本输入激活（密码框等）时关联回来，
+    // 使中文可输入（见 update_ime_association，落实 ADR-028 的后续要求）。
+    g_saved_ime = ImmAssociateContext(g_hwnd, nullptr);
+    g_ime_attached = false;
 
     if (!doc_path.empty()) request_open_document(std::move(doc_path));
 

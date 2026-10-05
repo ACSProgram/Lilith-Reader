@@ -132,6 +132,27 @@ struct Renderer::Impl {
     std::uint64_t       use_tick = 0;                         // LRU 时钟
     int                 evictions = 0;                        // 累计逐出页数
 
+    // ---- 视图变换（Phase 5）----
+    // 全局（文档级）的旋转与配色：渲染每一页时传给 Document::render_page。
+    int rotation_ = 0;      // 0/90/180/270
+    int color_mode_ = 0;    // 见 document.ixx 的 ColorMode
+
+    // ---- 缩略图通道（Phase 5）----
+    // 与页缓存分开存储、独立字节记账；不参与页缓存 LRU/预算。
+    std::vector<Entry>   thumbs;
+    std::size_t          thumb_bytes = 0;
+    std::vector<int>     thumb_pages;       // 本帧需要的缩略图页
+    std::vector<int>     last_thumb_pages;  // 去重用
+    int                  thumb_target_px = 150;
+    int                  last_thumb_px = -1;
+    bool                 thumbs_dirty = false;
+
+    // 文档信息副本：缩略图需按"旋转后"的页尺寸算目标倍率（页纹理不需要，倍率由 UI 给定）。
+    DocumentInfo info_;
+
+    // 目录（outline）快照：打开/解锁成功后一次性加载，供 UI 取用。
+    std::vector<OutlineItem> outline_;
+
     // 两段式退役队列（见文件头）
     std::vector<void*>  retired_pending;
     std::vector<void*>  retired_ready;
@@ -148,11 +169,14 @@ struct Renderer::Impl {
         std::lock_guard lock(mtx);
         for (Entry& e : pages) release_srv(e.slot.texture);
         pages.clear();
+        for (Entry& e : thumbs) release_srv(e.slot.texture);
+        thumbs.clear();
         for (void* p : retired_pending) release_srv(p);
         for (void* p : retired_ready) release_srv(p);
         retired_pending.clear();
         retired_ready.clear();
         used_bytes = 0;
+        thumb_bytes = 0;
     }
 
     static void release_srv(void* p) {
@@ -184,6 +208,49 @@ struct Renderer::Impl {
         evictions = 0;
     }
 
+    // 缩略图纹理退役（扣减 thumb_bytes 而不是页缓存 used_bytes）
+    void retire_thumb_locked(Entry& e) {
+        if (e.slot.texture) {
+            retired_pending.push_back(e.slot.texture);
+            e.slot.texture = nullptr;
+        }
+        if (e.bytes) {
+            thumb_bytes = thumb_bytes >= e.bytes ? thumb_bytes - e.bytes : 0;
+            e.bytes = 0;
+        }
+        e.slot.pixel_w = 0;
+        e.slot.pixel_h = 0;
+        e.slot.scale = 0.0f;
+    }
+
+    void clear_thumbs_locked() {
+        for (Entry& e : thumbs) retire_thumb_locked(e);
+        thumbs.clear();
+        thumb_bytes = 0;
+        last_thumb_pages.clear();
+        last_thumb_px = -1;
+    }
+
+    // 视图变换变化（旋转/配色）时调用：全部页纹理与缩略图作废并重新排队。
+    // 变换结果已固化进纹理像素，无法在原纹理上"改属性"，必须整篇重渲。
+    void invalidate_all_locked() {
+        for (Entry& e : pages) {
+            retire_entry_locked(e);
+            e.slot.status = PageStatus::Unloaded;
+            e.slot.error = DocError::Ok;
+            e.auto_retries = 0;
+            e.failed_scale = -1.0f;
+        }
+        for (Entry& e : thumbs) {
+            retire_thumb_locked(e);
+            e.slot.status = PageStatus::Unloaded;
+            e.slot.error = DocError::Ok;
+        }
+        last_wants.clear();
+        last_thumb_pages.clear();
+        last_thumb_px = -1;
+    }
+
     void publish_doc(const DocState& s) {
         std::lock_guard lock(mtx);
         doc = s;
@@ -202,10 +269,13 @@ struct Renderer::Impl {
         for (;;) {
             std::optional<Command>  c;
             std::vector<RenderWant> w;
+            std::vector<int>        tw;
             bool have_wants = false;
+            bool have_thumbs = false;
+            int  thumb_px = 150;
             {
                 std::unique_lock lock(mtx);
-                cv.wait(lock, st, [this] { return cmd.has_value() || wants_dirty; });
+                cv.wait(lock, st, [this] { return cmd.has_value() || wants_dirty || thumbs_dirty; });
                 if (st.stop_requested()) return;
                 if (cmd) {                      // 命令优先，渲染请求留到下一轮
                     c = std::move(cmd);
@@ -215,10 +285,16 @@ struct Renderer::Impl {
                     wants.clear();
                     wants_dirty = false;
                     have_wants = true;
+                } else if (thumbs_dirty) {
+                    tw = thumb_pages;
+                    thumb_px = thumb_target_px;
+                    thumbs_dirty = false;
+                    have_thumbs = true;
                 }
             }
             if (c) handle_command(*c);
             else if (have_wants) handle_wants(w);
+            else if (have_thumbs) handle_thumbs(tw, thumb_px);
         }
     }
 
@@ -235,6 +311,7 @@ struct Renderer::Impl {
         {
             std::lock_guard lock(mtx);
             clear_pages_locked();
+            clear_thumbs_locked();
             last_wants.clear();
         }
 
@@ -247,9 +324,15 @@ struct Renderer::Impl {
             if (ierr == DocError::Ok) {
                 s.phase = DocPhase::Ready;
                 s.info = info;
+                info_ = info;  // 缩略图按页尺寸算倍率用（工作线程私有，无需加锁）
+                std::vector<OutlineItem> ol;
+                doc_engine.outline(ol);  // 锁外加载（可能触及页树），避免长时间持锁
                 std::lock_guard lock(mtx);
-                pages.assign(static_cast<std::size_t>(info.page_count > 0 ? info.page_count : 0),
-                             Entry{});
+                const std::size_t n =
+                    static_cast<std::size_t>(info.page_count > 0 ? info.page_count : 0);
+                pages.assign(n, Entry{});
+                thumbs.assign(n, Entry{});
+                outline_ = std::move(ol);
             } else {
                 s.phase = DocPhase::Failed;
                 s.error = ierr;
@@ -271,7 +354,10 @@ struct Renderer::Impl {
         s.id = c.id;
         std::lock_guard lock(mtx);
         clear_pages_locked();
+        clear_thumbs_locked();
         last_wants.clear();
+        info_ = DocumentInfo{};
+        outline_.clear();
         doc = s;
     }
 
@@ -285,10 +371,17 @@ struct Renderer::Impl {
             if (ierr == DocError::Ok) {
                 s.phase = DocPhase::Ready;
                 s.info = info;
+                info_ = info;
+                std::vector<OutlineItem> ol;
+                doc_engine.outline(ol);
                 std::lock_guard lock(mtx);
                 clear_pages_locked();
-                pages.assign(static_cast<std::size_t>(info.page_count > 0 ? info.page_count : 0),
-                             Entry{});
+                clear_thumbs_locked();
+                const std::size_t n =
+                    static_cast<std::size_t>(info.page_count > 0 ? info.page_count : 0);
+                pages.assign(n, Entry{});
+                thumbs.assign(n, Entry{});
+                outline_ = std::move(ol);
                 last_wants.clear();
             } else {
                 s.phase = DocPhase::Failed;
@@ -398,7 +491,8 @@ struct Renderer::Impl {
 
         for (;;) {
             PageBitmap bmp;
-            DocError err = doc_engine.render_page(page, scale, bmp);
+            DocError err = doc_engine.render_page(page, scale, bmp, 8192, rotation_,
+                                                  static_cast<ColorMode>(color_mode_));
 
             ID3D11ShaderResourceView* srv = nullptr;
             if (err == DocError::Ok &&
@@ -462,6 +556,82 @@ struct Renderer::Impl {
         e.slot.error = err;
         e.failed_scale = scale;
         // 保留已有纹理（ADR-024）：宁可继续显示旧图，也不闪回失败占位。
+    }
+
+    // ---- 缩略图渲染（Phase 5）----
+
+    void handle_thumbs(const std::vector<int>& list, int target_px) {
+        if (!doc_engine.is_open()) return;
+        if (target_px < 32) target_px = 32;
+        if (target_px > 1024) target_px = 1024;
+        for (int p : list) {
+            if (p < 0 || static_cast<std::size_t>(p) >= thumbs.size()) continue;
+            PageSlot cur;
+            {
+                std::lock_guard lock(mtx);
+                cur = thumbs[static_cast<std::size_t>(p)].slot;
+            }
+            if (cur.status == PageStatus::Loaded && cur.scale > 0.0f) continue;
+            render_thumb(p, target_px);
+        }
+    }
+
+    // 按"旋转后"页尺寸算目标倍率，使最长边 ≈ target_px。
+    // 缩略图失败**不自动重试**（侧栏是辅助视图，失败就留空占位）；
+    // 视图变换变化或重新打开文档会重置状态、自然重试。
+    void render_thumb(int page, int target_px) {
+        float w = info_.page_width_pt;
+        float h = info_.page_height_pt;
+        if (page >= 0 && static_cast<std::size_t>(page) < info_.page_sizes.size()) {
+            const PageSize& ps = info_.page_sizes[static_cast<std::size_t>(page)];
+            if (ps.width_pt > 0.0f && ps.height_pt > 0.0f) { w = ps.width_pt; h = ps.height_pt; }
+        }
+        if (!(w > 0.0f) || !(h > 0.0f)) { w = 595.0f; h = 842.0f; }
+        if (rotation_ == 90 || rotation_ == 270) { const float t = w; w = h; h = t; }
+        const float longest = w > h ? w : h;
+        float scale = longest > 0.0f ? static_cast<float>(target_px) / longest : 1.0f;
+        if (!(scale > 0.0f)) scale = 1.0f;
+
+        {
+            std::lock_guard lock(mtx);
+            if (page < 0 || static_cast<std::size_t>(page) >= thumbs.size()) return;
+            Entry& e = thumbs[static_cast<std::size_t>(page)];
+            if (e.slot.status == PageStatus::Failed) return;  // 已失败，不再重试
+            e.slot.status = PageStatus::Loading;
+        }
+
+        PageBitmap bmp;
+        DocError err = doc_engine.render_page(page, scale, bmp, 4096, rotation_,
+                                              static_cast<ColorMode>(color_mode_));
+        ID3D11ShaderResourceView* srv = nullptr;
+        if (err == DocError::Ok &&
+            !create_page_texture(device, bmp.samples(), bmp.width(), bmp.height(),
+                                 bmp.stride(), &srv)) {
+            err = DocError::Internal;
+        }
+
+        std::lock_guard lock(mtx);
+        if (page < 0 || static_cast<std::size_t>(page) >= thumbs.size()) {
+            if (srv) srv->Release();
+            return;
+        }
+        Entry& e = thumbs[static_cast<std::size_t>(page)];
+        if (err != DocError::Ok) {
+            if (srv) srv->Release();
+            e.slot.status = PageStatus::Failed;
+            e.slot.error = err;
+            return;
+        }
+        retire_thumb_locked(e);
+        e.slot.status = PageStatus::Loaded;
+        e.slot.texture = srv;
+        e.slot.pixel_w = bmp.width();
+        e.slot.pixel_h = bmp.height();
+        e.slot.scale = bmp.effective_scale();
+        e.slot.error = DocError::Ok;
+        e.bytes = static_cast<std::size_t>(bmp.width()) *
+                  static_cast<std::size_t>(bmp.height()) * 4u;
+        thumb_bytes += e.bytes;
     }
 };
 
@@ -539,6 +709,12 @@ PageSlot Renderer::slot(int page) const {
     return impl_->slot_snapshot(page);
 }
 
+std::vector<OutlineItem> Renderer::outline() const {
+    if (!impl_) return {};
+    std::lock_guard lock(impl_->mtx);
+    return impl_->outline_;
+}
+
 void Renderer::set_wanted(std::vector<RenderWant> wants) {
     if (!impl_) return;
     std::lock_guard lock(impl_->mtx);
@@ -597,6 +773,73 @@ void Renderer::retry_page(int page) {
     impl_->wants = impl_->last_wants;
     impl_->wants_dirty = true;
     impl_->cv.notify_all();
+}
+
+// ---- 视图变换（Phase 5）----
+
+void Renderer::set_view_transform(int rotation_deg, ColorMode color_mode) {
+    if (!impl_) return;
+    int rot = rotation_deg % 360;
+    if (rot < 0) rot += 360;
+    rot = (rot / 90) * 90;
+    const int mode = static_cast<int>(color_mode);
+    if (mode < 0 || mode > 2) return;  // 非法配色忽略
+
+    std::lock_guard lock(impl_->mtx);
+    if (impl_->rotation_ == rot && impl_->color_mode_ == mode) return;
+    impl_->rotation_ = rot;
+    impl_->color_mode_ = mode;
+
+    // 保留本帧请求，作废全部纹理后原样重新投递（触发整篇重渲）。
+    const std::vector<RenderWant> keep_wants = impl_->last_wants;
+    const std::vector<int>        keep_thumbs = impl_->last_thumb_pages;
+    const int                     keep_px = impl_->last_thumb_px;
+    impl_->invalidate_all_locked();
+    impl_->last_wants = keep_wants;
+    impl_->wants = keep_wants;
+    impl_->wants_dirty = !keep_wants.empty();
+    impl_->last_thumb_pages = keep_thumbs;
+    impl_->thumb_pages = keep_thumbs;
+    impl_->last_thumb_px = keep_px;
+    impl_->thumb_target_px = keep_px > 0 ? keep_px : impl_->thumb_target_px;
+    impl_->thumbs_dirty = !keep_thumbs.empty();
+    impl_->cv.notify_all();
+}
+
+int Renderer::rotation() const {
+    if (!impl_) return 0;
+    std::lock_guard lock(impl_->mtx);
+    return impl_->rotation_;
+}
+
+ColorMode Renderer::color_mode() const {
+    if (!impl_) return ColorMode::Normal;
+    std::lock_guard lock(impl_->mtx);
+    return static_cast<ColorMode>(impl_->color_mode_);
+}
+
+// ---- 缩略图通道（Phase 5）----
+
+void Renderer::set_thumbs_wanted(std::vector<int> pages, int target_px) {
+    if (!impl_) return;
+    if (target_px < 32) target_px = 32;
+    if (target_px > 1024) target_px = 1024;
+    std::lock_guard lock(impl_->mtx);
+    if (impl_->last_thumb_px == target_px && impl_->last_thumb_pages == pages) return;
+    impl_->last_thumb_pages = pages;      // 先拷贝再移动
+    impl_->last_thumb_px = target_px;
+    impl_->thumb_pages = std::move(pages);
+    impl_->thumb_target_px = target_px;
+    impl_->thumbs_dirty = true;
+    impl_->cv.notify_all();
+}
+
+PageSlot Renderer::thumb_slot(int page) const {
+    if (!impl_) return {};
+    std::lock_guard lock(impl_->mtx);
+    if (page >= 0 && static_cast<std::size_t>(page) < impl_->thumbs.size())
+        return impl_->thumbs[static_cast<std::size_t>(page)].slot;
+    return {};
 }
 
 }  // namespace lr

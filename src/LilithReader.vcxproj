@@ -129,6 +129,9 @@
     <ClCompile Include="render\render.cpp" />
     <!-- Phase 4：页缓存纯策略（零依赖，可单测；render.cpp 使用） -->
     <ClCompile Include="render\page_cache.ixx" />
+    <!-- Phase 5：阅读状态持久化（纯序列化 + 原子文件 I/O，可单测） -->
+    <ClCompile Include="state\reader_state.ixx" />
+    <ClCompile Include="state\reader_state.cpp" />
     <!-- Phase 3 起 ImPlot 已从构建中移除（自研画布取代其调试用途，见 ADR-018） -->
     <ClCompile Include="..\third_party\imgui\imgui.cpp" />
     <ClCompile Include="..\third_party\imgui\imgui_draw.cpp" />

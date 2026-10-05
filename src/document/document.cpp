@@ -147,6 +147,103 @@ float clamp_scale(fz_rect bounds, float scale, int max_dimension) noexcept {
     return s;
 }
 
+// ---- 页面配色变换（Phase 5）----
+//
+// 为什么不用 fz_invert_pixmap / fz_tint_pixmap：这两者面向 RGB/Gray，对 **RGBA（带 alpha）
+// 的 4 分量 pixmap** 的行为不在公开契约里（tint 明确只写 RGB/BGR/Gray）。本函数只处理
+// 已知的 RGBA8（n==4），逐像素改 RGB、**保留 alpha**，行为完全可控且可单测。
+// 只做 POD 运算、不构造 C++ 对象，故可安全放在 fz_try 内调用。
+//
+//   mode 1（反色）：RGB ← 255−RGB（暗色背景阅读）
+//   mode 2（护眼）：RGB 经 LUT 线性映射 黑→#2B2318、白→#F6EEDC（暖色纸张）
+void apply_color_transform(fz_context* ctx, fz_pixmap* pix, int mode) noexcept {
+    if (pix == nullptr || mode == 0) return;
+    if (fz_pixmap_components(ctx, pix) != kComponents) return;  // 只处理 RGBA8
+    const int w = fz_pixmap_width(ctx, pix);
+    const int h = fz_pixmap_height(ctx, pix);
+    const int stride = fz_pixmap_stride(ctx, pix);
+    unsigned char* p = fz_pixmap_samples(ctx, pix);
+    if (p == nullptr || w <= 0 || h <= 0 || stride <= 0) return;
+
+    if (mode == 1) {
+        for (int y = 0; y < h; ++y) {
+            unsigned char* row = p + static_cast<std::size_t>(y) * static_cast<std::size_t>(stride);
+            for (int x = 0; x < w; ++x) {
+                row[0] = static_cast<unsigned char>(255 - row[0]);
+                row[1] = static_cast<unsigned char>(255 - row[1]);
+                row[2] = static_cast<unsigned char>(255 - row[2]);
+                row += 4;  // alpha 不动
+            }
+        }
+    } else if (mode == 2) {
+        constexpr int kBlk[3] = { 0x2B, 0x23, 0x18 };  // 黑映射到的深暖褐
+        constexpr int kWht[3] = { 0xF6, 0xEE, 0xDC };  // 白映射到的米黄
+        unsigned char lut[3][256];
+        for (int c = 0; c < 3; ++c)
+            for (int v = 0; v < 256; ++v)
+                lut[c][v] = static_cast<unsigned char>(
+                    kBlk[c] + (kWht[c] - kBlk[c]) * v / 255);
+        for (int y = 0; y < h; ++y) {
+            unsigned char* row = p + static_cast<std::size_t>(y) * static_cast<std::size_t>(stride);
+            for (int x = 0; x < w; ++x) {
+                row[0] = lut[0][row[0]];
+                row[1] = lut[1][row[1]];
+                row[2] = lut[2][row[2]];
+                row += 4;  // alpha 不动
+            }
+        }
+    }
+}
+
+// ---- 目录遍历（Phase 5）----
+//
+// fz_outline 是 next（同级）/ down（子级）构成的树。这里前序遍历并**展平**为
+// OutlinePOD 数组（只含 POD，可安全在 fz_try 内写），返回后由调用方转成
+// std::vector<OutlineItem>（C++ 对象一律在 fz_try 之外构造，ADR-009）。
+constexpr int kMaxOutlineNodes = 2048;  // 真实书籍目录远小于此；超出则截断
+constexpr int kMaxOutlineDepth = 32;    // 防病态文档的深树导致递归爆栈
+
+struct OutlinePOD {
+    char title[384];
+    int  page;   // -1 = 无内部目标
+    int  depth;
+};
+
+void walk_outline(fz_context* ctx, fz_document* doc, fz_outline* node, int depth,
+                  OutlinePOD* buf, int cap, int& count, int& truncated) noexcept {
+    if (depth > kMaxOutlineDepth) return;
+    for (fz_outline* n = node; n != nullptr; n = n->next) {
+        if (count >= cap) { truncated = 1; return; }
+        OutlinePOD& e = buf[count++];
+        e.depth = depth;
+        e.page = -1;
+        e.title[0] = '\0';
+        if (n->title != nullptr) {
+            std::size_t k = 0;
+            while (n->title[k] != '\0' && k + 1 < sizeof e.title) {
+                e.title[k] = n->title[k];
+                ++k;
+            }
+            e.title[k] = '\0';
+        }
+
+        // 目标页：优先用 MuPDF 已解析的 fz_location；无目标时退回按 uri 解析
+        // （PDF 目录常见 "page=5" 这类内部链接）。两者都解析不出则留 -1。
+        int pg = -1;
+        if (n->page.chapter >= 0 || n->page.page >= 0) {
+            pg = fz_page_number_from_location(ctx, doc, n->page);
+        } else if (n->uri != nullptr) {
+            float xp = 0.0f, yp = 0.0f;
+            const fz_location loc = fz_resolve_link(ctx, doc, n->uri, &xp, &yp);
+            pg = fz_page_number_from_location(ctx, doc, loc);
+        }
+        if (pg >= 0) e.page = pg;
+
+        if (n->down != nullptr)
+            walk_outline(ctx, doc, n->down, depth + 1, buf, cap, count, truncated);
+    }
+}
+
 // 单页尺寸（点）。失败返回 false，调用方把该页留成 {0,0} 由上层回退。
 //
 // 每页一次独立的 fz_try：页树里混入坏对象（实测有 "non-page object in page tree"）
@@ -662,6 +759,8 @@ DocError Document::info(DocumentInfo& out) const noexcept {
     int      pages = 0;
     int      needs_password = 0;
     int      has_outline = 0;
+    int      can_copy = 1;
+    int      can_print = 1;
     fz_page* first = nullptr;
     fz_rect  bounds{};
     fz_outline* outline = nullptr;
@@ -674,6 +773,8 @@ DocError Document::info(DocumentInfo& out) const noexcept {
         fz_var(pages);
         fz_var(needs_password);
         fz_var(has_outline);
+        fz_var(can_copy);
+        fz_var(can_print);
         fz_var(first);
         fz_var(bounds);
         fz_var(outline);
@@ -683,6 +784,10 @@ DocError Document::info(DocumentInfo& out) const noexcept {
         pages = fz_count_pages(s.ctx, s.doc);
         needs_password = fz_needs_password(s.ctx, s.doc);
         if (pages <= 0) fz_throw(s.ctx, FZ_ERROR_FORMAT, "document contains no pages");
+
+        // 权限位：非加密文档恒为允许；查询失败不应影响打开，故各自独立容错由返回值表达。
+        can_copy = fz_has_permission(s.ctx, s.doc, FZ_PERMISSION_COPY);
+        can_print = fz_has_permission(s.ctx, s.doc, FZ_PERMISSION_PRINT);
 
         if (fz_lookup_metadata(s.ctx, s.doc, FZ_META_INFO_TITLE, title, sizeof title) < 0)
             title[0] = '\0';
@@ -716,6 +821,8 @@ DocError Document::info(DocumentInfo& out) const noexcept {
     out.page_count = pages;
     out.needs_password = needs_password != 0;
     out.has_outline = has_outline != 0;
+    out.can_copy = can_copy != 0;
+    out.can_print = can_print != 0;
     out.page_width_pt = bounds.x1 - bounds.x0;
     out.page_height_pt = bounds.y1 - bounds.y0;
     out.title.assign(title);    // C++ 对象操作一律放在 fz_try 之外
@@ -736,6 +843,60 @@ DocError Document::info(DocumentInfo& out) const noexcept {
                 out.page_sizes[static_cast<std::size_t>(i)] = PageSize{ w, h };
         }
     }
+    return DocError::Ok;
+}
+
+DocError Document::outline(std::vector<OutlineItem>& out) const noexcept {
+    out.clear();
+    if (!impl_ || !impl_->doc || !impl_->ctx) return DocError::NotOpen;
+    Impl& s = *impl_;
+
+    // 缓冲在 fz_try 之前分配：raw 指针（POD）跨 fz_try 是安全的（无析构函数可被 longjmp 跳过）。
+    // 不用 std::unique_ptr，是为了严格贴合"fz_try 内不得出现需析构的 C++ 对象"这条纪律
+    // 的强解读：这里连跨块存活的对象也不引入。
+    OutlinePOD* buf = new (std::nothrow) OutlinePOD[kMaxOutlineNodes];
+    if (buf == nullptr) return DocError::Internal;
+
+    fz_outline* root = nullptr;
+    int count = 0;
+    int truncated = 0;
+    DocError result = DocError::Ok;
+    char err[kErrCap] = {};
+
+    fz_try(s.ctx) {
+        fz_var(root);
+        fz_var(count);
+        fz_var(truncated);
+        root = fz_load_outline(s.ctx, s.doc);  // 无目录返回 nullptr（不是错误）
+        if (root != nullptr)
+            walk_outline(s.ctx, s.doc, root, 0, buf, kMaxOutlineNodes, count, truncated);
+    }
+    fz_always(s.ctx) {
+        if (root) fz_drop_outline(s.ctx, root);
+    }
+    fz_catch(s.ctx) {
+        result = classify(s.ctx);
+        copy_caught_message(s.ctx, err, kErrCap);
+    }
+
+    if (result != DocError::Ok) {
+        delete[] buf;
+        set_error(s.last_error, err);
+        return result;
+    }
+
+    // C++ 对象一律在 fz_try 之外构造
+    out.reserve(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        OutlineItem it;
+        it.title.assign(buf[i].title);
+        it.page = buf[i].page;
+        it.depth = buf[i].depth;
+        out.push_back(std::move(it));
+    }
+    delete[] buf;
+
+    s.last_error.clear();
     return DocError::Ok;
 }
 
@@ -775,11 +936,17 @@ DocError Document::page_size(int index, float& width_pt, float& height_pt) const
 }
 
 DocError Document::render_page(int index, float scale, PageBitmap& out,
-                               int max_dimension) noexcept {
+                               int max_dimension, int rotation_deg,
+                               ColorMode color_mode) noexcept {
     out.reset();
     if (!impl_ || !impl_->doc || !impl_->ctx) return DocError::NotOpen;
     if (index < 0 || !(scale > 0.0f)) return DocError::Internal;
     if (max_dimension < 64) max_dimension = 64;
+
+    // 旋转归一到 0/90/180/270（接受负值与 >360）
+    int rot = rotation_deg % 360;
+    if (rot < 0) rot += 360;
+    rot = (rot / 90) * 90;
 
     Impl& s = *impl_;
 
@@ -787,6 +954,7 @@ DocError Document::render_page(int index, float scale, PageBitmap& out,
     fz_pixmap* pix = nullptr;
     fz_device* dev = nullptr;
     float      used = scale;
+    int        mode = static_cast<int>(color_mode);
     DocError   result = DocError::Ok;
     char       err[kErrCap] = {};
 
@@ -799,10 +967,13 @@ DocError Document::render_page(int index, float scale, PageBitmap& out,
         page = fz_load_page(s.ctx, s.doc, index);
         const fz_rect bounds = fz_bound_page(s.ctx, page);
 
-        // 尺寸钳制：超上限时等比降采样，而不是把内存打爆
-        used = clamp_scale(bounds, scale, max_dimension);
+        // 尺寸钳制按**旋转后**包围盒：90/270 时宽高互换。若按未旋转的 bounds 钳制，
+        // 一张 8000×100 的横幅旋转后会得到 8000 高，仍然爆内存。
+        const fz_rect rotated = fz_transform_rect(bounds, fz_rotate(static_cast<float>(rot)));
+        used = clamp_scale(rotated, scale, max_dimension);
 
-        const fz_matrix ctm = fz_scale(used, used);
+        // 旋转与缩放都是线性变换，且缩放是等比的（标量×单位矩阵）⇒ 二者可交换，顺序无关。
+        const fz_matrix ctm = fz_pre_rotate(fz_scale(used, used), static_cast<float>(rot));
         const fz_irect  bbox = fz_round_rect(fz_transform_rect(bounds, ctm));
 
         // RGB + alpha ⇒ 4 分量 RGBA8，可直接上传 DXGI_FORMAT_R8G8B8A8_UNORM
@@ -817,6 +988,9 @@ DocError Document::render_page(int index, float scale, PageBitmap& out,
         fz_close_device(s.ctx, dev);
         fz_drop_device(s.ctx, dev);
         dev = nullptr;
+
+        // 配色变换：设备已关闭、内容全部落盘后再做（POD 运算，无 C++ 对象）。
+        apply_color_transform(s.ctx, pix, mode);
 
         fz_drop_page(s.ctx, page);
         page = nullptr;

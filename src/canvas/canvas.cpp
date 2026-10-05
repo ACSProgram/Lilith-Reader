@@ -73,6 +73,43 @@ PageSizePt Canvas::size_of(int i) const {
     return default_;
 }
 
+// ---- 行/列映射（spread 感知） ----
+
+int Canvas::eff_cols() const {
+    if (state_.spread) return 2;  // 书籍模式等效 2 列
+    return clampi(state_.columns, kMinColumns, kMaxColumns);
+}
+
+int Canvas::compute_rows(int n) const {
+    if (n <= 0) return 0;
+    if (state_.spread) return 1 + (n - 1 + 1) / 2;  // 1 + ceil((n-1)/2)：封面单页 + 两页对开
+    const int c = eff_cols();
+    return (n + c - 1) / c;
+}
+
+int Canvas::row_first_page(int row) const {
+    if (row < 0) return 0;
+    if (state_.spread) return row == 0 ? 0 : 1 + (row - 1) * 2;
+    return row * eff_cols();
+}
+
+int Canvas::row_page_count(int row) const {
+    const int n = static_cast<int>(sizes_.size());
+    if (row < 0 || n <= 0) return 0;
+    const int first = row_first_page(row);
+    if (first >= n) return 0;
+    // 书籍模式：第 0 行（封面）只有 1 页，其余行最多 2 页；网格模式上限为列数。
+    const int cap = state_.spread ? (row == 0 ? 1 : 2) : eff_cols();
+    const int cnt = n - first;
+    return cnt < cap ? cnt : cap;
+}
+
+int Canvas::row_col_of(int index) const {
+    if (index < 0) return 0;
+    const int row = row_of(index);
+    return index - row_first_page(row);
+}
+
 // ---- 派生缓存 ----
 
 void Canvas::ensure_layout() const {
@@ -80,7 +117,7 @@ void Canvas::ensure_layout() const {
     dirty_ = false;
 
     const int n = static_cast<int>(sizes_.size());
-    const int cols = clampi(state_.columns, kMinColumns, kMaxColumns);
+    const int cols = eff_cols();
 
     // 列宽 = 最宽页；行高 = 该行最高页（统一尺寸时即页高）
     float maxw = 0.0f;
@@ -115,14 +152,16 @@ void Canvas::ensure_layout() const {
     const float col_w_pt = maxw;
     const float col_pitch_pt = col_w_pt + gap_pt;
 
-    rows_ = n > 0 ? (n + cols - 1) / cols : 0;
+    rows_ = compute_rows(n);
     row_heights_pt_.assign(static_cast<std::size_t>(rows_), 0.0f);
     row_tops_pt_.assign(static_cast<std::size_t>(rows_) + 1, 0.0f);
 
     for (int r = 0; r < rows_; ++r) {
+        const int first = row_first_page(r);
+        const int cnt = row_page_count(r);
         float h = 0.0f;
-        for (int c = 0; c < cols; ++c) {
-            const int i = r * cols + c;
+        for (int c = 0; c < cnt; ++c) {
+            const int i = first + c;
             if (i >= n) break;
             const float ph = size_of(i).h;
             if (ph > h) h = ph;
@@ -157,7 +196,7 @@ float Canvas::effective_zoom() const { ensure_layout(); return eff_zoom_; }
 
 float Canvas::fit_width_zoom() const {
     // 独立于当前 fit_width 开关，供 UI 显示与测试使用
-    const int cols = clampi(state_.columns, kMinColumns, kMaxColumns);
+    const int cols = eff_cols();
     const int n = static_cast<int>(sizes_.size());
     float maxw = 0.0f;
     for (int i = 0; i < n; ++i) {
@@ -202,23 +241,24 @@ float Canvas::origin_y() const {
 int Canvas::rows() const { ensure_layout(); return rows_; }
 
 int Canvas::row_of(int index) const {
-    const int cols = clampi(state_.columns, kMinColumns, kMaxColumns);
-    return index < 0 ? -1 : index / cols;
+    if (index < 0) return -1;
+    if (state_.spread) return index == 0 ? 0 : 1 + (index - 1) / 2;
+    return index / eff_cols();
 }
 
-int Canvas::first_page_in_row(int row) const {
-    const int cols = clampi(state_.columns, kMinColumns, kMaxColumns);
-    return row < 0 ? 0 : row * cols;
-}
+int Canvas::first_page_in_row(int row) const { return row_first_page(row); }
+
 int Canvas::row_page_begin(int row) const { return first_page_in_row(row); }
 
 int Canvas::row_page_end(int row) const {
-    ensure_layout();
-    const int cols = clampi(state_.columns, kMinColumns, kMaxColumns);
-    const int last = (row + 1) * cols - 1;
-    const int n = static_cast<int>(sizes_.size());
     if (row < 0) return -1;
-    return last > n - 1 ? n - 1 : last;
+    const int n = static_cast<int>(sizes_.size());
+    if (n <= 0) return -1;
+    const int first = row_first_page(row);
+    if (first >= n) return n - 1;  // 越界行钳到末页（与旧实现一致）
+    const int cnt = row_page_count(row);
+    const int end = first + cnt - 1;
+    return end > n - 1 ? n - 1 : end;
 }
 
 float Canvas::row_top_px(int row) const {
@@ -240,9 +280,9 @@ PageRect Canvas::page_rect(int index) const {
     const int n = static_cast<int>(sizes_.size());
     if (index < 0 || index >= n) return {};
 
-    const int cols = clampi(state_.columns, kMinColumns, kMaxColumns);
-    const int col = index % cols;
-    const int row = index / cols;
+    const int cols = eff_cols();
+    const int row = row_of(index);
+    const int col = index - row_first_page(row);
     const PageSizePt s = size_of(index);
 
     const float z = eff_zoom_;
@@ -250,8 +290,16 @@ PageRect Canvas::page_rect(int index) const {
     const float gap_pt = state_.gap_ratio * max_page_w_pt_;  // 文档点，随缩放变化
     const float col_pitch_pt = max_page_w_pt_ + gap_pt;
 
-    // 列内水平居中（统一尺寸时居中量为 0）
-    const float x_pt = margin_pt + static_cast<float>(col) * col_pitch_pt +
+    // 行内水平位置。网格下即"列内居中"（row_offset = 0，与旧实现逐位一致）；
+    // 书籍模式下若该行只有一页（封面 / 末页），在整行宽度内居中，避免单独一页贴左。
+    const float row_full_w = static_cast<float>(cols) * max_page_w_pt_ +
+                             static_cast<float>(cols - 1) * gap_pt;
+    const int row_cnt = row_page_count(row);
+    const float row_w = static_cast<float>(row_cnt) * max_page_w_pt_ +
+                        static_cast<float>(row_cnt - 1) * gap_pt;
+    const float row_offset = state_.spread ? (row_full_w - row_w) * 0.5f : 0.0f;
+
+    const float x_pt = margin_pt + row_offset + static_cast<float>(col) * col_pitch_pt +
                        (max_page_w_pt_ - s.w) * 0.5f;
     const float y_pt = row_tops_pt_[static_cast<std::size_t>(row)];
 
@@ -272,8 +320,7 @@ int Canvas::row_at_content_y(float content_y_px) const {
 int Canvas::page_at_content_y(float content_y_px) const {
     const int row = row_at_content_y(content_y_px);
     if (row < 0) return -1;
-    const int cols = clampi(state_.columns, kMinColumns, kMaxColumns);
-    return row * cols;
+    return row_first_page(row);
 }
 
 int Canvas::visible_first() const {
@@ -283,8 +330,7 @@ int Canvas::visible_first() const {
     if (content_h_px_ <= viewport_h_) return 0;  // 内容不溢出：整篇都在视口里
     const int row = row_at_content_y(state_.scroll_y);
     if (row < 0) return 0;
-    const int cols = clampi(state_.columns, kMinColumns, kMaxColumns);
-    return row * cols;
+    return row_first_page(row);
 }
 
 int Canvas::visible_last() const {
@@ -297,9 +343,7 @@ int Canvas::visible_last() const {
     const auto it = std::upper_bound(row_tops_pt_.begin(), row_tops_pt_.end(), bottom_pt);
     int row = static_cast<int>(it - row_tops_pt_.begin()) - 1;
     row = clampi(row, 0, rows_ - 1);
-    const int cols = clampi(state_.columns, kMinColumns, kMaxColumns);
-    const int last = (row + 1) * cols - 1;
-    return last > n - 1 ? n - 1 : last;
+    return row_page_end(row);
 }
 
 // 由滚动位置反推"当前行"。到底时取末行：视口比一行还高时末行够不到视口顶部，
@@ -324,8 +368,7 @@ int Canvas::current_row() const {
 int Canvas::current_page() const {
     const int row = current_row();
     if (row < 0) return -1;
-    const int cols = clampi(state_.columns, kMinColumns, kMaxColumns);
-    return row * cols;
+    return row_first_page(row);
 }
 
 // ---- 操作 ----
@@ -384,11 +427,11 @@ void Canvas::scroll_rows(int dir) {
     ensure_layout();
     if (rows_ <= 0 || dir == 0) return;
 
-    const int cols = clampi(state_.columns, kMinColumns, kMaxColumns);
     // 游标推进一行：这是翻页的核心。用游标（而非滚动位置）推进，才能在末尾若干行
     // 够不到视口顶部时依然逐页走完，并在末行正确终止（不再"卡住"）。
+    // 目标页取该行的**首**页：网格下即 row*cols；书籍模式下封面行 = 0、其余行 = 1+(r-1)*2。
     const int target = clampi(clampi(nav_row_, 0, rows_ - 1) + (dir > 0 ? 1 : -1), 0, rows_ - 1);
-    scroll_to_page(target * cols, 0.0f);  // 内部会把 scroll_y 钳到合法范围并设定游标
+    scroll_to_page(row_first_page(target), 0.0f);  // 内部会把 scroll_y 钳到合法范围并设定游标
 }
 
 void Canvas::set_columns(int columns) {
@@ -398,6 +441,14 @@ void Canvas::set_columns(int columns) {
     state_.columns = c;
     dirty_ = true;
     scroll_to_page(anchor, 0.0f);
+}
+
+void Canvas::set_spread(bool on) {
+    if (state_.spread == on) return;
+    const int anchor = current_page();  // 切换前记录当前阅读页
+    state_.spread = on;
+    dirty_ = true;
+    scroll_to_page(anchor < 0 ? 0 : anchor, 0.0f);
 }
 
 void Canvas::fit_to_width() {

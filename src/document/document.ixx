@@ -59,6 +59,20 @@ enum class DocError : std::int32_t {
 [[nodiscard]] bool format_matches_extension(std::string_view format_utf8,
                                             std::string_view ext_utf8) noexcept;
 
+// ---- 页面配色（Phase 5）----
+//
+// 在渲染线程对渲染结果做一次色彩变换（ADR：Phase 5 决策）：
+//   Normal  原样；
+//   Invert  反色（暗色背景阅读）——用 fz_invert_pixmap，官方实现会保留 alpha；
+//   EyeCare 护眼（暖色纸张）——用 fz_tint_pixmap 把黑/白映射到暖色端点。
+// 之所以放在渲染层而不是 UI 层叠 shader：纹理是 IMMUTABLE 且零拷贝上传，
+// 变换必须发生在像素进入 GPU 之前；且配色变化即触发一次重渲染（缓存整体失效）。
+enum class ColorMode : int {
+    Normal = 0,
+    Invert = 1,
+    EyeCare = 2,
+};
+
 // ---- 文档元信息 ----
 
 // 单页尺寸（点）。与 canvas 的 PageSizePt 是**同名不同型**的两个结构：
@@ -68,12 +82,27 @@ struct PageSize {
     float height_pt = 0.0f;
 };
 
+// ---- 目录（outline）条目（Phase 5）----
+//
+// 从 MuPDF 的 fz_outline 树**展平**为前序序列：depth 表示层级（顶层为 0），
+// 顺序即阅读顺序。用展平而非树结构，是为了让 UI 侧只需一次线性遍历即可绘制，
+// 且本模块接口不引入递归容器（PIMPL 与 longjmp 纪律都更省心）。
+struct OutlineItem {
+    std::string title;      // UTF-8，可能为空
+    int         page = -1;  // 目标页（0 基）；-1 表示无内部目标（外链/无目标）
+    int         depth = 0;  // 层级，顶层为 0
+};
+
 struct DocumentInfo {
     int    page_count = 0;
     float  page_width_pt = 0.0f;   // 首页宽度（点，1 点 = 1/72 英寸）
     float  page_height_pt = 0.0f;  // 首页高度（点）
     bool   needs_password = false;
     bool   has_outline = false;    // 是否存在目录（Phase 5 使用）
+    // 权限位（Phase 5）：PDF 标准加密可声明"禁复制/禁打印"。UI 层据此把相应功能置灰。
+    // 无加密或无法判定时**一律为 true**（保守放行，避免误禁）。
+    bool   can_copy = true;
+    bool   can_print = true;
     std::string title;             // 元数据标题（UTF-8，可能为空）
     // MuPDF 上报的实际格式串（UTF-8，可能为空）：
     // "PDF 1.7" / "EPUB" / "FictionBook2" / "XPS" / "zip"（CBZ 报归档格式）/ "Image"。
@@ -158,6 +187,10 @@ public:
     // 读取元信息。需已打开且已解锁。
     DocError info(DocumentInfo& out) const noexcept;
 
+    // 读取文档目录（outline）。展平为前序序列（depth 表层级，见 OutlineItem）。
+    // 无目录时返回 Ok 且 out 为空（不是错误）。需已打开且已解锁。
+    DocError outline(std::vector<OutlineItem>& out) const noexcept;
+
     // 读取第 index 页的尺寸（点）。index 从 0 开始。注意：PDF 各页尺寸可以不同。
     DocError page_size(int index, float& width_pt, float& height_pt) const noexcept;
 
@@ -165,9 +198,14 @@ public:
     //   scale        : 1.0 = 72dpi 原始尺寸；2.0 = 144dpi
     //   max_dimension: 单边像素上限。超出时自动等比下调实际 scale
     //                  （结果见 PageBitmap::effective_scale()），保证不 OOM。
+    //   rotation_deg : 页面旋转（0/90/180/270，顺时针）。90/270 时输出宽高互换；
+    //                  max_dimension 按**旋转后**包围盒钳制。
+    //   color_mode   : 页面配色（Normal/Invert/EyeCare），在像素上传前于渲染线程完成。
     // 只在拥有本对象的线程内调用；out 会被先重置。
     DocError render_page(int index, float scale, PageBitmap& out,
-                         int max_dimension = 8192) noexcept;
+                         int max_dimension = 8192,
+                         int rotation_deg = 0,
+                         ColorMode color_mode = ColorMode::Normal) noexcept;
 
     // 最近一次失败的原始信息（UTF-8，截断到 1024 字节），调试/日志用。
     [[nodiscard]] std::string_view last_error() const noexcept;

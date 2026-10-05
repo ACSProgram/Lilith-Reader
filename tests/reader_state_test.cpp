@@ -1,0 +1,228 @@
+// reader_state_test.cpp — 阅读状态序列化自动化测试（Phase 5）
+//
+// 做法：**直接链接项目自己的 lilithreader.reader_state 模块**，对纯序列化
+// （encode_state/decode_state）与文档键（document_key）逐一断言。
+// 状态文件是"锦上添花"——解析失败必须安全拒绝，绝不能因损坏而崩溃或影响打开文档，
+// 因此这里把"坏输入一律拒绝"钉成规格。
+//
+// 退出码：0 = 全部通过，1 = 有 FAIL。
+// 用法： reader_state_test.exe
+
+#define NOMINMAX
+#include <windows.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+import lilithreader.reader_state;
+
+namespace {
+
+int g_pass = 0, g_fail = 0;
+
+void check(bool cond, const char* name) {
+    if (cond) { ++g_pass; std::printf("  [PASS] %s\n", name); }
+    else      { ++g_fail; std::printf("  [FAIL] %s\n", name); }
+}
+
+void check_eq_u64(std::uint64_t got, std::uint64_t want, const char* name) {
+    if (got == want) { ++g_pass; std::printf("  [PASS] %-46s (%llu)\n", name,
+                                              (unsigned long long)got); }
+    else { ++g_fail; std::printf("  [FAIL] %-46s 期望 %llu，实际 %llu\n", name,
+                                 (unsigned long long)want, (unsigned long long)got); }
+}
+
+void check_near(float got, float want, const char* name) {
+    if (std::fabs(got - want) <= 1e-4f) { ++g_pass; std::printf("  [PASS] %s\n", name); }
+    else { ++g_fail; std::printf("  [FAIL] %s（期望 %.4f，实际 %.4f）\n", name,
+                                 (double)want, (double)got); }
+}
+
+// ---- 小端写入（用于手工构造损坏输入） ----
+void put_u32(std::vector<std::uint8_t>& b, std::uint32_t v) {
+    b.push_back((std::uint8_t)(v & 0xFF));
+    b.push_back((std::uint8_t)((v >> 8) & 0xFF));
+    b.push_back((std::uint8_t)((v >> 16) & 0xFF));
+    b.push_back((std::uint8_t)((v >> 24) & 0xFF));
+}
+void put_u64(std::vector<std::uint8_t>& b, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i) b.push_back((std::uint8_t)((v >> (8 * i)) & 0xFF));
+}
+std::vector<std::uint8_t> header(const char* magic, std::uint32_t version, std::uint32_t count) {
+    std::vector<std::uint8_t> b;
+    for (int i = 0; i < 4; ++i) b.push_back((std::uint8_t)magic[i]);
+    put_u32(b, version);
+    put_u32(b, count);
+    return b;
+}
+
+// ---- 1. 序列化往返 ----
+lr::ReaderState make_state() {
+    lr::ReaderState s;
+    lr::DocRecord& a = s.upsert(0x1122334455667788ull);
+    a.page = 42; a.zoom = 1.75f; a.columns = 2; a.rotation = 90;
+    a.fit_width = false; a.spread = true; a.color_mode = 2;
+    a.bookmarks.push_back(lr::Bookmark{ 3, "start" });
+    a.bookmarks.push_back(lr::Bookmark{ 100, "" });
+    lr::DocRecord& b = s.upsert(0xdeadbeefcafebabeull);
+    b.page = 0; b.zoom = 1.0f; b.columns = 4; b.rotation = 270;
+    b.fit_width = true; b.spread = false; b.color_mode = 1;
+    return s;
+}
+
+void test_round_trip() {
+    std::printf("\n[1] 序列化往返\n");
+    const lr::ReaderState in = make_state();
+    const std::vector<std::uint8_t> bytes = lr::encode_state(in);
+    check(!bytes.empty(), "编码非空");
+
+    lr::ReaderState out;
+    check(lr::decode_state(bytes.data(), bytes.size(), out), "解码成功");
+    check(out.docs.size() == 2, "文档条数 = 2");
+
+    const lr::DocRecord* a = out.find(0x1122334455667788ull);
+    check(a != nullptr, "找到文档 A");
+    if (a) {
+        check(a->page == 42, "A.page");
+        check_near(a->zoom, 1.75f, "A.zoom");
+        check(a->columns == 2, "A.columns");
+        check(a->rotation == 90, "A.rotation");
+        check(a->fit_width == false, "A.fit_width");
+        check(a->spread == true, "A.spread");
+        check(a->color_mode == 2, "A.color_mode");
+        check(a->bookmarks.size() == 2, "A 书签数 = 2");
+        if (a->bookmarks.size() == 2) {
+            check(a->bookmarks[0].page == 3 && a->bookmarks[0].label == "start", "书签 0 内容");
+            check(a->bookmarks[1].page == 100 && a->bookmarks[1].label.empty(), "书签 1 内容");
+        }
+    }
+    const lr::DocRecord* b = out.find(0xdeadbeefcafebabeull);
+    check(b != nullptr && b->rotation == 270 && b->color_mode == 1, "文档 B 字段");
+
+    // 往返二次编码应逐字节一致（确定性）
+    const std::vector<std::uint8_t> bytes2 = lr::encode_state(out);
+    check(bytes == bytes2, "二次编码逐字节一致");
+}
+
+// ---- 2. 空状态与容器语义 ----
+void test_container_semantics() {
+    std::printf("\n[2] 容器语义\n");
+    lr::ReaderState s;
+    check(s.find(0) == nullptr, "key=0 查不到（无效键）");
+    check(s.find(123) == nullptr, "不存在的 key 返回 nullptr");
+
+    lr::DocRecord& r = s.upsert(123);
+    r.page = 7;
+    check(s.docs.size() == 1, "upsert 新建一条");
+    lr::DocRecord& r2 = s.upsert(123);
+    check(&r2 == &r && s.docs.size() == 1, "再次 upsert 命中同一条");
+    check(s.erase(123), "erase 命中");
+    check(!s.erase(123), "erase 二次返回 false");
+    check(s.find(123) == nullptr, "erase 后查不到");
+
+    lr::ReaderState empty;
+    const std::vector<std::uint8_t> bytes = lr::encode_state(empty);
+    lr::ReaderState out;
+    check(lr::decode_state(bytes.data(), bytes.size(), out), "空状态可解码");
+    check(out.docs.empty(), "空状态解码后无记录");
+}
+
+// ---- 3. 坏输入一律安全拒绝 ----
+void test_bad_input() {
+    std::printf("\n[3] 坏输入拒绝\n");
+    lr::ReaderState out;
+    out.upsert(1);  // 先塞一条，验证失败时 out 不被改动
+
+    // 空/太短
+    check(!lr::decode_state(nullptr, 0, out), "nullptr 拒绝");
+    const std::uint8_t tiny[4] = { 'L', 'R', 'S', '1' };
+    check(!lr::decode_state(tiny, sizeof tiny, out), "仅 magic 拒绝");
+    check(out.docs.size() == 1, "失败不改动 out");
+
+    // magic 错
+    std::vector<std::uint8_t> bad_magic = header("XXX1", lr::kStateVersion, 0);
+    check(!lr::decode_state(bad_magic.data(), bad_magic.size(), out), "magic 错拒绝");
+
+    // 版本不符
+    std::vector<std::uint8_t> bad_ver = header("LRS1", lr::kStateVersion + 1, 0);
+    check(!lr::decode_state(bad_ver.data(), bad_ver.size(), out), "版本不符拒绝");
+
+    // 条数超上限
+    std::vector<std::uint8_t> too_many = header("LRS1", lr::kStateVersion, lr::kMaxDocs + 1);
+    check(!lr::decode_state(too_many.data(), too_many.size(), out), "条数超上限拒绝");
+
+    // 记录被截断（声明 1 条但没有记录体）
+    std::vector<std::uint8_t> truncated = header("LRS1", lr::kStateVersion, 1);
+    put_u64(truncated, 0xABCDEF);  // 只有 key，后面字段缺失
+    check(!lr::decode_state(truncated.data(), truncated.size(), out), "记录截断拒绝");
+
+    // 书签数超上限
+    std::vector<std::uint8_t> bm_over = header("LRS1", lr::kStateVersion, 1);
+    put_u64(bm_over, 1);           // key
+    put_u32(bm_over, 0);           // page
+    put_u32(bm_over, 0x3F800000);  // zoom = 1.0f
+    put_u32(bm_over, 1);           // columns
+    put_u32(bm_over, 0);           // rotation
+    put_u32(bm_over, 0);           // flags
+    put_u32(bm_over, 0);           // color_mode
+    put_u32(bm_over, lr::kMaxBookmarksPerDoc + 1);  // 书签数超限
+    check(!lr::decode_state(bm_over.data(), bm_over.size(), out), "书签数超上限拒绝");
+}
+
+// ---- 4. 字段钳制（损坏值不得进入内存） ----
+void test_field_clamping() {
+    std::printf("\n[4] 字段钳制\n");
+    std::vector<std::uint8_t> b = header("LRS1", lr::kStateVersion, 1);
+    put_u64(b, 0x55);
+    put_u32(b, 5);              // page
+    put_u32(b, 0);              // zoom bits = 0.0f（非法）
+    put_u32(b, 99);             // columns 越界 → 钳到 4
+    put_u32(b, 450);            // rotation 450 → 归一到 90
+    put_u32(b, 0);              // flags
+    put_u32(b, 77);             // color_mode 越界 → 钳到 2
+    put_u32(b, 0);              // 书签数 0
+
+    lr::ReaderState out;
+    check(lr::decode_state(b.data(), b.size(), out), "可解码");
+    const lr::DocRecord* r = out.find(0x55);
+    check(r != nullptr, "记录存在");
+    if (r) {
+        check(r->columns == 4, "columns 钳到 4");
+        check(r->rotation == 90, "rotation 450 归一到 90");
+        check(r->color_mode == 2, "color_mode 钳到 2");
+        check_near(r->zoom, 1.0f, "非法 zoom 回落到 1.0");
+    }
+}
+
+// ---- 5. 文档键 ----
+void test_document_key() {
+    std::printf("\n[5] 文档键\n");
+    check_eq_u64(lr::document_key(L"Z:\\nonexistent\\no-such-file.pdf"), 0,
+                 "不存在的路径 → 0");
+    check_eq_u64(lr::document_key(L""), 0, "空路径 → 0");
+
+    wchar_t exe[1024] = {};
+    GetModuleFileNameW(nullptr, exe, 1024);
+    const std::uint64_t k1 = lr::document_key(exe);
+    const std::uint64_t k2 = lr::document_key(exe);
+    check(k1 != 0, "exe 路径键非 0");
+    check_eq_u64(k1, k2, "同一路径键稳定");
+}
+
+}  // namespace
+
+int main() {
+    std::printf("Lilith Reader 阅读状态测试（Phase 5）\n");
+    test_round_trip();
+    test_container_semantics();
+    test_bad_input();
+    test_field_clamping();
+    test_document_key();
+
+    std::printf("\n合计：通过 %d，失败 %d\n", g_pass, g_fail);
+    return g_fail == 0 ? 0 : 1;
+}

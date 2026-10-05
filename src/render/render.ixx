@@ -1,10 +1,10 @@
-// render.ixx — Lilith Reader 渲染调度层（Phase 3 建立，Phase 4 完善）
+// render.ixx — Lilith Reader 渲染调度层（Phase 3 建立，Phase 4 完善，Phase 5 增视图变换与缩略图）
 //
 // 职责：衔接 document 与 canvas。架构文档 §1 的依赖方向要求
 //       document 与 canvas **互不 import**，由本层居中调度，为将来替换
 //       MuPDF 为 PDFium 预留解耦（ADR-003）。
 //
-// 本层做四件事：
+// 本层做六件事：
 //   1. **线程归属**：单工作线程独占唯一的 Document；UI 线程零 fz_* 调用、
 //      零阻塞（延续 ADR-006/ADR-012）。
 //   2. **页状态机**：Unloaded → Loading → Loaded / Failed（架构文档 §3.2）。
@@ -17,6 +17,9 @@
 //      （架构文档 §3.3，ADR-019/033）。
 //   4. **缓存**：按**字节预算**的 LRU 逐出（默认 512MiB，可设 128MiB~2GiB）。
 //      逐出策略本身是纯函数，单独放在 lilithreader.page_cache 里可单测（ADR-030）。
+//   5. **视图变换**（Phase 5）：旋转（0/90/180/270）与配色（正常/反色/护眼）为
+//      文档级视图状态；变化即让全部纹理失效并整篇重渲（变换已固化进像素）。
+//   6. **缩略图通道**（Phase 5）：侧栏用的低 DPI 缩略图，独立缓存、不占页缓存预算。
 //
 // 纪律：
 //   · 本模块接口不出现 ImGui/D3D 类型：纹理以不透明 void* 暴露，UI 侧自行转
@@ -106,6 +109,9 @@ public:
     [[nodiscard]] DocState doc_state() const;
     [[nodiscard]] int      page_count() const;
     [[nodiscard]] PageSlot slot(int page) const;
+    // 目录（outline）快照。打开/解锁成功后由工作线程一次性加载；UI 进入阅读态时取一次即可。
+    // 无目录返回空表。**不要每帧调用**（会拷贝整个目录表）。
+    [[nodiscard]] std::vector<OutlineItem> outline() const;
 
     // 声明本帧需要的页（可见 + 预加载，按优先级排序）。渲染线程去重、
     // 排队、换入；已在足够倍率上 Loaded 的页会被跳过。
@@ -122,6 +128,22 @@ public:
     // 手动重试某页（用户点击失败占位）：重置自动重试计数并重新排队。
     // 页不可见时仅置标记，待其重新进入可见范围后生效。
     void retry_page(int page);
+
+    // ---- 视图变换（Phase 5）----
+    // 旋转（0/90/180/270，顺时针）与页面配色。**任一变化即让全部已缓存纹理失效**
+    // 并重新排队——因为变换结果已固化进纹理像素，必须整篇重渲。
+    // 页纹理与缩略图纹理都会失效重渲。
+    void set_view_transform(int rotation_deg, ColorMode color_mode);
+    [[nodiscard]] int       rotation() const;
+    [[nodiscard]] ColorMode color_mode() const;
+
+    // ---- 缩略图通道（Phase 5）----
+    // 声明侧栏需要的缩略图页（低 DPI）。与页纹理**互不干扰、独立缓存**，
+    // 不占页缓存字节预算（缩略图很小）。相同请求不会重复投递。
+    //   pages     : 需要的页（0 基），顺序即优先级
+    //   target_px : 缩略图最长边目标像素（如 150）
+    void set_thumbs_wanted(std::vector<int> pages, int target_px);
+    [[nodiscard]] PageSlot thumb_slot(int page) const;
 
 private:
     struct Impl;

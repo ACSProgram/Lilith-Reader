@@ -406,6 +406,80 @@ void test_gap_scales_with_zoom() {
     check_near(c2.content_width_px(), kVW, "含间距后 fit-width 仍严格铺满视口宽");
 }
 
+// ---- 17. 双页对开（书籍模式，Phase 5）----
+//
+// 书籍模式 = 封面（第 0 页）单独成页 + 其余两页对开：(1,2)、(3,4)…。
+// 与"columns=2 均匀网格"的唯一区别是**奇偶偏移**；布局/翻页/缩放全部复用网格逻辑。
+// 这里把映射与"封面在整行内居中"钉死，并守卫 spread=false 时映射不被污染。
+void test_spread_book_mode() {
+    std::printf("\n[17] 双页对开（书籍模式，Phase 5）\n");
+    auto make_spread = [](int pages, bool spread) {
+        lr::Canvas c;
+        c.set_viewport(kVW, kVH);
+        c.set_default_size({ kPW, kPH });
+        c.set_uniform(pages, { kPW, kPH });
+        lr::CanvasState st;
+        st.columns = 1;         // 对开时 columns 被忽略（等效 2 列）
+        st.fit_width = false;
+        st.zoom = 1.0f;
+        st.spread = spread;
+        c.set_state(st);
+        c.clamp_scroll();
+        return c;
+    };
+
+    lr::Canvas c = make_spread(5, true);
+    check(c.rows() == 3, "5 页对开 = 3 行（封面 1 行 + 对开 2 行）");
+    check(c.row_of(0) == 0, "页 0 独占第 0 行");
+    check(c.row_of(1) == 1 && c.row_of(2) == 1, "页 1/2 在第 1 行（对开）");
+    check(c.row_of(3) == 2 && c.row_of(4) == 2, "页 3/4 在第 2 行");
+    check(c.first_page_in_row(1) == 1, "第 1 行首页 = 页 1");
+    check(c.row_page_end(0) == 0, "第 0 行末页 = 页 0（封面单独）");
+    check(c.row_page_end(1) == 2, "第 1 行末页 = 页 2");
+    check(c.row_page_end(2) == 4, "第 2 行末页 = 页 4");
+
+    // 封面在整行宽度内居中；对开两页分列左右
+    const float gap = gap_at(1.0f);
+    const float ox = c.origin_x();
+    check_near(c.page_rect(0).x, ox + 16.0f + (2 * kPW + gap - kPW) * 0.5f,
+               "封面在整行内居中");
+    check_near(c.page_rect(1).x, ox + 16.0f, "对开左页贴左列");
+    check_near(c.page_rect(2).x, ox + 16.0f + kPW + gap, "对开右页在右列");
+    check_near(c.page_rect(1).y, c.page_rect(2).y, "对开两页同一行");
+    check(c.page_rect(0).y < c.page_rect(1).y, "封面行在对开行之上");
+
+    // 翻页按"行"推进，行首页即该行首页
+    check(c.current_page() == 0, "初始游标 = 页 0");
+    c.scroll_rows(+1);
+    check(c.current_page() == 1, "下翻 → 页 1（第 1 行首页）");
+    c.scroll_rows(+1);
+    check(c.current_page() == 3, "再下翻 → 页 3（第 2 行首页）");
+    c.scroll_rows(+1);
+    check(c.current_page() == 3, "末行后再下翻无操作");
+    c.scroll_rows(-1);
+    check(c.current_page() == 1, "上翻 → 页 1");
+    c.scroll_rows(-1);
+    check(c.current_page() == 0, "回到封面");
+
+    // 回归守卫：spread=false 时映射不变（均匀网格，未被对开映射污染）
+    lr::Canvas g = make_spread(5, false);
+    check(g.rows() == 5, "非对开：单列 5 页 = 5 行");
+    check(g.row_of(1) == 1, "非对开：页 1 在第 1 行");
+    check(g.row_page_end(0) == 0, "非对开：第 0 行末页 = 页 0");
+    check_near(g.page_rect(0).x, g.origin_x() + 16.0f,
+               "非对开：无行内居中偏移（x = 留白 + 居中原点）");
+
+    // 切换对开时锚定当前页（锚点页须仍在可见范围内）
+    lr::Canvas a = make(9, 1, true);
+    a.scroll_to_page(6);
+    check(a.current_page() == 6, "切换前游标 = 页 6");
+    a.set_spread(true);
+    check(a.state().spread, "spread 已开启");
+    check(a.visible_first() <= 6 && 6 <= a.visible_last(), "切换对开后锚点页仍可见");
+    a.set_spread(false);
+    check(!a.state().spread, "spread 已关闭");
+}
+
 }  // namespace
 
 int main() {
@@ -426,6 +500,7 @@ int main() {
     test_row_navigation_columns();
     test_nav_row_sync();
     test_gap_scales_with_zoom();
+    test_spread_book_mode();
 
     std::printf("\n合计：通过 %d，失败 %d\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

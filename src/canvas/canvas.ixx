@@ -44,6 +44,10 @@ struct CanvasState {
     float scroll_y = 0.0f;
     int   columns = 1;        // 1~4 列
     bool  fit_width = true;   // true：zoom 由视口宽度派生（使整行恰好铺满宽度）
+    // 双页对开（书籍模式）：封面（第 0 页）单独成页，其余两页对开 —— (1,2)、(3,4)…。
+    // 与"columns=2 的均匀网格"的区别仅在**奇偶偏移**：真实书籍装订是封面单张、正文成对。
+    // 开启时等效 2 列（columns 被忽略），布局复用网格的翻页/缩放/钳制逻辑。
+    bool  spread = false;
     float margin_px = 16.0f;   // 内容四周留白（**屏幕像素**；界面 chrome，不随缩放变化）
     float gap_ratio = 0.013f;  // 页/列间距，占**列宽（最宽页）的比例**；屏幕间距 = 该值 × 列宽 × zoom，
                                // 故随缩放线性变化（ADR-029）
@@ -141,6 +145,8 @@ public:
     void scroll_to_page(int index, float align = 0.0f);
     // 切换列数：锚定到当前首个可见页，避免跳变
     void set_columns(int columns);
+    // 切换双页对开（书籍模式）：锚定到当前阅读页，避免跳变
+    void set_spread(bool on);
     // 回到 fit-width
     void fit_to_width();
 
@@ -149,6 +155,17 @@ private:
     [[nodiscard]] PageSizePt size_of(int i) const;
     [[nodiscard]] int row_from_scroll() const;  // 由滚动位置反推当前行（到底取末行）
     void sync_nav_row();                        // nav_row_ ← row_from_scroll()
+
+    // ---- 行/列映射（spread 感知） ----
+    //
+    // 均匀网格：page i → (row=i/C, col=i%C)，行内页数恒为 C（末行可能少）。
+    // 书籍模式：page 0 → (0,0) 独占；page i≥1 → (1+(i-1)/2, (i-1)%2)，等效 2 列。
+    // 其余布局（缩放/滚动/钳制/游标）两者共用，故只在这几个映射函数里分支。
+    [[nodiscard]] int eff_cols() const;            // spread ? 2 : clamp(columns)
+    [[nodiscard]] int compute_rows(int n) const;
+    [[nodiscard]] int row_first_page(int row) const;
+    [[nodiscard]] int row_page_count(int row) const;  // 该行页数（1 或 2；网格下 ≤ eff_cols）
+    [[nodiscard]] int row_col_of(int index) const;    // 页在行内的列号（0 基）
 
     // ---- 输入 ----
     float viewport_w_ = 0.0f;

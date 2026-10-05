@@ -145,6 +145,14 @@ Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\page_cache.ifc", "/Fo$out\pag
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\page_cache.ifc",
     "/Fo$out\page_cache_test.obj", (Join-Path $tests "page_cache_test.cpp"))) "编译 page_cache_test.cpp"
 
+# Phase 5：阅读状态持久化（纯序列化 + Win32 文件 I/O），单独编译成 reader_state_test.exe
+Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\reader_state.ifc", "/Fo$out\reader_state.ixx.obj",
+    (Join-Path $src "state\reader_state.ixx"))) "编译 reader_state.ixx"
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\reader_state.ifc",
+    "/Fo$out\reader_state.obj", (Join-Path $src "state\reader_state.cpp"))) "编译 reader_state.cpp"
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\reader_state.ifc",
+    "/Fo$out\reader_state_test.obj", (Join-Path $tests "reader_state_test.cpp"))) "编译 reader_state_test.cpp"
+
 # 依赖库清单取自 unofficial-libmupdf 的 INTERFACE_LINK_LIBRARIES（不能改成"链上 lib\*.lib"：
 # jpeg.lib 与 turbojpeg.lib 会符号冲突）
 $libs = @("libmupdf.lib", "freetype.lib", "harfbuzz.lib", "jbig2dec.lib", "jpeg.lib",
@@ -166,6 +174,10 @@ Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\canvas_test.exe", "$out\canvas_test.obj
 # 页缓存策略测试同样只用 C++ 标准库；必须链 page_cache.ixx.obj（导出函数由它发射）。
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\page_cache_test.exe", "$out\page_cache_test.obj",
     "$out\page_cache.ixx.obj", "/link") + $libdirs) "链接 page_cache_test.exe"
+
+# 阅读状态测试：链 reader_state 的接口单元与实现单元。
+Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\reader_state_test.exe", "$out\reader_state_test.obj",
+    "$out\reader_state.ixx.obj", "$out\reader_state.obj", "/link") + $libdirs) "链接 reader_state_test.exe"
 
 # ---- 4. 运行测试 ---------------------------------------------------------------
 
@@ -201,6 +213,16 @@ try {
 $cacheExit = $LASTEXITCODE
 Write-Host "  page_cache_test.exe 退出码 = $cacheExit"
 
+Step "运行阅读状态测试"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & "$out\reader_state_test.exe"
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$stateExit = $LASTEXITCODE
+Write-Host "  reader_state_test.exe 退出码 = $stateExit"
+
 if ($Probe) {
     Step "编译并运行 MuPDF 诊断探针"
     Invoke-Cl ($defs + $incs + @("/c", "/Fo$out\mupdf_probe.obj",
@@ -211,11 +233,12 @@ if ($Probe) {
 }
 
 Step "结束"
-if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0) {
+if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $stateExit -eq 0) {
     Write-Host "全部通过。" -ForegroundColor Green
 } else {
     Write-Host "存在失败用例。" -ForegroundColor Red
 }
 if ($testExit -ne 0) { exit $testExit }
 if ($canvasExit -ne 0) { exit $canvasExit }
-exit $cacheExit
+if ($cacheExit -ne 0) { exit $cacheExit }
+exit $stateExit

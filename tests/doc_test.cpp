@@ -25,6 +25,7 @@
 #include <cstring>
 #include <cmath>
 #include <string>
+#include <vector>
 
 import lilithreader.utils;
 import lilithreader.document;
@@ -59,6 +60,7 @@ const Case kCases[] = {
     {"real.xps",   Expect::Open, {}, 1, "XPS", 1, "XPS 打开"},
     {"real.png",   Expect::Open, {}, 1, "Image", 1, "单页图片：白名单放行（ADR-017）"},
     {"comic.cbz",  Expect::Open, {}, 3, "zip", 1, "CBZ 页数=图片数"},
+    {"outline.pdf", Expect::Open, {}, 3, "PDF", 1, "带目录的 PDF（Phase 5）"},
 
     // ---- 2. 改名但内容可读：内容优先，打开但标注不符（ADR-016） ----
     {"img_named_pdf.pdf",   Expect::Open, {}, 1, "Image", 0, "图片改 .pdf 仍打开"},
@@ -365,6 +367,130 @@ void run_size_cases(const std::wstring& dir) {
     }
 }
 
+// ---- 目录（outline）解析（Phase 5）----
+//
+// outline.pdf 的目录结构（前序）：Chapter 1(→页0, 有子项) / Section 1.1(→页1) / Chapter 2(→页2)。
+// 断言展平顺序、层级（depth）与页号解析都正确；无目录文档返回 Ok 且空表（不是错误）。
+struct OutlineExpect { const char* title; int page; int depth; };
+
+void run_outline_cases(const std::wstring& dir) {
+    std::printf("\n-- 目录（outline）解析（Phase 5）--\n");
+    const std::wstring path = dir + L"\\outline.pdf";
+    if (!file_exists(path)) { skip("outline.pdf", "目录解析"); return; }
+
+    lr::Document doc;
+    if (doc.open(path) != lr::DocError::Ok) { fail("outline.pdf", "目录解析", "打不开"); return; }
+    lr::DocumentInfo info;
+    if (doc.info(info) != lr::DocError::Ok || !info.has_outline) {
+        fail("outline.pdf", "目录解析", "info 失败或 has_outline=false");
+        return;
+    }
+    std::vector<lr::OutlineItem> items;
+    if (doc.outline(items) != lr::DocError::Ok) {
+        fail("outline.pdf", "目录解析", "outline 失败");
+        return;
+    }
+
+    const OutlineExpect want[] = {
+        { "Chapter 1",   0, 0 },
+        { "Section 1.1", 1, 1 },
+        { "Chapter 2",   2, 0 },
+    };
+    const int n = static_cast<int>(sizeof want / sizeof want[0]);
+    if (static_cast<int>(items.size()) != n) {
+        char d[128];
+        std::snprintf(d, sizeof d, "目录项数 %zu，期望 %d", items.size(), n);
+        fail("outline.pdf", "目录解析", d);
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        char name[64];
+        std::snprintf(name, sizeof name, "目录项 %d", i);
+        if (items[i].title != want[i].title || items[i].page != want[i].page ||
+            items[i].depth != want[i].depth) {
+            char d[220];
+            std::snprintf(d, sizeof d,
+                          "第 %d 项 \"%s\" page=%d depth=%d，期望 \"%s\" page=%d depth=%d",
+                          i, items[i].title.c_str(), items[i].page, items[i].depth,
+                          want[i].title, want[i].page, want[i].depth);
+            fail("outline.pdf", name, d);
+            return;
+        }
+        pass("outline.pdf", name);
+    }
+
+    // 无目录文档：返回 Ok 且空表
+    const std::wstring plain = dir + L"\\real.pdf";
+    if (file_exists(plain)) {
+        lr::Document d2;
+        if (d2.open(plain) == lr::DocError::Ok) {
+            std::vector<lr::OutlineItem> o2;
+            const lr::DocError oe = d2.outline(o2);
+            if (oe == lr::DocError::Ok && o2.empty())
+                pass("real.pdf", "无目录返回 Ok 且空表");
+            else
+                fail("real.pdf", "无目录返回 Ok 且空表", "结果不符");
+        }
+    }
+}
+
+// ---- 渲染：旋转与配色（Phase 5）----
+//
+// real.pdf 每页 200x300 pt。断言：0°/180° 输出尺寸不变，90° 宽高互换；
+// 反色把白色背景变黑且保留 alpha；护眼把白色背景映射为暖色（R>B）。
+// 这些都能在无窗口环境下由 MuPDF 直接渲染，属"可程序判定的证据"。
+void run_render_cases(const std::wstring& dir) {
+    std::printf("\n-- 渲染：旋转与配色（Phase 5）--\n");
+    const std::wstring path = dir + L"\\real.pdf";
+    if (!file_exists(path)) { skip("real.pdf", "旋转/配色渲染"); return; }
+
+    lr::Document doc;
+    if (doc.open(path) != lr::DocError::Ok) { fail("real.pdf", "旋转渲染", "打不开"); return; }
+    lr::DocumentInfo info;
+    if (doc.info(info) != lr::DocError::Ok) { fail("real.pdf", "旋转渲染", "info 失败"); return; }
+    const int pw = static_cast<int>(info.page_width_pt + 0.5f);
+    const int ph = static_cast<int>(info.page_height_pt + 0.5f);
+
+    auto dims_ok = [](const lr::PageBitmap& b, int w, int h) {
+        const int dw = b.width() - w;
+        const int dh = b.height() - h;
+        return dw >= -2 && dw <= 2 && dh >= -2 && dh <= 2;
+    };
+
+    lr::PageBitmap b0, b90, b180;
+    if (doc.render_page(0, 1.0f, b0, 8192, 0) != lr::DocError::Ok ||
+        doc.render_page(0, 1.0f, b90, 8192, 90) != lr::DocError::Ok ||
+        doc.render_page(0, 1.0f, b180, 8192, 180) != lr::DocError::Ok) {
+        fail("real.pdf", "旋转渲染", "render 失败");
+        return;
+    }
+    if (dims_ok(b0, pw, ph)) pass("real.pdf", "旋转 0° 尺寸 = 原尺寸");
+    else fail("real.pdf", "旋转 0° 尺寸 = 原尺寸", "尺寸不符");
+    if (dims_ok(b90, ph, pw)) pass("real.pdf", "旋转 90° 宽高互换");
+    else fail("real.pdf", "旋转 90° 宽高互换", "尺寸不符");
+    if (dims_ok(b180, pw, ph)) pass("real.pdf", "旋转 180° 尺寸 = 原尺寸");
+    else fail("real.pdf", "旋转 180° 尺寸 = 原尺寸", "尺寸不符");
+
+    lr::PageBitmap bn, bi, be;
+    if (doc.render_page(0, 1.0f, bn, 8192, 0, lr::ColorMode::Normal) != lr::DocError::Ok ||
+        doc.render_page(0, 1.0f, bi, 8192, 0, lr::ColorMode::Invert) != lr::DocError::Ok ||
+        doc.render_page(0, 1.0f, be, 8192, 0, lr::ColorMode::EyeCare) != lr::DocError::Ok) {
+        fail("real.pdf", "配色渲染", "render 失败");
+        return;
+    }
+    const std::uint8_t* pn = bn.samples();
+    const std::uint8_t* pi = bi.samples();
+    const std::uint8_t* pe = be.samples();
+    if (pn[0] > 200) pass("real.pdf", "正常：背景为白");
+    else fail("real.pdf", "正常：背景为白", "像素不符");
+    if (pi[0] < 55) pass("real.pdf", "反色：背景变黑");
+    else fail("real.pdf", "反色：背景变黑", "像素不符");
+    if (pi[3] == 255 && pn[3] == 255) pass("real.pdf", "反色保留 alpha=255");
+    else fail("real.pdf", "反色保留 alpha=255", "alpha 被改");
+    if (pe[0] > pe[2]) pass("real.pdf", "护眼：背景为暖色（R>B）");
+    else fail("real.pdf", "护眼：背景为暖色（R>B）", "像素不符");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -391,6 +517,8 @@ int main(int argc, char** argv) {
 
     run_gate_cases();
     run_size_cases(dir);
+    run_outline_cases(dir);
+    run_render_cases(dir);
 
     std::printf("\n=== 结果：%d 通过 / %d 失败 / %d 跳过 ===\n", g_pass, g_fail, g_skip);
     if (g_fail > 0) {
