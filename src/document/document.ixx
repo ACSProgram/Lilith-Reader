@@ -142,6 +142,9 @@ class Document;  // 前向声明：PageBitmap 需要它作为工厂友元
 // 非线程安全；只能在创建它的线程内使用。
 // 与 Document 共享 fz_context 所有权，因此不要求在本体之前析构；
 // 但为控制内存占用，仍应尽早销毁（推荐：GPU 上传完成后立即释放）。
+//
+// 属性访问（ADR-083）：w/h/stride/samples 在**构造时一次性快照**，访问器是纯读取、
+// 不再回调 MuPDF；资源释放在统一的边界函数内受 fz_try/fz_catch 覆盖。
 class PageBitmap {
 public:
     PageBitmap() noexcept = default;
@@ -152,10 +155,10 @@ public:
     PageBitmap& operator=(const PageBitmap&) = delete;
 
     [[nodiscard]] bool valid() const noexcept;
-    [[nodiscard]] int width() const noexcept;       // 像素
-    [[nodiscard]] int height() const noexcept;      // 像素
-    [[nodiscard]] int stride() const noexcept;      // 字节/行（= width * 4）
-    [[nodiscard]] const std::uint8_t* samples() const noexcept;  // 行主序 RGBA
+    [[nodiscard]] int width() const noexcept;       // 像素（构造时快照）
+    [[nodiscard]] int height() const noexcept;      // 像素（构造时快照）
+    [[nodiscard]] int stride() const noexcept;      // 字节/行（= width * 4，构造时快照）
+    [[nodiscard]] const std::uint8_t* samples() const noexcept;  // 行主序 RGBA（构造时快照）
 
     // 实际使用的缩放：若因尺寸上限被下调，这里返回下调后的值
     [[nodiscard]] float effective_scale() const noexcept;

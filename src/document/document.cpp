@@ -676,6 +676,69 @@ void copy_truncated(std::string_view src, char* dst, std::size_t cap) noexcept {
     dst[n] = '\0';
 }
 
+// ---- MuPDF 边界函数（ADR-083）----
+//
+// 文件头铁律第 1 条：任何 fz_* 调用都必须被 fz_try/fz_catch 包住。资源属性读取与资源释放
+// 集中到下面这几个边界函数里，其余代码只经它们接触 MuPDF 的资源对象 —— 于是"longjmp 不
+// 穿透 C++ 生命周期"成为**结构保证**，而不是"这些函数恰好不抛"的经验假设。
+// 块内只出现 POD（PixmapAttrs / 裸指针），符合铁律第 1 条对 fz_try 体的约束。
+
+// pixmap 属性快照（POD，可安全跨越 longjmp）。
+struct PixmapAttrs {
+    int                  w = 0;
+    int                  h = 0;
+    int                  stride = 0;
+    int                  components = 0;
+    const unsigned char* samples = nullptr;
+};
+
+// 一次性读出 pixmap 的全部属性（构造 PageBitmap 时调用）。失败归零。
+PixmapAttrs pixmap_attrs(fz_context* ctx, fz_pixmap* pix) noexcept {
+    PixmapAttrs a{};
+    if (ctx == nullptr || pix == nullptr) return a;
+    fz_var(a);
+    fz_try(ctx) {
+        a.w = fz_pixmap_width(ctx, pix);
+        a.h = fz_pixmap_height(ctx, pix);
+        a.stride = fz_pixmap_stride(ctx, pix);
+        a.components = fz_pixmap_components(ctx, pix);
+        a.samples = fz_pixmap_samples(ctx, pix);
+    }
+    fz_catch(ctx) {
+        a = PixmapAttrs{};
+    }
+    return a;
+}
+
+// 释放类边界：fz_drop_* 在 MuPDF 里约定不抛，但 ADR-083 要求它们同样被 fz_try/fz_catch 覆盖。
+// 入参先取本地副本并置空调用方的指针：即便 drop 内部 longjmp，调用方也不会留下悬垂指针。
+void drop_pixmap_safe(fz_context* ctx, fz_pixmap*& pix) noexcept {
+    fz_pixmap* p = pix;
+    pix = nullptr;
+    if (ctx == nullptr || p == nullptr) return;
+    fz_var(p);
+    fz_try(ctx) { fz_drop_pixmap(ctx, p); }
+    fz_catch(ctx) {}
+}
+
+void drop_stext_safe(fz_context* ctx, fz_stext_page*& st) noexcept {
+    fz_stext_page* p = st;
+    st = nullptr;
+    if (ctx == nullptr || p == nullptr) return;
+    fz_var(p);
+    fz_try(ctx) { fz_drop_stext_page(ctx, p); }
+    fz_catch(ctx) {}
+}
+
+void drop_document_safe(fz_context* ctx, fz_document*& doc) noexcept {
+    fz_document* p = doc;
+    doc = nullptr;
+    if (ctx == nullptr || p == nullptr) return;
+    fz_var(p);
+    fz_try(ctx) { fz_drop_document(ctx, p); }
+    fz_catch(ctx) {}
+}
+
 }  // namespace
 
 // ---- 错误码文案 ----
@@ -734,6 +797,8 @@ struct PageBitmap::Impl {
     std::shared_ptr<CtxHandle> ch;   // ctx 的共享所有权（见 CtxHandle 说明）
     fz_pixmap* pix = nullptr;
     float      scale = 1.0f;
+    // ADR-083：像素属性在构造时快照，访问器不再回调 MuPDF（零 fz_* 的纯访问器）。
+    PixmapAttrs attrs{};
 
     [[nodiscard]] fz_context* ctx() const noexcept { return ch ? ch->ctx : nullptr; }
 };
@@ -757,30 +822,21 @@ PageBitmap& PageBitmap::operator=(PageBitmap&& other) noexcept {
 
 void PageBitmap::reset() noexcept {
     if (!impl_) return;
-    if (impl_->pix) {
-        if (fz_context* ctx = impl_->ctx()) fz_drop_pixmap(ctx, impl_->pix);
-        impl_->pix = nullptr;
-    }
+    drop_pixmap_safe(impl_->ctx(), impl_->pix);   // ADR-083：销毁走统一边界函数
     delete impl_;
     impl_ = nullptr;
 }
 
 bool PageBitmap::valid() const noexcept { return impl_ != nullptr && impl_->pix != nullptr; }
 
-int PageBitmap::width() const noexcept {
-    return valid() ? fz_pixmap_width(impl_->ctx(), impl_->pix) : 0;
-}
+int PageBitmap::width() const noexcept { return impl_ ? impl_->attrs.w : 0; }
 
-int PageBitmap::height() const noexcept {
-    return valid() ? fz_pixmap_height(impl_->ctx(), impl_->pix) : 0;
-}
+int PageBitmap::height() const noexcept { return impl_ ? impl_->attrs.h : 0; }
 
-int PageBitmap::stride() const noexcept {
-    return valid() ? fz_pixmap_stride(impl_->ctx(), impl_->pix) : 0;
-}
+int PageBitmap::stride() const noexcept { return impl_ ? impl_->attrs.stride : 0; }
 
 const std::uint8_t* PageBitmap::samples() const noexcept {
-    return valid() ? fz_pixmap_samples(impl_->ctx(), impl_->pix) : nullptr;
+    return impl_ ? impl_->attrs.samples : nullptr;
 }
 
 float PageBitmap::effective_scale() const noexcept {
@@ -809,20 +865,16 @@ struct Document::Impl {
 
     ~Impl() { destroy(); }
 
-    // 丢弃文本抽取缓存（fz_drop_* 不抛异常）
+    // 丢弃文本抽取缓存（ADR-083：释放走统一边界函数，fz_try/fz_catch 覆盖）
     void drop_stext() noexcept {
-        if (stext_ != nullptr && ctx != nullptr) fz_drop_stext_page(ctx, stext_);
-        stext_ = nullptr;
+        drop_stext_safe(ctx, stext_);
         stext_page_ = -1;
     }
 
-    // 释放 MuPDF 资源。doc 必须先于 ctx 释放。fz_drop_* 不抛异常。
+    // 释放 MuPDF 资源。doc 必须先于 ctx 释放（ADR-083：销毁统一走边界函数）。
     void destroy() noexcept {
         drop_stext();
-        if (doc && ctx) {
-            fz_drop_document(ctx, doc);
-            doc = nullptr;
-        }
+        drop_document_safe(ctx, doc);
         // 若仍有 PageBitmap 存活，这里只是放下自己那一份所有权，ctx 延后释放
         ch.reset();
         ctx = nullptr;
@@ -1799,15 +1851,17 @@ DocError Document::render_page_region(int index, float scale, PageBitmap& out,
 
     // 防御性校验：分量数不是 4 说明 MuPDF 行为与预期不符，
     // 宁可报错也不能把格式不符的缓冲交给纹理层。
-    if (fz_pixmap_components(s.ctx, pix) != kComponents) {
-        fz_drop_pixmap(s.ctx, pix);
+    // ADR-083：属性读取经边界函数 pixmap_attrs（fz_try/fz_catch 覆盖），并顺带快照给 PageBitmap。
+    const PixmapAttrs attrs = pixmap_attrs(s.ctx, pix);
+    if (attrs.components != kComponents || attrs.samples == nullptr) {
+        drop_pixmap_safe(s.ctx, pix);
         set_error(s.last_error, "unexpected pixmap component count");
         return DocError::Internal;
     }
 
-    auto* impl = new (std::nothrow) PageBitmap::Impl{ s.ch, pix, used };
+    auto* impl = new (std::nothrow) PageBitmap::Impl{ s.ch, pix, used, attrs };
     if (impl == nullptr) {
-        fz_drop_pixmap(s.ctx, pix);
+        drop_pixmap_safe(s.ctx, pix);
         set_error(s.last_error, "out of memory allocating page bitmap");
         return DocError::Internal;
     }

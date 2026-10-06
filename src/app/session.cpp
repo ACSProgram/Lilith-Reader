@@ -312,6 +312,11 @@ void toggle_scheme(int mode) { set_scheme(g_scheme == mode ? 0 : mode); }
 
 // ---------------- 阅读位置与书签 ----------------
 
+// 把 g_state 交给异步持久化服务（ADR-082）：本函数只在调用线程做纯序列化，写盘在工作线程。
+void request_state_save() {
+    if (g_persist) g_persist->request_save(g_state);
+}
+
 void save_reading_state() {
     if (g_doc_key == 0 || g_doc.kind != UiDoc::Kind::Reading) return;
     lr::DocRecord& r = g_state.upsert(g_doc_key);
@@ -327,7 +332,7 @@ void save_reading_state() {
     r.path_key = g_identity.path;
     r.page_count = g_identity.page_count;
     lr::remember_location(r, g_identity.path_u8);
-    (void)lr::save_state(g_state_path, g_state);  // 书签在增删时已写入 g_state，这里不覆盖
+    request_state_save();  // 书签在增删时已写入 g_state，这里不覆盖
 }
 
 // ---- 身份解析与阅读数据维护（ADR-062）----
@@ -403,7 +408,7 @@ void detach_current_progress() {
         nr.page_count = g_identity.page_count;
         lr::remember_location(nr, me);
     }
-    (void)lr::save_state(g_state_path, g_state);
+    request_state_save();
     g_restore_pending = false;      // 首帧待恢复的位置作废
     request_jump_scroll(0, 0.0f);
 }
@@ -413,13 +418,13 @@ void clear_reading_data(std::uint64_t key) {
     g_state.erase(key);
     // 删的正是当前在读的那本：解除本次会话的绑定（不再写入），下次打开按新文档处理。
     if (key == g_doc_key) g_doc_key = 0;
-    (void)lr::save_state(g_state_path, g_state);
+    request_state_save();
 }
 
 void clear_all_reading_data() {
     g_state.docs.clear();
     g_doc_key = 0;
-    (void)lr::save_state(g_state_path, g_state);
+    request_state_save();
 }
 
 int unknown_reading_data_count() {
@@ -443,7 +448,7 @@ void clear_unknown_reading_data() {
     }
     if (keep.size() == g_state.docs.size()) return;     // 没有可清的
     g_state.docs = std::move(keep);
-    (void)lr::save_state(g_state_path, g_state);
+    request_state_save();
 }
 
 bool current_page_has_bookmark() {
@@ -463,12 +468,12 @@ void toggle_bookmark_current() {
     for (auto it = r.bookmarks.begin(); it != r.bookmarks.end(); ++it) {
         if (it->page == page) {
             r.bookmarks.erase(it);
-            (void)lr::save_state(g_state_path, g_state);
+            request_state_save();
             return;
         }
     }
     r.bookmarks.push_back(lr::Bookmark{ page, {} });
-    (void)lr::save_state(g_state_path, g_state);
+    request_state_save();
 }
 
 void remove_bookmark_at(int index) {
@@ -478,7 +483,7 @@ void remove_bookmark_at(int index) {
         if (kv.first == g_doc_key) { r = &kv.second; break; }
     if (r == nullptr || index < 0 || index >= static_cast<int>(r->bookmarks.size())) return;
     r->bookmarks.erase(r->bookmarks.begin() + index);
-    (void)lr::save_state(g_state_path, g_state);
+    request_state_save();
 }
 
 // ---------------- 文档状态机 ----------------
@@ -623,13 +628,9 @@ void request_open_document(std::wstring path) {
     g_confirm_open = false;          // 上一次可能还挂着一个"是否沿用"的询问
     g_confirm_kind = ConfirmKind::None;
 
-    // 本地即时判定：不存在 / 不在支持清单内（不必浪费一次线程往返）
-    if (!lr::file_exists(path)) {
-        g_doc.kind = UiDoc::Kind::Rejected;
-        g_doc.error = lr::DocError::NotFound;
-        update_title();
-        return;
-    }
+    // 扩展名闸门（ADR-013）：纯字符串策略、不碰磁盘，保留在 UI 线程做即时拒绝。
+    // 文件**存在性**不再在 UI 线程预检（那是磁盘 I/O，违反「UI 零磁盘」，ADR-081）：
+    // 交给后台打开，由 DocError::NotFound 经 poll_document → Failed 如实呈现。
     if (!lr::is_supported(path)) {
         g_doc.kind = UiDoc::Kind::Rejected;
         g_doc.error = lr::DocError::Unsupported;

@@ -148,6 +148,10 @@ struct ReaderState {
 [[nodiscard]] ReaderState load_state(const std::wstring& path) noexcept;
 // 写临时文件 + MoveFileExW 替换。返回是否成功。
 [[nodiscard]] bool save_state(const std::wstring& path, const ReaderState& s) noexcept;
+// 与 save_state 同一套原子写入，但入参是**已编码**的字节：供异步持久化服务在
+// 工作线程直接落盘，UI 线程只负责 encode_state 产快照（ADR-082）。
+[[nodiscard]] bool write_state_bytes(const std::wstring& path,
+                                     const std::vector<std::uint8_t>& bytes) noexcept;
 
 // 解析上限（防御损坏/恶意文件把内存撑爆）
 inline constexpr std::uint32_t kMaxDocs = 4096;

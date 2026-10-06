@@ -45,6 +45,7 @@ import lilithreader.document;
 import lilithreader.canvas;
 import lilithreader.render;
 import lilithreader.reader_state;
+import lilithreader.persist;  // 异步持久化服务（ADR-082）
 import lilithreader.log;      // Phase 7：轻量日志（自实现，不引入 spdlog，ADR-077）
 
 #include "imgui.h"
@@ -361,10 +362,15 @@ struct UiDoc {
 };
 inline UiDoc g_doc;
 
-// ---- 阅读状态持久化（ADR-034；身份分层 ADR-062）----
+// ---- 阅读状态持久化（ADR-034；身份分层 ADR-062；异步写盘 ADR-082）----
 inline lr::ReaderState  g_state;      // exe 同目录 reader_state.bin 的全部记录
 inline lr::DocIdentity  g_identity;   // 当前文档身份（内容指纹 / 路径键 / 页数 / 路径）
 inline std::uint64_t    g_doc_key = 0;  // 当前文档在库里的主键（0 = 无效，不参与存取）
+// 异步持久化服务（ADR-082）：写盘在工作线程完成，UI 线程只产快照（不碰磁盘）。
+// 由入口在载入 g_state 之后创建；退出路径经 flush() 保证写入（见 main.cpp 的 WM_DESTROY）。
+inline std::unique_ptr<lr::PersistService> g_persist;
+// 请求把 g_state 落盘：编码在调用线程（纯序列化），写盘在服务的工作线程。g_persist 为空时无操作。
+void request_state_save();
 
 // ---- 侧栏（目录 / 书签 / 缩略图 / 搜索）----
 inline bool g_show_sidebar = false;

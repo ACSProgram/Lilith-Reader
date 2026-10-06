@@ -456,8 +456,11 @@ ReaderState load_state(const std::wstring& path) noexcept {
 }
 
 bool save_state(const std::wstring& path, const ReaderState& s) noexcept {
-    const std::vector<std::uint8_t> bytes = encode_state(s);
+    return write_state_bytes(path, encode_state(s));
+}
 
+bool write_state_bytes(const std::wstring& path,
+                       const std::vector<std::uint8_t>& bytes) noexcept {
     // 先写临时文件（同目录，保证 MoveFileEx 是同一卷上的原子重命名）
     const std::wstring tmp = path + L".tmp";
     HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,

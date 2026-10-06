@@ -131,7 +131,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                          SWP_NOZORDER | SWP_NOACTIVATE);
         return 0;
     case WM_DESTROY: {
-        save_reading_state();  // 退出时落盘阅读位置（书签已实时落盘）
+        save_reading_state();                 // 更新 g_state 快照（书签已实时更新）
+        if (g_persist) g_persist->flush();    // 退出前把在途快照写完（ADR-082）
         if (!g_fullscreen) {   // 全屏态不覆盖保存的正常态矩形
             WINDOWPLACEMENT placement{ sizeof(placement) };
             if (GetWindowPlacement(hwnd, &placement)) {
@@ -193,6 +194,9 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
     g_state_path = lr::exe_dir() + L"reader_state.bin";
     g_state = lr::load_state(g_state_path);  // 阅读位置/书签（损坏则安全忽略为空）
     load_prefs();  // 用户偏好（界面缩放/主题/动效/间距/缓存预算）
+    // 异步持久化服务（ADR-082）：在载入 g_state 之后创建；写盘在工作线程，
+    // UI 线程只产快照。退出路径经 flush 保证写入（见 WM_DESTROY 与下面的 shutdown）。
+    g_persist = std::make_unique<lr::PersistService>(g_state_path);
 
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -332,6 +336,7 @@ quit:
     g_renderer.reset();  // 必须先于 gfx 释放：纹理依赖 D3D11 设备
     g_ui.shutdown();
     g_gfx.shutdown();
+    g_persist.reset();   // 析构即 flush；须在 log::shutdown 之前（写失败要能记日志）
     lr::log::info("app", "clean exit");
     crash::mark_clean_exit();   // 正常退出：清掉"运行中"标记，下次启动不误报
     lr::log::shutdown();

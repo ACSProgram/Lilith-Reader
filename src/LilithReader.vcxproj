@@ -143,6 +143,9 @@
     <!-- Phase 5：阅读状态持久化（纯序列化 + 原子文件 I/O，可单测） -->
     <ClCompile Include="state\reader_state.ixx" />
     <ClCompile Include="state\reader_state.cpp" />
+    <!-- 架构加固（ADR-082）：阅读状态异步持久化服务（独立写线程 + 防抖 + 退出 flush） -->
+    <ClCompile Include="state\persist.ixx" />
+    <ClCompile Include="state\persist.cpp" />
     <!-- Phase 3 起 ImPlot 已从构建中移除（自研画布取代其调试用途，见 ADR-018）。
          imgui_demo.cpp 同样不在构建内：本项目从未调用任何 ShowDemoWindow/ShowStyleEditor，
          留着只是白编译一个 594KB 的翻译单元（F3 调试浮层是自绘的，不依赖它）。 -->

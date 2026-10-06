@@ -216,6 +216,18 @@ Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\utils.ifc",
     "/reference", "$out\reader_state.ifc",
     "/Fo$out\reader_state_test.obj", (Join-Path $tests "reader_state_test.cpp"))) "编译 reader_state_test.cpp"
 
+# 架构加固（ADR-082）：阅读状态异步持久化服务。persist.ixx 重导出 reader_state，
+# persist.cpp 依赖 reader_state 与 log，故编译顺序必须是 reader_state/log → persist。
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\reader_state.ifc",
+    "/ifcOutput$out\persist.ifc", "/Fo$out\persist.ixx.obj",
+    (Join-Path $src "state\persist.ixx"))) "编译 persist.ixx"
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\persist.ifc",
+    "/reference", "$out\reader_state.ifc", "/reference", "$out\log.ifc",
+    "/Fo$out\persist.obj", (Join-Path $src "state\persist.cpp"))) "编译 persist.cpp"
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\reader_state.ifc",
+    "/reference", "$out\persist.ifc",
+    "/Fo$out\persist_test.obj", (Join-Path $tests "persist_test.cpp"))) "编译 persist_test.cpp"
+
 # 配色色调映射（ADR-068）：纯数学 + 无 ImGui/Win32 依赖的头，单独编译成 tone_test.exe。
 # 它把"配色的骨架"（色相/饱和度/对比度）钉死，观感仍留给人工验证。
 Invoke-Cl ($defs + @("/I$(Join-Path $src 'app')") + $incs + @("/c",
@@ -269,6 +281,12 @@ Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\imgui_raii_test.exe") + $raiiObjs +
 # 阅读状态测试：链 reader_state 的接口单元与实现单元。
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\reader_state_test.exe", "$out\reader_state_test.obj",
     "$out\reader_state.ixx.obj", "$out\reader_state.obj", "/link") + $libdirs) "链接 reader_state_test.exe"
+
+# 持久化服务测试：链 persist 的接口/实现单元 + 它依赖的 reader_state 与 log。
+Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\persist_test.exe", "$out\persist_test.obj",
+    "$out\persist.ixx.obj", "$out\persist.obj",
+    "$out\reader_state.ixx.obj", "$out\reader_state.obj",
+    "$out\log.obj", "$out\log.ixx.obj", "/link") + $libdirs) "链接 persist_test.exe"
 
 # 色调测试只用 C++ 标准库。
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\tone_test.exe", "$out\tone_test.obj", "/link") +
@@ -330,6 +348,16 @@ try {
 }
 $stateExit = $LASTEXITCODE
 Write-Host "  reader_state_test.exe 退出码 = $stateExit"
+
+Step "运行持久化服务测试"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & "$out\persist_test.exe"
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$persistExit = $LASTEXITCODE
+Write-Host "  persist_test.exe 退出码 = $persistExit"
 
 Step "运行配色色调测试"
 try {
@@ -453,6 +481,7 @@ Write-Host "  check_theme_precedence.py 退出码 = $themePrecedenceExit"
 
 Step "结束"
 if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $stateExit -eq 0 -and
+    $persistExit -eq 0 -and
     $toneExit -eq 0 -and $pageMapExit -eq 0 -and $renderSearchExit -eq 0 -and
     $renderFaultExit -eq 0 -and $raiiExit -eq 0 -and
     $fontExit -eq 0 -and $iconExit -eq 0 -and
@@ -465,6 +494,7 @@ if ($testExit -ne 0) { exit $testExit }
 if ($canvasExit -ne 0) { exit $canvasExit }
 if ($cacheExit -ne 0) { exit $cacheExit }
 if ($stateExit -ne 0) { exit $stateExit }
+if ($persistExit -ne 0) { exit $persistExit }
 if ($toneExit -ne 0) { exit $toneExit }
 if ($pageMapExit -ne 0) { exit $pageMapExit }
 if ($renderSearchExit -ne 0) { exit $renderSearchExit }
