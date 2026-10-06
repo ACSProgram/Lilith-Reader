@@ -63,13 +63,18 @@ namespace lr::app {
 inline constexpr wchar_t kWindowClass[] = L"LilithReaderWnd";
 inline constexpr wchar_t kWindowTitle[] = L"Lilith Reader";
 inline constexpr int     kAppIconId = 101;   // 见 src/app/app.rc
+inline constexpr int     kUiFontResId = 102; // UI 字体子集（RCDATA），见 src/app/app.rc
 
 inline constexpr float  kUiFontBasePx = 20.0f;    // UI 基准字号（×FontScaleMain×FontScaleDpi 后为实际像素）
 inline constexpr float  kScrollStepPx = 120.0f;   // 每格滚轮滚动的屏幕像素
 inline constexpr float  kKeyScrollPx = 80.0f;     // 方向键每次滚动的屏幕像素
 inline constexpr float  kZoomStep = 1.15f;        // 每格 Ctrl+滚轮 / 每次 +/- 的缩放倍率
 inline constexpr double kZoomDebounceSec = 0.15;  // 缩放稳定后触发高清重渲染的等待时间
-inline constexpr float  kStatusBarH = 30.0f;      // 底部状态栏高度
+// 状态栏高度：**必须容得下 CJK 字体的墨迹盒**，而不是只装名义行高。
+// ImGui 的 `GetTextLineHeight()` = 字号（1.0 em），而微软雅黑/思源黑体的 ascent+descent
+// ≈ 1.32 em（含汉字上下的气口），故 20px 基准字号的实际墨迹约 26px。取 34 是为了让
+// 墨迹上下各留 ~4px 基准像素的呼吸空间（早期取 30 时下缘只剩 1~2px，实测反馈"字太贴边"）。
+inline constexpr float  kStatusBarH = 34.0f;      // 底部状态栏高度
 inline constexpr float  kTopBarH = 40.0f;         // 顶部工具栏高度
 inline constexpr float  kCanvasMarginPx = 18.0f;  // 画布四周留白（屏幕像素，随 DPI 缩放）
 // 页/列间距：占**列宽**的比例（文档空间，ADR-029），**刻意不过 px()**（与页面同比例缩放）。
@@ -82,6 +87,20 @@ inline constexpr float  kPopupPadXY = 8.0f;      // 弹出菜单四周内边距
 inline constexpr float  kMenuItemGapY = 10.0f;   // 弹出菜单项之间/项高（Selectable 不吃 FramePadding）
 // 图标字形与汉字的基线差异（实测，ADR-045）：正值 = 向下微调，使图标与文字对齐。
 inline constexpr float  kIconGlyphOffsetY = 4.0f;
+
+// ---- 视图动效（Phase 6 收尾，ADR-047）----
+// 统一用**一阶滞后**（帧率无关的指数趋近）而不是补间：无过冲、必然收敛、不需要维护速度状态，
+// 且连续输入时自然叠加（补间则每次输入都要重排时间轴）。速率单位 1/s，时间常数 = 1/rate：
+// 22/s ≈ 45ms，95% 收敛约 135ms —— 这个量级"跟得上手"又把台阶抹平了。
+inline constexpr float  kScrollSmoothRate = 22.0f;  // 滚轮 / 方向键 / 整屏滚动
+inline constexpr float  kZoomSmoothRate   = 26.0f;  // 缩放插值
+inline constexpr float  kTopBarAnimRate   = 20.0f;  // 顶栏自动隐藏的滑入/滑出
+inline constexpr float  kMotionEpsPx      = 0.5f;   // 动画收敛阈值（像素/倍率），到阈值即吸附到目标
+
+// 一阶趋近（帧率无关的指数趋近）：无过冲、必然收敛，不需要维护速度状态。
+inline float approach(float cur, float target, float rate, float dt) {
+    return target + (cur - target) * std::exp(-rate * dt);
+}
 
 // ---- 图标字形（Segoe MDL2 Assets，PUA 码位；缺失时按钮退化为文字标签）----
 // **只列当前实际用到的字形**：多列一个就多一份图集体积与一处启动校验点。
@@ -276,6 +295,29 @@ inline bool g_canvas_focused = false;
 inline int g_dbg_r_down = 0;
 inline int g_dbg_r_up = 0;
 
+// ---- 视图动效状态（ADR-047）----
+// 三段外壳的显式布局见 ui.cpp 的 draw_shell（ADR-049）。
+// 动效只发生在 **app 层写入画布之前**：画布仍是"状态唯一真源 + 纯函数布局"，
+// 不引入任何插值/时间概念，`canvas_test` 的断言不受影响。
+inline float  g_scroll_pending = 0.0f;   // 待消耗的滚动量（内容像素），每帧按一阶滞后消耗
+// 显式跳页（跳页框/目录/书签/缩略图/翻页）在动画结束后要**重新钉一次游标**：
+// 滑行途中 scroll_by 会把阅读游标同步到"视口顶部所在行"，而末尾几行够不到视口顶部时
+// 这个反推值会落到末行，与"显式跳页应显示目标行"的语义冲突（ADR-023）。
+inline int    g_jump_repin_page = -1;    // ≥0 = 动画结束后重新钉住的目标页
+inline float  g_jump_repin_align = 0.0f;
+inline bool   g_zoom_anim = false;       // 缩放插值进行中
+inline float  g_zoom_to = 1.0f;          // 缩放目标倍率（渲染请求/防抖都看它，而不是显示值）
+inline float  g_zoom_anchor_x = 0.0f;    // 缩放不动点（画布内屏幕坐标）
+inline float  g_zoom_anchor_y = 0.0f;
+inline bool   g_zoom_end_fit = false;    // 动画结束后回到 fit-width（"适合宽度"的收尾）
+inline float  g_top_bar_h = -1.0f;       // 顶栏当前动画高度（px，0~px(kTopBarH)）；<0 = 未初始化
+
+// ---- 自绘滚动条（画布右侧，可拖拽，ADR-050）----
+// 三者都由 ui.cpp 的滚动条交互维护：拖拽期间必须抑制画布平移（否则"拖滚动条"变成"拖页面"）。
+inline bool   g_scroll_drag = false;      // 正在拖拽滑块
+inline float  g_scroll_drag_off = 0.0f;   // 抓取点相对滑块顶端的偏移
+inline bool   g_scroll_hover = false;     // 悬停在轨道上（用于高亮与加宽滑块）
+
 // 跳页弹窗
 inline bool g_open_jump = false;
 inline int  g_jump_page = 1;
@@ -312,6 +354,16 @@ void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered)
 void update_want_scale();           // 缩放防抖
 void emit_wants();                  // 可见页 + 方向感知预加载 → 渲染请求
 
+// ---- 视图动效（ADR-047）----
+// 所有"滚动/缩放意图"统一走这几个入口，由 app 层做插值；画布只接收插值后的结果。
+void request_scroll(float delta_px);                       // 滚轮/方向键/整屏：纯增量
+void request_jump_scroll(int page, float align);           // 显式跳页/翻页：算目标 → 回退 → 滑行
+void zoom_to_animated(float z, float anchor_sx, float anchor_sy);
+void zoom_by_animated(float factor, float anchor_sx, float anchor_sy);
+void fit_to_width_animated();
+void step_view_motion(float dt);                           // 每帧消耗待定量 + 推进缩放插值
+[[nodiscard]] float view_zoom_target();                    // 目标倍率（动效中 = 动画目标）
+
 // ============================================================================
 // 绘制层（ui.cpp）
 // ============================================================================
@@ -336,11 +388,13 @@ inline double g_last_scroll_time = -1.0;
 inline bool    g_request_open_dialog = false;
 inline wchar_t g_open_path_buf[32768] = {};
 
+// 三段外壳的绘制：**高度/位置由 draw_shell 显式给出**，不依赖 ImGui 的"相邻项自动间距"
+// （那正是状态栏被挤出窗口底部的根因，见 draw_shell 注释）。
 void draw_shell();
-void draw_top_bar();
+void draw_top_bar(float bar_h);
 void draw_status_bar();
-void draw_canvas_area();
-void draw_sidebar();
+void draw_canvas_area(float height);
+void draw_sidebar(float height);
 void draw_canvas_context_menu();
 void draw_debug_overlay();
 void draw_jump_popup();
@@ -349,6 +403,7 @@ void draw_settings_window();
 void draw_help_window();
 void update_toolbar_visibility();
 bool top_bar_should_show();
+float update_top_bar_height(float dt);   // 顶栏高度的滑入/滑出插值
 
 // ============================================================================
 // 入口层（main.cpp）

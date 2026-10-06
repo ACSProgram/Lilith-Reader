@@ -25,6 +25,14 @@ constexpr const char* kFormatsLine =
 constexpr float kSidebarWidthPx = 300.0f;   // 基准像素，用前过 px()
 constexpr int   kThumbTargetPx = 150;       // 缩略图最长边目标像素
 
+// ---- 自绘滚动条（画布右侧；可拖拽，ADR-050）----
+// 命中区刻意比可见滑块宽：滑块视觉上要细（4~7px），但 4px 宽的目标很难按中。
+constexpr float kScrollBarHitW   = 12.0f;   // 命中区宽度（基准像素）
+constexpr float kScrollBarVisW   = 5.0f;    // 可见滑块宽度
+constexpr float kScrollBarVisWHover = 7.0f; // 悬停/拖拽时加宽（给"可拖"以即时反馈）
+constexpr float kScrollBarInsetY = 10.0f;   // 轨道上下内缩
+constexpr float kScrollBarMinThumb = 30.0f; // 滑块最小长度
+
 constexpr double kToolbarHideDelaySec = 1.6;   // 鼠标离开顶部区域多久后收起顶栏
 constexpr float  kToolbarRevealBandPx = 4.0f;  // 距窗口顶端多少像素内即判定"要显示"
 
@@ -108,8 +116,106 @@ void draw_rejected() {
 
 // ---------------- 画布绘制 ----------------
 
-// 自绘滚动指示条（画布子窗口是 NoScrollbar，滚动反馈自己画）；定义在文件后半。
-void draw_scroll_indicator(ImDrawList* dl, const ImVec2& origin, const ImVec2& size);
+// ---- 自绘滚动条（画布子窗口是 NoScrollbar，滚动反馈自己画）----
+//
+// 几何只在 scroll_bar_geom() 里算一次，**绘制与命中测试共用同一份** —— 早期版本只画一条
+// 装饰性指示条、没有命中区，于是"拖右侧滚动条"实际落到了画布的左键拖拽平移上（实测反馈）。
+struct ScrollBarGeom {
+    bool   active = false;
+    ImVec2 track_min{}, track_max{};   // 命中区（比可见滑块宽）
+    ImVec2 thumb_min{}, thumb_max{};   // 可见滑块
+    float  travel = 0.0f;              // 滑块可移动距离 = 轨道长 − 滑块长
+};
+
+ScrollBarGeom scroll_bar_geom(const ImVec2& origin, const ImVec2& size) {
+    ScrollBarGeom g;
+    const float max_sy = g_canvas.max_scroll_y();
+    if (max_sy <= 1.0f) return g;      // 内容不高于视口：没有滚动条
+    const float top = origin.y + px(kScrollBarInsetY);
+    const float bot = origin.y + size.y - px(kScrollBarInsetY);
+    const float track_len = std::max(1.0f, bot - top);
+    const float content = std::max(1.0f, g_canvas.content_height_px());
+    const float frac = std::clamp(size.y / content, 0.06f, 1.0f);
+    const float thumb_len = std::min(track_len, std::max(px(kScrollBarMinThumb), track_len * frac));
+    const float t = std::clamp(g_canvas.state().scroll_y / max_sy, 0.0f, 1.0f);
+    const float thumb_top = top + t * (track_len - thumb_len);
+    const float vis_w = (g_scroll_hover || g_scroll_drag) ? px(kScrollBarVisWHover)
+                                                          : px(kScrollBarVisW);
+    const float x_right = origin.x + size.x - px(4.0f);
+    g.active = true;
+    g.track_min = ImVec2(x_right - px(kScrollBarHitW), top);
+    g.track_max = ImVec2(x_right, bot);
+    g.thumb_min = ImVec2(x_right - vis_w, thumb_top);
+    g.thumb_max = ImVec2(x_right, thumb_top + thumb_len);
+    g.travel = std::max(1.0f, track_len - thumb_len);
+    return g;
+}
+
+// 滚动条交互。返回 true = 本次左键输入已被滚动条消费（调用方跳过画布的命中测试）。
+bool update_scroll_bar(const ScrollBarGeom& g) {
+    if (!g.active) {
+        g_scroll_drag = false;
+        g_scroll_hover = false;
+        return false;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    const ImVec2 mp = io.MousePos;
+    const float slop = px(4.0f);
+
+    if (g_scroll_drag) {
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            g_scroll_drag = false;
+            return true;
+        }
+        // 拖拽中即使鼠标移出轨道也继续跟随（与系统滚动条一致）
+        const float top = std::clamp(mp.y - g_scroll_drag_off, g.track_min.y,
+                                     g.track_min.y + g.travel);
+        const float t = (top - g.track_min.y) / g.travel;
+        g_canvas.scroll_by(0.0f, t * g_canvas.max_scroll_y() - g_canvas.state().scroll_y);
+        g_scroll_pending = 0.0f;   // 直接定位：掐掉平滑尾巴，避免"松手后还在飘"
+        g_jump_repin_page = -1;
+        g_scroll_hover = true;
+        return true;
+    }
+
+    const bool over = mp.x >= g.track_min.x - slop && mp.x <= g.track_max.x + slop &&
+                      mp.y >= g.track_min.y - slop && mp.y <= g.track_max.y + slop;
+    g_scroll_hover = over;
+    if (!over || !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) return false;
+
+    const float thumb_len = g.thumb_max.y - g.thumb_min.y;
+    if (mp.y >= g.thumb_min.y && mp.y <= g.thumb_max.y) {
+        g_scroll_drag_off = mp.y - g.thumb_min.y;      // 按在滑块上：保持抓取点
+    } else {
+        g_scroll_drag_off = thumb_len * 0.5f;          // 按在空白处：滑块中心跳到该处
+        const float top = std::clamp(mp.y - g_scroll_drag_off, g.track_min.y,
+                                     g.track_min.y + g.travel);
+        const float t = (top - g.track_min.y) / g.travel;
+        g_canvas.scroll_by(0.0f, t * g_canvas.max_scroll_y() - g_canvas.state().scroll_y);
+    }
+    g_scroll_pending = 0.0f;
+    g_jump_repin_page = -1;
+    g_scroll_drag = true;
+    return true;
+}
+
+void draw_scroll_bar(ImDrawList* dl, const ScrollBarGeom& g) {
+    if (!g.active) return;
+    // 浮现/渐隐：滚动中、悬停、拖拽时全显，静止一段时间后渐隐（Motion 关闭则直切）
+    const bool hot = g_scroll_hover || g_scroll_drag ||
+                     (g_last_scroll_time > 0.0 &&
+                      (ImGui::GetTime() - g_last_scroll_time) < kScrollIndHoldSec);
+    const float target = hot ? 1.0f : 0.0f;
+    g_scroll_ind_alpha = g_prefs.motion ? approach(g_scroll_ind_alpha, target, 12.0f,
+                                                   ImGui::GetIO().DeltaTime)
+                                        : target;
+    if (g_scroll_ind_alpha < 0.02f) return;
+    const float peak = (g_scroll_hover || g_scroll_drag) ? 235.0f : 170.0f;
+    const ImU32 col = (g_pal.accent & 0x00FFFFFFu) |
+                      (static_cast<ImU32>(g_scroll_ind_alpha * peak) << 24);
+    const float r = (g.thumb_max.x - g.thumb_min.x) * 0.5f;
+    dl->AddRectFilled(g.thumb_min, g.thumb_max, col, r);
+}
 
 void draw_page_placeholder(ImDrawList* dl, const ImVec2& pmin, const ImVec2& pmax,
                            const lr::PageSlot& s) {
@@ -126,9 +232,10 @@ void draw_page_placeholder(ImDrawList* dl, const ImVec2& pmin, const ImVec2& pma
     }
 }
 
-void draw_canvas_area() {
+// 画布区：高度由 draw_shell 显式给出（不依赖 ImGui 的相邻项间距，见 draw_shell 注释）
+void draw_canvas_area(float height) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::BeginChild("##canvas", ImVec2(0, -px(kStatusBarH)), false,
+    ImGui::BeginChild("##canvas", ImVec2(0, height), false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
                       ImGuiWindowFlags_NoNav);
     ImGui::PopStyleVar();
@@ -163,10 +270,14 @@ void draw_canvas_area() {
     if (ImGui::GetIO().MouseClicked[ImGuiMouseButton_Right]) ++g_dbg_r_down;
     if (ImGui::GetIO().MouseReleased[ImGuiMouseButton_Right]) ++g_dbg_r_up;
 
+    // 滚动条交互先于画布输入（ADR-050）：它一旦消费左键，画布就不再把这串输入当成平移/点击。
+    const ScrollBarGeom bar_hit = scroll_bar_geom(origin, size);
+    const bool bar_consumed = update_scroll_bar(bar_hit);
+
     // 失败占位点击重试（ADR-031）：在输入处理**之前**做命中测试，只针对
     // "Failed 且尚无纹理"的页（曾成功渲染过、因重渲染失败而保留旧图的页不显示占位，
     // 也无从点击）。单击不会触发拖拽平移（平移需要移动阈值），故两者不冲突。
-    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    if (!bar_consumed && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         const ImVec2 mp = ImGui::GetIO().MousePos;
         const int cnt = g_canvas.page_count();
         const int vf = g_canvas.visible_first();
@@ -187,6 +298,9 @@ void draw_canvas_area() {
     if (!g_open_jump && !g_open_password && !g_show_settings && !g_show_help)
         handle_canvas_input(origin, size, hovered);
 
+    // 视图动效（ADR-047）：在输入之后、取页与布局之前推进 —— 本帧绘制的就是插值后的状态。
+    step_view_motion(dt);
+
     // 滚动方向（供方向感知预加载）：以内容坐标 scroll_y 的变化判定。
     // 阈值 0.5px 抑制浮点抖动导致的假翻转。
     {
@@ -194,6 +308,11 @@ void draw_canvas_area() {
         if (sy > g_prev_scroll_y + 0.5f) g_scroll_dir = +1;
         else if (sy < g_prev_scroll_y - 0.5f) g_scroll_dir = -1;
         g_prev_scroll_y = sy;
+        // 滚动条淡出计时：只在真正滚动时刷新"最近滚动时刻"
+        if (std::fabs(sy - g_scroll_ind_last_y) > 0.5f) {
+            g_scroll_ind_last_y = sy;
+            g_last_scroll_time = ImGui::GetTime();
+        }
     }
 
     update_want_scale();
@@ -240,7 +359,8 @@ void draw_canvas_area() {
     }
     dl->PopClipRect();
 
-    draw_scroll_indicator(dl, origin, size);
+    // 滚动条用**交互后**的几何重算一次：拖动刚改过 scroll_y，滑块位置必须同帧跟上
+    draw_scroll_bar(dl, scroll_bar_geom(origin, size));
     draw_canvas_context_menu();  // 命中区是画布，命令集中在上下文菜单里
 
     ImGui::EndChild();
@@ -364,6 +484,11 @@ void draw_debug_overlay() {
                         cs.resident_pages, cs.evictions);
             ImGui::TextDisabled("preload dir %d  (+1 下 / -1 上 / 0 两侧)",
                                 g_scroll_dir);
+            // 动效读数（ADR-047）：验证"动效是否真的在跑"时看这里，不必靠肉眼猜
+            ImGui::TextDisabled("motion: pending %.1f  zoom->%.3f %s  topbar %.0f/%.0f  bar drag %d",
+                                (double)g_scroll_pending, (double)view_zoom_target(),
+                                g_zoom_anim ? "anim" : "idle", (double)g_top_bar_h,
+                                (double)px(kTopBarH), g_scroll_drag ? 1 : 0);
             // 快捷键**不**看这两个量（ADR-026），列出仅为排查"某个键没反应"时定位用
             ImGui::TextDisabled("canvas hover %d  focus %d  text-input %d  r-click down/up %d/%d",
                                 g_canvas_hovered ? 1 : 0, g_canvas_focused ? 1 : 0,
@@ -394,7 +519,7 @@ void draw_jump_popup() {
             int p = g_jump_page - 1;
             if (p < 0) p = 0;
             if (p >= g_canvas.page_count()) p = g_canvas.page_count() - 1;
-            g_canvas.scroll_to_page(p, 0.0f);
+            request_jump_scroll(p, 0.0f);
             g_open_jump = false;
             ImGui::CloseCurrentPopup();
         } else if (cancel) {
@@ -418,7 +543,7 @@ void draw_outline_tab() {
         if (it.depth > 0) ImGui::Indent(px(14.0f) * static_cast<float>(it.depth));
         const bool selected = (it.page >= 0 && it.page == cur);
         if (ImGui::Selectable(label, selected) && it.page >= 0)
-            g_canvas.scroll_to_page(it.page, 0.0f);
+            request_jump_scroll(it.page, 0.0f);
         if (it.depth > 0) ImGui::Unindent(px(14.0f) * static_cast<float>(it.depth));
         ImGui::PopID();
     }
@@ -451,7 +576,7 @@ void draw_bookmarks_tab() {
         char label[64];
         std::snprintf(label, sizeof label, "第 %d 页", b.page + 1);
         if (ImGui::Selectable(label, b.page == cur, 0, ImVec2(sel_w, 0)))
-            g_canvas.scroll_to_page(b.page, 0.0f);
+            request_jump_scroll(b.page, 0.0f);
         ImGui::SameLine();
         if (ImGui::SmallButton("×")) del = i;
         ImGui::PopID();
@@ -479,7 +604,7 @@ void draw_thumbnails_tab() {
         ImGui::PushID(i);
         char label[32];
         std::snprintf(label, sizeof label, "第 %d 页", i + 1);
-        if (ImGui::Selectable(label, i == cur)) g_canvas.scroll_to_page(i, 0.0f);
+        if (ImGui::Selectable(label, i == cur)) request_jump_scroll(i, 0.0f);
         if (s.texture != nullptr && s.pixel_w > 0 && s.pixel_h > 0) {
             const float w = px(130.0f);
             const float h = w * static_cast<float>(s.pixel_h) / static_cast<float>(s.pixel_w);
@@ -494,9 +619,10 @@ void draw_thumbnails_tab() {
     ImGui::EndChild();
 }
 
-void draw_sidebar() {
+// 侧栏：高度与画布同高（由 draw_shell 统一给出，避免"三段 + 间距"溢出客户区）
+void draw_sidebar(float height) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(8), px(8)));
-    ImGui::BeginChild("##sidebar", ImVec2(px(kSidebarWidthPx), -px(kStatusBarH)), false,
+    ImGui::BeginChild("##sidebar", ImVec2(px(kSidebarWidthPx), height), false,
                       ImGuiWindowFlags_NoNav);
     ImGui::PopStyleVar();
     if (ImGui::BeginTabBar("##sidebar_tabs")) {
@@ -616,11 +742,12 @@ void push_popup_style() {
 inline void pop_popup_style() { ImGui::PopStyleVar(2); }
 
 int  zoom_percent() { return static_cast<int>(std::lround(g_canvas.effective_zoom() * 100.0f)); }
+// 顶栏/菜单里的缩放按钮与档位：都走动效入口（ADR-047），锚点取视口中心
 void zoom_at_center(float factor) {
-    g_canvas.zoom_by(factor, g_canvas.viewport_w() * 0.5f, g_canvas.viewport_h() * 0.5f);
+    zoom_by_animated(factor, g_canvas.viewport_w() * 0.5f, g_canvas.viewport_h() * 0.5f);
 }
 void zoom_set(float z) {
-    g_canvas.set_zoom(z, g_canvas.viewport_w() * 0.5f, g_canvas.viewport_h() * 0.5f);
+    zoom_to_animated(z, g_canvas.viewport_w() * 0.5f, g_canvas.viewport_h() * 0.5f);
 }
 
 // 页面间距（设置项）变更后立即下发；会失效布局缓存，故只在真正变化时调用。
@@ -633,7 +760,7 @@ void apply_gap_pref() {
 
 void draw_zoom_menu_contents() {
     if (menu_item(kIcExpand, "适合宽度", "F", g_canvas.state().fit_width))
-        g_canvas.fit_to_width();
+        fit_to_width_animated();
     if (menu_item(kIcDoc, "实际大小", nullptr)) zoom_set(1.0f);
     ImGui::Separator();
     const int pcts[] = { 50, 75, 100, 125, 150, 200, 300 };
@@ -682,11 +809,11 @@ void draw_view_menu_contents() {
 
 void draw_nav_menu_contents() {
     const bool rd = (g_doc.kind == UiDoc::Kind::Reading);
-    if (menu_item(kIcHome, "首页", "Home", false, rd)) g_canvas.scroll_to_page(0, 0.0f);
+    if (menu_item(kIcHome, "首页", "Home", false, rd)) request_jump_scroll(0, 0.0f);
     if (menu_item(kIcPrev, "上一页 / 上一行", "←", false, rd)) scroll_by_rows(-1);
     if (menu_item(kIcNext, "下一页 / 下一行", "→", false, rd)) scroll_by_rows(+1);
     if (menu_item(kIcArrowDown, "末页", "End", false, rd))
-        g_canvas.scroll_to_page(g_canvas.page_count() - 1, 0.0f);
+        request_jump_scroll(g_canvas.page_count() - 1, 0.0f);
     ImGui::Separator();
     if (menu_item(kIcSearch, "跳转页码…", "G", false, rd)) open_jump_popup();
     if (menu_item(kIcStar, current_page_has_bookmark() ? "删除本页书签" : "添加本页书签", "B",
@@ -746,41 +873,6 @@ void draw_canvas_context_menu() {
     pop_popup_style();
 }
 
-// ---- 自绘滚动指示条（画布子窗口是 NoScrollbar，滚动反馈自己画） ----
-void draw_scroll_indicator(ImDrawList* dl, const ImVec2& origin, const ImVec2& size) {
-    const float max_sy = g_canvas.max_scroll_y();
-    float target = 0.0f;
-    if (max_sy > 1.0f) {
-        const float sy = g_canvas.state().scroll_y;
-        if (std::fabs(sy - g_scroll_ind_last_y) > 0.5f) {
-            g_scroll_ind_last_y = sy;
-            g_last_scroll_time = ImGui::GetTime();
-        }
-        if (g_last_scroll_time > 0.0 &&
-            (ImGui::GetTime() - g_last_scroll_time) < kScrollIndHoldSec)
-            target = 1.0f;
-    }
-    if (!g_prefs.motion) {
-        g_scroll_ind_alpha = target;
-    } else {
-        const float dt = ImGui::GetIO().DeltaTime;
-        g_scroll_ind_alpha += (target - g_scroll_ind_alpha) * std::min(1.0f, dt * 12.0f);
-    }
-    if (max_sy <= 1.0f || g_scroll_ind_alpha < 0.02f) return;
-
-    const float track_h = std::max(1.0f, size.y - px(20));
-    const float content = std::max(1.0f, g_canvas.content_height_px());
-    const float frac = std::clamp(size.y / content, 0.05f, 1.0f);
-    const float h = std::max(px(26.0f), track_h * frac);
-    const float t = std::clamp(g_canvas.state().scroll_y / max_sy, 0.0f, 1.0f);
-    const float y = origin.y + px(10.0f) + t * (track_h - h);
-    const float w = px(4.0f);
-    const float x = origin.x + size.x - px(9.0f) - w;
-    const int a = static_cast<int>(g_scroll_ind_alpha * 170.0f);
-    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
-                      (g_pal.accent & 0x00FFFFFFu) | (static_cast<ImU32>(a) << 24), w * 0.5f);
-}
-
 // ---- 顶栏自动隐藏 ----
 // 阅读态下，鼠标离开窗口顶部一段时间就收起顶栏（沉浸阅读）；移到顶部即重现。
 // 引导/失败/密码等状态、以及打开菜单/设置/帮助时始终显示（否则用户找不到入口）。
@@ -817,9 +909,26 @@ bool top_bar_should_show() {
     return g_toolbar_visible;
 }
 
+// 顶栏高度的滑入/滑出插值：自动隐藏不再"整块消失"，而是把顶栏推上去。
+// 返回当前高度（0 ~ px(kTopBarH)）。调用方在高度为 0 时**不要**创建子窗口 ——
+// ImGui 的 BeginChild 把 size.y == 0 当作"自动高度"，会吃掉整个客户区。
+float update_top_bar_height(float dt) {
+    const float full = px(kTopBarH);
+    if (g_top_bar_h < 0.0f) g_top_bar_h = full;   // 首帧：未初始化即按展开态
+    const float want = top_bar_should_show() ? full : 0.0f;
+    if (!g_prefs.motion) {
+        g_top_bar_h = want;
+        return want;
+    }
+    g_top_bar_h = approach(g_top_bar_h, want, kTopBarAnimRate, dt);
+    if (std::fabs(g_top_bar_h - want) < kMotionEpsPx) g_top_bar_h = want;
+    return g_top_bar_h;
+}
+
 // ---- 顶栏 ----
-void draw_top_bar() {
-    const float bar_h = px(kTopBarH);
+// bar_h 由 draw_shell 传入（可小于整条高度：自动隐藏的滑出动效）。
+void draw_top_bar(float bar_h) {
+    const float full_h = px(kTopBarH);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(kChromePadX), 0));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(px(kChromeGapX), 0));
     ImGui::BeginChild("##topbar", ImVec2(0, bar_h), false,
@@ -836,7 +945,10 @@ void draw_top_bar() {
 
     const bool rd = (g_doc.kind == UiDoc::Kind::Reading);
     const float h = ImGui::GetFrameHeight();
-    const float y = (bar_h - h) * 0.5f;
+    // 内容始终按**整条高度**排布，再整体上移被收起的那部分：于是收起过程表现为"滑出"，
+    // 而不是原地被裁掉（子窗口会裁掉超出部分，负偏移正好落到窗口上缘之外）。
+    const float dy = -(full_h - bar_h);
+    const float y = (full_h - h) * 0.5f + dy;
     const float gap = ImGui::GetStyle().ItemSpacing.x;
     ImGui::SetCursorPos(ImVec2(px(kChromePadX), y));
 
@@ -866,7 +978,7 @@ void draw_top_bar() {
     if (right_start - tw - px(24.0f) > left_end) {   // 空间不足就省略标题（窄窗口/长文件名）
         ImGui::SameLine();
         ImGui::SetCursorPos(ImVec2((ws.x - tw) * 0.5f,
-                                   (bar_h - ImGui::GetTextLineHeight()) * 0.5f));
+                                   (full_h - ImGui::GetTextLineHeight()) * 0.5f + dy));
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim), "%s", title);
     }
 
@@ -1177,11 +1289,26 @@ void draw_shell() {
                  ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar(3);
 
-    // 顶栏（阅读态可自动隐藏；其余状态恒显示——菜单/设置/帮助是唯一入口）
-    if (top_bar_should_show()) draw_top_bar();
+    // ---- 三段外壳的显式布局（顶栏 / 画布[+侧栏] / 状态栏）----
+    //
+    // 为什么不让 ImGui 顺着排：三者是**同级子窗口**，`EndChild()` 会为每个子窗口记一个 item，
+    // 于是相邻子窗口之间被插入一份 `ItemSpacing.y`。三段高度之和因此比客户区多出一个间距，
+    // 状态栏被挤出窗口底部、文字下缘被裁 —— 实测截图里"第 95 / 361 页"的墨迹正好落在
+    // 窗口最后一行（这才是"下方的字太靠近边缘"的真实原因，不是配色或内边距问题）。
+    // 改为显式定位 + 显式高度后：三段**恰好铺满客户区**，中间不留缝，几何一眼可读（ADR-049）。
+    const float dt = ImGui::GetIO().DeltaTime;
+    const float client_h = ImGui::GetContentRegionAvail().y;
+    const float status_h = px(kStatusBarH);
+    const float top_h = update_top_bar_height(dt);
+    if (top_h >= 1.0f) {   // 高度为 0 时不创建子窗口：BeginChild 把 0 当作"自动高度"
+        ImGui::SetCursorPosY(0.0f);
+        draw_top_bar(top_h);
+    }
+    const float body_h = std::max(px(60.0f), client_h - top_h - status_h);
 
     // 非阅读态把内容区铺成画布同色的底，与阅读态的视觉语言一致（否则是一大片窗口底色）。
     if (g_doc.kind != UiDoc::Kind::Reading) {
+        ImGui::SetCursorPosY(top_h);
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
         const ImVec2 avail = ImGui::GetContentRegionAvail();
         ImGui::GetWindowDrawList()->AddRectFilled(
@@ -1190,26 +1317,33 @@ void draw_shell() {
 
     switch (g_doc.kind) {
     case UiDoc::Kind::None:
+        ImGui::SetCursorPosY(top_h);
         draw_drop_guide();
         break;
     case UiDoc::Kind::Opening:
+        ImGui::SetCursorPosY(top_h);
         draw_opening();
         break;
     case UiDoc::Kind::Reading:
+        ImGui::SetCursorPosY(top_h);
         if (g_show_sidebar) {
-            draw_sidebar();
+            draw_sidebar(body_h);
             ImGui::SameLine(0.0f, 0.0f);
         }
-        draw_canvas_area();
+        draw_canvas_area(body_h);
+        ImGui::SetCursorPosY(client_h - status_h);
         draw_status_bar();
         break;
     case UiDoc::Kind::Failed:
+        ImGui::SetCursorPosY(top_h);
         draw_failed();
         break;
     case UiDoc::Kind::NeedsPassword:
+        ImGui::SetCursorPosY(top_h);
         draw_failed();  // 背景铺失败页，密码框浮在其上
         break;
     case UiDoc::Kind::Rejected:
+        ImGui::SetCursorPosY(top_h);
         draw_rejected();
         break;
     }

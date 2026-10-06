@@ -149,6 +149,15 @@ void reset_doc_state() {
     g_raw_sizes.clear();
     g_page_fade.clear();
     g_restore_pending = false;
+    // 动效状态：关闭文档后必须归零，否则下一个文档会带着上一个的待定量/滑行起点开场
+    g_scroll_pending = 0.0f;
+    g_jump_repin_page = -1;
+    g_zoom_anim = false;
+    g_zoom_end_fit = false;
+    g_top_bar_h = -1.0f;
+    g_scroll_drag = false;
+    g_scroll_drag_off = 0.0f;
+    g_scroll_hover = false;
     g_rotation = 0;
     g_color_mode = 0;
     g_show_sidebar = false;
@@ -206,6 +215,14 @@ void enter_reading() {
     g_page_fade.assign(static_cast<std::size_t>(std::max(0, g_doc.info.page_count)), PageFade{});
     g_toolbar_visible = true;         // 新文档从显示顶栏开始
     g_toolbar_idle_since = -1.0;
+    // 动效状态复位：开文档不播动画（顶栏直接展开，首帧就是稳定态）
+    g_scroll_pending = 0.0f;
+    g_jump_repin_page = -1;
+    g_zoom_anim = false;
+    g_zoom_end_fit = false;
+    g_top_bar_h = px(kTopBarH);
+    g_scroll_drag = false;
+    g_scroll_hover = false;
 
     apply_view_transform();            // 旋转/配色下发（首次会触发整篇重渲）
     g_outline = g_renderer->outline(); // 目录快照（一次性）
@@ -315,12 +332,137 @@ void open_jump_popup() {
     g_jump_page = g_canvas.current_page() + 1;
 }
 
+// ---------------- 视图动效（ADR-047） ----------------
+//
+// 设计：**动效只发生在 app 层写入画布之前**。画布保持"状态唯一真源 + 纯函数布局"，
+// 不引入任何时间/插值概念，`canvas_test` 的断言与"滚动不重算布局"的 O(1) 性质都不受影响。
+//
+// 三条路径（统一由 [ui] Motion 开关，关掉即等价于动效前的直切行为）：
+//   · 滚轮 / 方向键 / 整屏滚动 → request_scroll()：增量进 g_scroll_pending，逐帧一阶滞后消耗；
+//   · 显式跳页（跳页框/目录/书签/缩略图/翻行）→ request_jump_scroll()：让画布先算出目标位置
+//     （含对开/网格/钳制的唯一真源），再回退到起点交给动效滑行；
+//   · 缩放 → zoom_*_animated()：显示倍率指数趋近目标倍率，锚点固定不动。
+
+// 滑行到目标滚动位置：起点/终点由调用方用画布算好（本文件内部使用）。
+// 末尾要重新钉游标的原因见 app_internal.h 的 g_jump_repin_page 注释。
+namespace {
+void start_scroll_glide(float from, float to, int repin_page, float repin_align) {
+    if (!g_prefs.motion || std::fabs(to - from) < 1.0f) {
+        g_scroll_pending = 0.0f;
+        g_jump_repin_page = -1;
+        return;
+    }
+    g_canvas.scroll_by(0.0f, from - to);  // 回退到起点（scroll_by 会把游标同步回视口顶部）
+    g_scroll_pending = to - from;
+    g_jump_repin_page = repin_page;
+    g_jump_repin_align = repin_align;
+}
+}  // namespace
+
+void request_scroll(float delta_px) {
+    // 新的滚动意图取消未完成的跳页滑行：否则滑行会把用户刚滚到的位置又拽回目标页。
+    g_jump_repin_page = -1;
+    g_scroll_pending += delta_px;
+}
+
+void request_jump_scroll(int page, float align) {
+    const float from = g_canvas.state().scroll_y;
+    g_canvas.scroll_to_page(page, align);
+    start_scroll_glide(from, g_canvas.state().scroll_y, page, align);
+}
+
+void zoom_to_animated(float z, float anchor_sx, float anchor_sy) {
+    z = std::clamp(z, lr::kMinZoom, lr::kMaxZoom);
+    g_zoom_anchor_x = anchor_sx;
+    g_zoom_anchor_y = anchor_sy;
+    g_zoom_end_fit = false;
+    if (!g_prefs.motion) {
+        g_zoom_anim = false;
+        g_canvas.set_zoom(z, anchor_sx, anchor_sy);
+        return;
+    }
+    if (std::fabs(z - view_zoom_target()) < 1e-4f) return;  // 目标未变：不重启动画
+    g_zoom_anim = true;
+    g_zoom_to = z;
+}
+
+void zoom_by_animated(float factor, float anchor_sx, float anchor_sy) {
+    if (!(factor > 0.0f)) return;
+    // 基于**目标倍率**累乘：动画进行中若基于显示值，连续滚轮的倍率会被滞后吞掉
+    zoom_to_animated(view_zoom_target() * factor, anchor_sx, anchor_sy);
+}
+
+// 适合宽度：让画布先算派生倍率（fit 公式的唯一真源），再回退到当前倍率交给动效，
+// 动画结束时重新置 fit（幂等；期间显示的是插值倍率）。
+void fit_to_width_animated() {
+    if (!g_prefs.motion) {
+        g_zoom_anim = false;
+        g_zoom_end_fit = false;
+        g_canvas.fit_to_width();
+        return;
+    }
+    const lr::CanvasState st = g_canvas.state();
+    const float from = g_canvas.effective_zoom();
+    g_canvas.fit_to_width();
+    const float to = g_canvas.effective_zoom();
+    if (std::fabs(to - from) < 1e-4f) return;  // 已在 fit 状态：无需动画
+    g_canvas.set_state(st);                    // 回退（含 fit_width 标志）
+    g_zoom_anim = true;
+    g_zoom_to = to;
+    g_zoom_anchor_x = g_canvas.viewport_w() * 0.5f;
+    g_zoom_anchor_y = g_canvas.viewport_h() * 0.5f;
+    g_zoom_end_fit = true;
+}
+
+float view_zoom_target() {
+    return g_zoom_anim ? g_zoom_to : g_canvas.effective_zoom();
+}
+
+// 每帧推进（在画布输入处理之后、渲染请求之前调用）
+void step_view_motion(float dt) {
+    // 1) 待定滚动：一阶滞后消耗
+    if (g_scroll_pending != 0.0f) {
+        if (!g_prefs.motion) {
+            g_canvas.scroll_by(0.0f, g_scroll_pending);
+            g_scroll_pending = 0.0f;
+        } else {
+            const float step = g_scroll_pending * (1.0f - std::exp(-kScrollSmoothRate * dt));
+            g_canvas.scroll_by(0.0f, step);
+            g_scroll_pending -= step;
+            if (std::fabs(g_scroll_pending) < kMotionEpsPx) g_scroll_pending = 0.0f;
+        }
+        if (g_scroll_pending == 0.0f && g_jump_repin_page >= 0) {
+            g_canvas.scroll_to_page(g_jump_repin_page, g_jump_repin_align);
+            g_jump_repin_page = -1;
+        }
+    }
+
+    // 2) 缩放插值：锚点固定，显示倍率趋近目标倍率（收敛后吸附到目标，避免残留亚像素差）
+    if (g_zoom_anim) {
+        const float target = g_zoom_to;
+        const bool done = !g_prefs.motion ||
+                          std::fabs(g_canvas.effective_zoom() - target) <= 1e-3f * target;
+        g_canvas.set_zoom(done ? target
+                               : approach(g_canvas.effective_zoom(), target, kZoomSmoothRate, dt),
+                          g_zoom_anchor_x, g_zoom_anchor_y);
+        if (done) {
+            g_zoom_anim = false;
+            if (g_zoom_end_fit) { g_zoom_end_fit = false; g_canvas.fit_to_width(); }
+        }
+    }
+}
+
 // ---------------- 画布输入 ----------------
 
 // 翻行/翻页的几何计算全在画布层（纯函数、可单测，见 canvas_test 的 scroll_rows 用例）。
 // UI 层只做转发：不再用 visible_first() 自行推算目标行 —— 那正是"视口高于一行时末页反复
 // 卡住"的根因（已由阅读游标修掉，见 ADR-023 与 canvas.ixx）。
-void scroll_by_rows(int dir) { g_canvas.scroll_rows(dir); }
+// 动效（ADR-047）：翻行同样是一次"显式跳页"，故先记下起点、让画布跳到目标，再回退滑行。
+void scroll_by_rows(int dir) {
+    const float from = g_canvas.state().scroll_y;
+    g_canvas.scroll_rows(dir);
+    start_scroll_glide(from, g_canvas.state().scroll_y, g_canvas.current_page(), 0.0f);
+}
 
 namespace {
 
@@ -356,45 +498,50 @@ void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered)
     const float cx = size.x * 0.5f;
     const float cy = size.y * 0.5f;
 
-    // 滚轮：Ctrl 缩放（以鼠标为不动点），否则滚动
+    // 滚轮：Ctrl 缩放（以鼠标为不动点），否则滚动。
+    // 两者都进动效层（ADR-047）：滚动进待定量、缩放进插值；关闭动效时即等价于直接改画布。
     if (hovered && io.MouseWheel != 0.0f) {
         if (io.KeyCtrl) {
-            g_canvas.zoom_by(std::pow(kZoomStep, io.MouseWheel),
+            zoom_by_animated(std::pow(kZoomStep, io.MouseWheel),
                              io.MousePos.x - origin.x, io.MousePos.y - origin.y);
         } else {
-            g_canvas.scroll_by(0.0f, -io.MouseWheel * px(kScrollStepPx));
+            request_scroll(-io.MouseWheel * px(kScrollStepPx));
         }
     }
 
-    // 左键拖拽平移（位移直接取鼠标物理像素增量，不做缩放换算）
-    if (hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
+    // 左键拖拽平移（位移直接取鼠标物理像素增量，不做缩放换算）。
+    // **刻意不做平滑**：直接操纵必须 1:1 跟手；同时掐掉滚轮残留的平滑尾巴。
+    // 在滚动条上按下/拖动时不进入平移 —— 否则"拖滚动条"变成"拖页面"（实测反馈）。
+    if (hovered && !g_scroll_drag && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
+        g_scroll_pending = 0.0f;
+        g_jump_repin_page = -1;
         g_canvas.scroll_by(-io.MouseDelta.x, -io.MouseDelta.y);
     }
 
     if (io.WantTextInput) return;  // 有文本输入在跑：键盘归它
 
     const float vh = size.y;
-    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true))  g_canvas.scroll_by(0.0f, px(kKeyScrollPx));
-    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true))    g_canvas.scroll_by(0.0f, -px(kKeyScrollPx));
-    if (ImGui::IsKeyPressed(ImGuiKey_PageDown, true))   g_canvas.scroll_by(0.0f, vh * 0.9f);
-    if (ImGui::IsKeyPressed(ImGuiKey_PageUp, true))     g_canvas.scroll_by(0.0f, -vh * 0.9f);
-    if (ImGui::IsKeyPressed(ImGuiKey_Home, false))      g_canvas.scroll_to_page(0, 0.0f);
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true))  request_scroll(px(kKeyScrollPx));
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true))    request_scroll(-px(kKeyScrollPx));
+    if (ImGui::IsKeyPressed(ImGuiKey_PageDown, true))   request_scroll(vh * 0.9f);
+    if (ImGui::IsKeyPressed(ImGuiKey_PageUp, true))     request_scroll(-vh * 0.9f);
+    if (ImGui::IsKeyPressed(ImGuiKey_Home, false))      request_jump_scroll(0, 0.0f);
     if (ImGui::IsKeyPressed(ImGuiKey_End, false))
-        g_canvas.scroll_to_page(g_canvas.page_count() - 1, 0.0f);
+        request_jump_scroll(g_canvas.page_count() - 1, 0.0f);
     if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) scroll_by_rows(+1);
     if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true))  scroll_by_rows(-1);
 
     const int cols = pressed_column_key();
     if (cols != 0) g_canvas.set_columns(cols);
 
-    if (ImGui::IsKeyPressed(ImGuiKey_F, false)) g_canvas.fit_to_width();
-    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_0, false)) g_canvas.fit_to_width();
+    if (ImGui::IsKeyPressed(ImGuiKey_F, false)) fit_to_width_animated();
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_0, false)) fit_to_width_animated();
     if (ImGui::IsKeyPressed(ImGuiKey_Equal, true) ||
         ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, true))
-        g_canvas.zoom_by(kZoomStep, cx, cy);
+        zoom_by_animated(kZoomStep, cx, cy);
     if (ImGui::IsKeyPressed(ImGuiKey_Minus, true) ||
         ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, true))
-        g_canvas.zoom_by(1.0f / kZoomStep, cx, cy);
+        zoom_by_animated(1.0f / kZoomStep, cx, cy);
 
     if (ImGui::IsKeyPressed(ImGuiKey_G, false)) open_jump_popup();
     // F11/F1/Ctrl+O/Ctrl+, 等全局快捷键统一在 draw_shell 处理（任何状态下都可用）
@@ -413,8 +560,11 @@ void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered)
 
 // 缩放防抖：目标倍率稳定 150ms 后，才按新倍率请求高清重渲染；
 // 期间 g_want_scale 保持旧值，页面用现有纹理显示（双线性放大，不闪白）。
+// 注意目标是**目标倍率**而不是显示倍率（ADR-047）：缩放插值进行中显示值每帧都在变，
+// 若盯显示值，防抖会被动画不断重置，高清重渲要等动画结束后再等 150ms 才开始；
+// 盯目标倍率则"最后一次缩放意图后 150ms"即触发，正好在动画收敛时换入高清。
 void update_want_scale() {
-    const float target = g_canvas.effective_zoom();
+    const float target = view_zoom_target();
     const double now = ImGui::GetTime();
 
     if (g_want_scale < 0.0f) {  // 首帧（刚进入阅读态）：立即采用

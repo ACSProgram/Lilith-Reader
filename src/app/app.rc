@@ -1,9 +1,16 @@
 // app.rc — 应用资源（Phase 6）
-// 目前只有应用图标：作为 exe 图标、窗口图标与任务栏图标（Windows 默认取 exe 首个图标资源）。
+// 目前两类：应用图标（exe 图标、窗口图标与任务栏图标）与 UI 字体子集。
 // 版本资源、打开方式注册表脚本仍属 Phase 7 发布打包，见 docs/01-迁移计划.md。
 //
-// 刻意不 #include <windows.h>：资源编译器对它的展开支持有限，这里只需要一个整型 ID。
+// 刻意不 #include <windows.h>：资源编译器对它的展开支持有限，这里只需要整型 ID。
 
 #define IDI_APPICON 101
+#define IDR_UIFONT  102
 
 IDI_APPICON ICON "../../assets/icon.ico"
+
+// UI 字体子集（ADR-048）：以 RCDATA 原样嵌入，运行时 FindResource/LoadResource 取内存交给
+// ImGui（AddFontFromMemoryTTF）。不用 #embed 的原因：① 不要求 /std:c++latest；
+// ② 资源在进程生命周期内一直映射着，正合 ImGui 1.92+ "字体数据须全程有效"的要求。
+// 生成方式见 assets/make_font_subset.py；覆盖范围由 tests 里的 check_font_coverage.py 断言。
+IDR_UIFONT RCDATA "../../assets/ui_font_subset.otf"

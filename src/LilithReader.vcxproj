@@ -147,6 +147,11 @@
     <ClCompile Include="..\third_party\imgui\imgui_widgets.cpp" />
     <ClCompile Include="..\third_party\imgui\backends\imgui_impl_dx11.cpp" />
     <ClCompile Include="..\third_party\imgui\backends\imgui_impl_win32.cpp" />
+    <!-- Phase 6（ADR-048）：FreeType 字体装载器。内置 stb_truetype 只支持 TrueType，
+         而内嵌的 UI 字体子集是 CFF/OTF，且 FreeType 的小字号 CJK 栅格化质量更好。
+         freetype 库本身是 libmupdf 的传递依赖，已随 vcpkg 安装（VcpkgAutoLink 会自动链接），
+         头文件在 $(VcpkgInstalledDir)\$(VcpkgTriplet)\include\freetype 下。 -->
+    <ClCompile Include="..\third_party\imgui\misc\freetype\imgui_freetype.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

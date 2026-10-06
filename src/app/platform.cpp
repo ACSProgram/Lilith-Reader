@@ -16,6 +16,8 @@
 // DPI 查询辅助来自 Win32 后端头；该头声明了 Init/Shutdown/NewFrame 与 DPI 辅助函数。
 #include "backends/imgui_impl_dx11.h"
 #include "backends/imgui_impl_win32.h"
+// FreeType 装载器（ADR-048）：比内置 stb_truetype 栅格化质量好，且能读 CFF/OTF（子集即 OTF）。
+#include "misc/freetype/imgui_freetype.h"
 
 namespace lr::app {
 
@@ -70,6 +72,21 @@ bool verify_icon_glyphs() {
 // 未缩放的 ImGui 基准样式（CreateContext 后立即留底；每次缩放都从它重算，避免累积）
 ImGuiStyle g_base_style;
 bool g_base_style_ready = false;
+
+// 取出 exe 内嵌 RCDATA 的只读内存（ADR-048）。
+// 资源在进程生命周期内始终映射着，故指针可直接交给 ImGui（配合 FontDataOwnedByAtlas=false），
+// 既不用拷贝也不用释放 —— 这正合 ImGui 1.92+ "字体数据须全程有效"的要求。
+const void* find_embedded_resource(int id, int* out_size) {
+    const HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(id), RT_RCDATA);
+    if (res == nullptr) return nullptr;
+    const DWORD size = SizeofResource(nullptr, res);
+    const HGLOBAL handle = LoadResource(nullptr, res);
+    if (handle == nullptr) return nullptr;
+    const void* data = LockResource(handle);
+    if (data == nullptr) return nullptr;
+    if (out_size != nullptr) *out_size = static_cast<int>(size);
+    return data;
+}
 
 }  // namespace
 
@@ -328,10 +345,43 @@ void ImGuiRaii::initialize(HWND hwnd) {
     g_base_style = ImGui::GetStyle();
     g_base_style_ready = true;
 
-    // 中文字体：系统微软雅黑（子集化内嵌属 Phase 6 未完成项，见迁移计划）。
-    // 这里给的是**基准字号**；实际渲染尺寸 = 基准 × FontScaleMain × FontScaleDpi。
-    io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", kUiFontBasePx,
-        nullptr, io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+    // ---- 字体装载（ADR-048）----
+    //
+    // 1) 先换 FreeType 装载器：内置 stb_truetype 只吃 TrueType，而子集是 CFF/OTF；
+    //    且小字号 CJK 的栅格化质量明显更好（imgui_freetype 的官方用途）。
+    //    等效于在 imconfig.h 里 #define IMGUI_ENABLE_FREETYPE，但不必改第三方文件。
+    io.Fonts->SetFontLoader(ImGuiFreeType::GetFontLoader());
+
+    // 2) UI 主字体 = **随 exe 内嵌的子集**（assets/ui_font_subset.otf，Noto Sans SC 子集）。
+    //    这样界面观感不随"这台机器装没装某款系统字体"漂移。覆盖范围有自动化断言兜底
+    //    （tests 扫描源码字符集 ⊆ 子集 cmap），故界面自述文字不可能出现豆腐块。
+    //    字形**按需栅格化**（DX11 后端声明了 RendererHasTextures，走动态图集路径），
+    //    因此这里 ranges 传 nullptr 不会预烘整本字库。
+    int ui_font_size = 0;
+    const void* ui_font_data = find_embedded_resource(kUiFontResId, &ui_font_size);
+    bool ui_font_ok = false;
+    if (ui_font_data != nullptr && ui_font_size > 0) {
+        ImFontConfig cfg;
+        cfg.FontDataOwnedByAtlas = false;   // 资源内存归 exe 映射所有，ImGui 不得释放
+        cfg.FontLoaderFlags = ImGuiFreeTypeLoaderFlags_LightHinting;
+        ui_font_ok = io.Fonts->AddFontFromMemoryTTF(const_cast<void*>(ui_font_data), ui_font_size,
+                                                    kUiFontBasePx, &cfg, nullptr) != nullptr;
+    }
+    if (!ui_font_ok) {
+        // 资源缺失（异常构建或资源被剥离）：退回系统微软雅黑，界面仍可用但不保证覆盖
+        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", kUiFontBasePx,
+                                     nullptr, io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+    }
+
+    // 3) 生僻字 fallback：把系统微软雅黑**合并**进同一 ImFont，只兜子集里没有的字形
+    //    （文件名、PDF 目录标题里可能出现生僻字）。合并顺序即优先级 —— 子集在前，
+    //    常规字仍走内嵌子集；系统缺该字体时 ImGui 静默跳过，界面自述文字不受影响。
+    {
+        ImFontConfig fb;
+        fb.MergeMode = true;
+        fb.FontLoaderFlags = ImGuiFreeTypeLoaderFlags_LightHinting;
+        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", kUiFontBasePx, &fb, nullptr);
+    }
 
     // 图标字体：把 Segoe MDL2 Assets 的相关字形**合并**进同一字体。
     // 只烘 kIconGlyphs 里用到的二十余个 PUA 码位，图集不膨胀。字体缺失、或任一码位

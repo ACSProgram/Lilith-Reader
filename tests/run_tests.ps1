@@ -232,8 +232,23 @@ if ($Probe) {
     & "$out\mupdf_probe.exe" $samples
 }
 
+# ---- 5. 资源类断言（不走 C++ 用例）--------------------------------------------
+
+# 内嵌 UI 字体子集的覆盖范围（ADR-048）：断言对象是字体文件的 cmap，用 fontTools 读表最直接；
+# 判据是"源码里出现的每个非 ASCII 字符都在子集里"—— 界面自述文字不依赖系统字体的硬保证。
+Step "字体子集覆盖断言"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & $Python (Join-Path $repo "assets\check_font_coverage.py")
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$fontExit = $LASTEXITCODE
+Write-Host "  check_font_coverage.py 退出码 = $fontExit"
+
 Step "结束"
-if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $stateExit -eq 0) {
+if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $stateExit -eq 0 -and
+    $fontExit -eq 0) {
     Write-Host "全部通过。" -ForegroundColor Green
 } else {
     Write-Host "存在失败用例。" -ForegroundColor Red
@@ -241,4 +256,5 @@ if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $stateExit
 if ($testExit -ne 0) { exit $testExit }
 if ($canvasExit -ne 0) { exit $canvasExit }
 if ($cacheExit -ne 0) { exit $cacheExit }
-exit $stateExit
+if ($stateExit -ne 0) { exit $stateExit }
+exit $fontExit
