@@ -17,6 +17,8 @@ build/
 out/
 bin/
 
+assets/__pycache__
+
 # 安装包构建产物（脚本与图标入库，setup exe 不入库）
 installer/dist/
 

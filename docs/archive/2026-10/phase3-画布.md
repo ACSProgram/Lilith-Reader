@@ -5,7 +5,7 @@
 
 ## 1. 目标与范围
 
-按 [迁移计划](../../01-迁移计划.md) Phase 3：用纯 ImGui + ImDrawList 自研画布，取代
+按 [迁移阶段总览](迁移阶段总览.md) Phase 3：用纯 ImGui + ImDrawList 自研画布，取代
 ImPlot 作产品画布（ADR-001），拆 3a 单页视口 / 3b 缩放 / 3c 多列网格三步，并配套
 `PageBitmap → D3D11 纹理上传`、用 render 调度层取代 Phase 2 的 `DocSession` 临时线程。
 
