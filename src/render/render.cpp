@@ -26,6 +26,7 @@ module;
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -81,6 +82,16 @@ bool create_page_texture(ID3D11Device* dev, const std::uint8_t* data,
     }
     return true;
 }
+
+// 全文搜索的**全局**命中上限：单页上限（document 层 200）之上再加一道总闸，
+// 防止"文档里全是 e"这类查询把结果表撑到几十万条（列表/内存都受不了）。
+// 触顶即标记 truncated 并停止检索，UI 会如实告知"仅显示前 N 处"。
+constexpr int kMaxSearchHits = 5000;
+
+// 每轮检索的页数。取值权衡：太小 → 线程唤醒次数多、调度开销占比高；
+// 太大 → 单轮占用工作线程过久，期间渲染请求要排队（滚动会顿）。
+// 24 页约合"人眼刚好察觉不到的一次停顿"，且一批之后必然让位给渲染请求。
+constexpr int kSearchBatchPages = 24;
 
 bool wants_equal(const std::vector<RenderWant>& a, const std::vector<RenderWant>& b) {
     if (a.size() != b.size()) return false;
@@ -162,6 +173,45 @@ struct Renderer::Impl {
     // 内容指纹（ADR-062）：**工作线程**在打开前算好（≤320KB 采样读），UI 线程不读文件内容。
     // 加密文档打开会失败在 NeedsPassword，指纹要留给随后 authenticate 成功的那次发布，故存一份。
     std::uint64_t fp_ = 0;
+
+    // ---- 辅助请求队列（Phase 8：文本/图片/链接）----
+    //
+    // 为什么不复用上面的 `cmd` 单槽：`cmd` 是"后到覆盖先到"的语义（open/close/auth 都是
+    // 用户显式动作，覆盖上一次待处理是合理的）。而文本请求由鼠标悬停触发、频率高得多，
+    // 若共用槽位，一次悬停就能把"待打开的文档"覆盖掉 —— 用户点了打开却没反应。
+    // 故另开一条 FIFO 队列，与渲染请求同优先级、互不覆盖。
+    struct AuxReq {
+        enum class Kind { PageContent, CopyText, CopyImage };
+        Kind  kind = Kind::PageContent;
+        int   page = -1;
+        float ax = 0, ay = 0, bx = 0, by = 0;   // CopyText：选区两端（未旋转页面 pt）
+        float px = 0, py = 0;                   // CopyImage：取图点（未旋转页面 pt）
+    };
+    std::deque<AuxReq> aux;
+    bool               aux_dirty = false;
+
+    // 已发布的页内容快照（只保留一页 + "未被取走"标记）。
+    // 只保留一页的理由同 document 的 stext 缓存：交互始终集中在鼠标所在的那一页。
+    PageContent content_pub;
+    int         content_page = -1;
+    bool        content_fresh = false;
+
+    // 复制结果：一次性取用（取走即清空）。文本用 optional 区分"空结果"与"无结果"。
+    std::optional<std::string> copy_text_res;
+    std::optional<ImageData>   copy_image_res;
+
+    // ---- 全文搜索作业（Phase 8）----
+    struct SearchJob {
+        bool          active = false;
+        std::string   needle;              // UTF-8
+        int           next_page = 0;       // 下一个待扫描页
+        int           hits = 0;            // 已累计命中数
+        bool          truncated = false;   // 命中触顶，提前收工
+        std::uint64_t id = 0;              // 查询序号（在途批次用它判断"是否已被取代"）
+        std::vector<SearchHit> pending;    // 待 UI 取走的新命中
+    };
+    SearchJob     search;
+    std::uint64_t next_search_id = 0;
 
     Document     doc_engine;  // 仅工作线程访问
     std::jthread worker;
@@ -288,6 +338,7 @@ struct Renderer::Impl {
     void run(std::stop_token st) {
         for (;;) {
             std::optional<Command>  c;
+            std::optional<AuxReq>   a;
             std::vector<RenderWant> w;
             std::vector<int>        tw;
             bool have_wants = false;
@@ -295,11 +346,24 @@ struct Renderer::Impl {
             int  thumb_px = 150;
             {
                 std::unique_lock lock(mtx);
-                cv.wait(lock, st, [this] { return cmd.has_value() || wants_dirty || thumbs_dirty; });
+                cv.wait(lock, st, [this] {
+                    return cmd.has_value() || aux_dirty || wants_dirty || thumbs_dirty ||
+                           search.active;
+                });
                 if (st.stop_requested()) return;
+                // 优先级：显式命令 > 辅助请求 > 渲染请求 > 缩略图 > 检索。
+                // 辅助请求排在渲染之前：它由用户动作直接触发（悬停/复制），延迟可感知；
+                // 且每个请求只处理一页，成本与渲染一页同量级，不会造成长停顿。
+                // 检索排在最后：它是长任务，必须让位给渲染（滚动时不卡）。
                 if (cmd) {                      // 命令优先，渲染请求留到下一轮
                     c = std::move(cmd);
                     cmd.reset();
+                } else if (aux_dirty) {
+                    if (!aux.empty()) {
+                        a = aux.front();
+                        aux.pop_front();
+                    }
+                    aux_dirty = !aux.empty();
                 } else if (wants_dirty) {
                     w = std::move(wants);
                     wants.clear();
@@ -313,8 +377,12 @@ struct Renderer::Impl {
                 }
             }
             if (c) handle_command(*c);
+            else if (a) handle_aux(*a);
             else if (have_wants) handle_wants(w);
             else if (have_thumbs) handle_thumbs(tw, thumb_px);
+            else search_step();
+            // 渲染/缩略图之后捎带一轮检索：两者都不忙时才轮到它，天然与渲染交替。
+            if (have_wants || have_thumbs) search_step();
         }
     }
 
@@ -326,12 +394,113 @@ struct Renderer::Impl {
         }
     }
 
+    // ---- 辅助请求处理（Phase 8）----
+    void handle_aux(const AuxReq& a) {
+        if (!doc_engine.is_open()) return;
+        switch (a.kind) {
+        case AuxReq::Kind::PageContent: {
+            PageContent pc;
+            if (doc_engine.page_content(a.page, pc) != DocError::Ok) return;
+            std::lock_guard lock(mtx);
+            content_pub = std::move(pc);
+            content_page = a.page;
+            content_fresh = true;
+            break;
+        }
+        case AuxReq::Kind::CopyText: {
+            std::string text;
+            // 失败不改变结果槽：UI 会一直等不到结果 —— 但复制失败没有别的补救，
+            // 宁可让它"没反应"，也不要写入半截文本（半截更糟：用户以为复制成功）。
+            if (doc_engine.copy_text(a.page, a.ax, a.ay, a.bx, a.by, text) != DocError::Ok) return;
+            std::lock_guard lock(mtx);
+            copy_text_res = std::move(text);
+            break;
+        }
+        case AuxReq::Kind::CopyImage: {
+            ImageData img;   // 无图片时保持空 → take_copy_image 返回 true 但 out 无效
+            doc_engine.image_at(a.page, a.px, a.py, img);
+            std::lock_guard lock(mtx);
+            copy_image_res = std::move(img);
+            break;
+        }
+        }
+    }
+
+    // ---- 全文检索：一轮 = 一小批页（Phase 8）----
+    //
+    // 三处让步设计：
+    //   1) 每页开始前重读 `search.id` —— 新查询/取消会换 id，在途批次据此立即收工；
+    //   2) 每轮只扫 kSearchBatchPages 页 —— 之后必然回到主循环，渲染请求得以及时插队；
+    //   3) 结果攒够一批才进 pending —— UI 每帧取一次，不产生逐页的锁竞争。
+    void search_step() {
+        std::string   needle;
+        std::uint64_t id = 0;
+        int           page = 0;
+        int           hits = 0;
+        bool          truncated = false;
+        {
+            std::lock_guard lock(mtx);
+            if (!search.active) return;
+            needle = search.needle;
+            id = search.id;
+            page = search.next_page;
+            hits = search.hits;
+            truncated = search.truncated;
+        }
+        if (!doc_engine.is_open() || needle.empty()) {
+            std::lock_guard lock(mtx);
+            if (search.id == id) search.active = false;
+            return;
+        }
+        const int total = info_.page_count;
+
+        std::vector<SearchHit> found;
+        std::vector<SearchHit> page_hits;
+        for (int n = 0; n < kSearchBatchPages && page < total; ++n, ++page) {
+            {
+                // 每页前检查：是否已被新查询取代 / 已取消 / 文档已换
+                std::lock_guard lock(mtx);
+                if (!search.active || search.id != id) return;
+            }
+            page_hits.clear();
+            if (doc_engine.search_page(page, needle, 200, page_hits) != DocError::Ok) continue;
+            for (SearchHit& h : page_hits) {
+                if (hits >= kMaxSearchHits) { truncated = true; break; }
+                found.push_back(std::move(h));
+                ++hits;
+            }
+            if (truncated) { ++page; break; }
+        }
+
+        std::lock_guard lock(mtx);
+        if (!search.active || search.id != id) return;
+        for (SearchHit& h : found) search.pending.push_back(std::move(h));
+        search.hits = hits;
+        search.next_page = page;
+        search.truncated = truncated;
+        if (truncated || page >= total) search.active = false;
+    }
+
+    // 取消检索（换文档 / 关文档 / 用户取消时调用）。换 id 让在途批次失效。
+    void cancel_search_locked() {
+        search.active = false;
+        search.needle.clear();
+        search.next_page = 0;
+        search.hits = 0;
+        search.truncated = false;
+        search.pending.clear();
+        search.id = ++next_search_id;
+    }
+
     void do_open(const Command& c) {
         doc_engine.close();
         {
             std::lock_guard lock(mtx);
             clear_pages_locked();
             clear_thumbs_locked();
+            cancel_search_locked();   // 换文档：旧的检索结果一律作废（页号不再对应）
+            content_fresh = false;
+            content_page = -1;
             last_wants.clear();
         }
 
@@ -377,6 +546,9 @@ struct Renderer::Impl {
         std::lock_guard lock(mtx);
         clear_pages_locked();
         clear_thumbs_locked();
+        cancel_search_locked();
+        content_fresh = false;
+        content_page = -1;
         last_wants.clear();
         info_ = DocumentInfo{};
         outline_.clear();
@@ -401,6 +573,9 @@ struct Renderer::Impl {
                 std::lock_guard lock(mtx);
                 clear_pages_locked();
                 clear_thumbs_locked();
+                cancel_search_locked();
+                content_fresh = false;
+                content_page = -1;
                 const std::size_t n =
                     static_cast<std::size_t>(info.page_count > 0 ? info.page_count : 0);
                 pages.assign(n, Entry{});
@@ -804,6 +979,135 @@ void Renderer::retry_page(int page) {
     impl_->wants = impl_->last_wants;
     impl_->wants_dirty = true;
     impl_->cv.notify_all();
+}
+
+// ---- 文本 / 图片 / 链接（Phase 8）----
+
+void Renderer::request_page_content(int page) {
+    if (!impl_ || page < 0) return;
+    std::lock_guard lock(impl_->mtx);
+    for (const Impl::AuxReq& a : impl_->aux)
+        if (a.kind == Impl::AuxReq::Kind::PageContent && a.page == page) return;  // 已在队列
+    Impl::AuxReq r;
+    r.kind = Impl::AuxReq::Kind::PageContent;
+    r.page = page;
+    impl_->aux.push_back(r);
+    impl_->aux_dirty = true;
+    impl_->cv.notify_all();
+}
+
+bool Renderer::take_page_content(int page, PageContent& out) {
+    if (!impl_) return false;
+    std::lock_guard lock(impl_->mtx);
+    if (!impl_->content_fresh || impl_->content_page != page) return false;
+    out = std::move(impl_->content_pub);
+    impl_->content_pub = PageContent{};
+    impl_->content_fresh = false;
+    return true;
+}
+
+void Renderer::request_copy_text(int page, float ax, float ay, float bx, float by) {
+    if (!impl_ || page < 0) return;
+    std::lock_guard lock(impl_->mtx);
+    Impl::AuxReq r;
+    r.kind = Impl::AuxReq::Kind::CopyText;
+    r.page = page;
+    r.ax = ax; r.ay = ay;
+    r.bx = bx; r.by = by;
+    impl_->aux.push_back(r);
+    impl_->aux_dirty = true;
+    impl_->cv.notify_all();
+}
+
+bool Renderer::take_copy_text(std::string& out) {
+    if (!impl_) return false;
+    std::lock_guard lock(impl_->mtx);
+    if (!impl_->copy_text_res.has_value()) return false;
+    out = std::move(*impl_->copy_text_res);
+    impl_->copy_text_res.reset();
+    return true;
+}
+
+void Renderer::request_copy_image(int page, float x, float y) {
+    if (!impl_ || page < 0) return;
+    std::lock_guard lock(impl_->mtx);
+    Impl::AuxReq r;
+    r.kind = Impl::AuxReq::Kind::CopyImage;
+    r.page = page;
+    r.px = x; r.py = y;
+    impl_->aux.push_back(r);
+    impl_->aux_dirty = true;
+    impl_->cv.notify_all();
+}
+
+bool Renderer::take_copy_image(ImageData& out) {
+    if (!impl_) return false;
+    std::lock_guard lock(impl_->mtx);
+    if (!impl_->copy_image_res.has_value()) return false;
+    out = std::move(*impl_->copy_image_res);
+    impl_->copy_image_res.reset();
+    return true;
+}
+
+// ---- 全文搜索（Phase 8）----
+
+void Renderer::start_search(std::string utf8_needle) {
+    if (!impl_) return;
+    std::lock_guard lock(impl_->mtx);
+    impl_->cancel_search_locked();     // 旧查询立即作废（换 id，在途批次收工）
+    // 只挡空关键字。**不挡"页表为空"**：那种情况下 search_step 会因为文档未打开而立刻
+    // 收敛（active=false），UI 如实显示"没有找到"；若在这里直接返回，active 一直是 false
+    // 而 needle 也没记下，故障会变成"按了搜索什么都没发生"，无从排查。
+    if (utf8_needle.empty()) {
+        impl_->cv.notify_all();
+        return;
+    }
+    impl_->search.needle = std::move(utf8_needle);
+    impl_->search.id = ++impl_->next_search_id;
+    impl_->search.next_page = 0;
+    impl_->search.active = true;
+    impl_->cv.notify_all();
+}
+
+void Renderer::cancel_search() {
+    if (!impl_) return;
+    std::lock_guard lock(impl_->mtx);
+    impl_->cancel_search_locked();
+    impl_->cv.notify_all();
+}
+
+void Renderer::stop_search() {
+    if (!impl_) return;
+    std::lock_guard lock(impl_->mtx);
+    if (!impl_->search.active) return;
+    // 只关 active 并换 id（在途批次据此收工）；next_page / hits / pending / needle **全部保留**。
+    // 于是 UI 仍能如实报"已扫描 N / M 页 · 已找到 K 处"，也仍能取走最后一批命中。
+    // 若这里改用 cancel_search_locked()，进度会被清零，UI 会显示"已扫描 0 / M 页"——
+    // 那是"从未搜过"的样子，与"搜到一半停下"是两回事。
+    impl_->search.active = false;
+    impl_->search.id = ++impl_->next_search_id;
+}
+
+SearchStatus Renderer::search_status() const {
+    SearchStatus s;
+    if (!impl_) return s;
+    std::lock_guard lock(impl_->mtx);
+    s.active = impl_->search.active;
+    s.scanned = impl_->search.next_page;
+    s.total = impl_->doc.info.page_count;   // 走 doc 快照：info_ 是工作线程私有、不加锁
+    s.hits = impl_->search.hits;
+    s.truncated = impl_->search.truncated;
+    s.id = impl_->search.id;
+    s.needle = impl_->search.needle;
+    return s;
+}
+
+void Renderer::take_search_hits(std::vector<SearchHit>& out) {
+    if (!impl_) return;
+    std::lock_guard lock(impl_->mtx);
+    if (impl_->search.pending.empty()) return;
+    for (SearchHit& h : impl_->search.pending) out.push_back(std::move(h));
+    impl_->search.pending.clear();
 }
 
 // ---- 视图变换（Phase 5）----

@@ -94,6 +94,20 @@ struct CacheStats {
     int         evictions = 0;       // 自打开文档以来累计逐出页数
 };
 
+// ---- 全文搜索状态快照（Phase 8）----
+//
+// 检索是**增量**的：工作线程每轮只扫一小批页，与渲染交替，避免"搜 1000 页文档时
+// 界面整段卡死"。结果**渐进发布**（每批追加），UI 边搜边显示；发起新查询即取消旧查询。
+struct SearchStatus {
+    bool        active = false;     // 仍在检索
+    int         scanned = 0;        // 已扫描页数（= 下一页起点）
+    int         total = 0;          // 总页数（0 = 无文档）
+    int         hits = 0;           // 已找到命中数
+    bool        truncated = false;  // 命中数达到上限、提前停止
+    std::uint64_t id = 0;           // 查询序号（UI 用它识别"这批属于哪次查询"）
+    std::string needle;             // 当前关键字（UTF-8）
+};
+
 // ---- 渲染调度器 ----
 class Renderer {
 public:
@@ -145,6 +159,43 @@ public:
     //   target_px : 缩略图最长边目标像素（如 150）
     void set_thumbs_wanted(std::vector<int> pages, int target_px);
     [[nodiscard]] PageSlot thumb_slot(int page) const;
+
+    // ---- 文本 / 图片 / 链接（Phase 8）----
+    //
+    // 这些请求走**独立的辅助队列**，刻意不共用 open/close/authenticate 的那个命令槽：
+    // 文本请求由鼠标悬停触发、频率高得多，若共用槽位，一次悬停就能把"待打开的文档"
+    // 覆盖掉（用户点了打开却没反应）。辅助请求与渲染请求同优先级、互不覆盖。
+    //
+    // 坐标一律是**未旋转页面 pt**（见 document.ixx 坐标约定）；旋转折算由 app 层做。
+
+    // 请求某页的可交互内容（文本布局 / 图片矩形 / 链接）。同一页已在队列中则不重复投。
+    void request_page_content(int page);
+    // 取走某页的**新**内容快照：有未取走的快照时写入 out 并返回 true。
+    // 没有则返回 false 且不动 out —— UI 因此不必每帧拷贝整页字符表。
+    [[nodiscard]] bool take_page_content(int page, PageContent& out);
+
+    // 请求把某页 [a,b] 选区复制为文本。结果由 take_copy_text 一次性取走。
+    void request_copy_text(int page, float ax, float ay, float bx, float by);
+    // 取走复制文本结果；无结果返回 false。文本为空串也是有效结果（选区为空）。
+    [[nodiscard]] bool take_copy_text(std::string& out);
+
+    // 请求复制某页 (x,y) 处的**嵌入图片**。结果由 take_copy_image 取走。
+    void request_copy_image(int page, float x, float y);
+    // 取走复制图片结果；无结果返回 false。**返回 true 但 out 无效 = 该处没有图片**，
+    // UI 据此提示"此处没有可复制的图片"（而不是静默什么都不发生）。
+    [[nodiscard]] bool take_copy_image(ImageData& out);
+
+    // ---- 全文搜索（Phase 8）----
+    // 发起一次全文检索（UTF-8 关键字；空串 = 取消）。会取消上一次仍在跑的检索。
+    void start_search(std::string utf8_needle);
+    void cancel_search();
+    // 停止在途检索，但**保留**已扫描进度与已找到的命中（UI「停止」按钮）。
+    // 与 cancel_search 的分工：cancel 是"作废"（换关键字 / 换文档，进度与结果都不要了），
+    // stop 是"收手"（用户不想再等，但已找到的结果还要能看、能跳）。
+    void stop_search();
+    [[nodiscard]] SearchStatus search_status() const;
+    // 把自上次调用以来**新增**的命中追加到 out 尾部（不覆盖已有内容）。
+    void take_search_hits(std::vector<SearchHit>& out);
 
 private:
     struct Impl;

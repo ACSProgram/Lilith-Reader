@@ -47,7 +47,8 @@ import lilithreader.render;
 import lilithreader.reader_state;
 
 #include "imgui.h"
-#include "tone.h"     // 纸张方案 → chrome 色调（纯函数，自身不依赖 ImGui/Win32）
+#include "tone.h"      // 纸张方案 → chrome 色调（纯函数，自身不依赖 ImGui/Win32）
+#include "page_map.h"  // 页面 pt ↔ 屏幕点（纯函数，含旋转折算；可单测）
 
 // 链接依赖（app 层 TUs 共用；放在头里避免每个 .cpp 重复声明）
 #pragma comment(lib, "d3d11.lib")
@@ -89,6 +90,21 @@ inline constexpr float  kPopupPadXY = 8.0f;      // 弹出菜单四周内边距
 inline constexpr float  kMenuItemGapY = 10.0f;   // 弹出菜单项之间/项高（Selectable 不吃 FramePadding）
 // 图标字形与汉字的基线差异（实测，ADR-045）：正值 = 向下微调，使图标与文字对齐。
 inline constexpr float  kIconGlyphOffsetY = 4.0f;
+
+// ---- 文本交互（Phase 8）----
+// 判定"点击"还是"拖拽"的位移阈值（100% 缩放值）：超过它才算拖拽。
+// 4px 是桌面惯例量级（小于它人手几乎不可能"有意拖动"）。
+inline constexpr float  kClickSlopPx = 4.0f;
+// 选区高亮与搜索命中高亮的透明度（0~1）。
+inline constexpr float  kSelectAlpha = 0.34f;
+inline constexpr float  kFindAlpha   = 0.30f;
+// 状态栏提示（toast）的显示时长（秒）。
+inline constexpr double kToastSec = 2.6;
+// 搜索的**输入防抖**：停止打字多久后自动发起检索（秒）。
+// 为什么不逐键检索、也不无限等回车：逐键检索在千页文档上会把渲染线程持续占满；
+// 只认回车则中文输入法下"第一次回车是上屏"会让人以为搜索没反应（用户实测）。
+// 0.4s 是"打完一个词到想按回车"之间的自然停顿量级，短于它不算打完，长于它用户已在等结果。
+inline constexpr double kSearchDebounceSec = 0.4;
 
 // ---- 视图动效（Phase 6 收尾，ADR-047）----
 // 统一用**一阶滞后**（帧率无关的指数趋近）而不是补间：无过冲、必然收敛、不需要维护速度状态，
@@ -172,6 +188,10 @@ inline constexpr const char* kIcOpenFile   = "\xEE\xA3\xA5";  // U+E8E5 打开�
 inline constexpr const char* kIcSearch     = "\xEE\x9C\xA1";  // U+E721 搜索
 inline constexpr const char* kIcFolder     = "\xEE\xA2\xB7";  // U+E8B7 文件夹（阅读数据的位置行）
 inline constexpr const char* kIcTrash      = "\xEE\x9D\x8D";  // U+E74D 删除（阅读数据行尾）
+// Phase 8：文本/图片/链接
+inline constexpr const char* kIcCopy       = "\xEE\xA3\x88";  // U+E8C8 复制
+inline constexpr const char* kIcImage      = "\xEE\xA2\xB9";  // U+E8B9 图片
+inline constexpr const char* kIcLink       = "\xEE\x9C\x9B";  // U+E71B 链接
 
 // ============================================================================
 // 平台层（platform.cpp）
@@ -299,6 +319,12 @@ inline HIMC g_saved_ime = nullptr;
 inline bool g_ime_attached = false;
 void update_ime_association();
 
+// ---- 剪贴板（Phase 8）----
+// 文本走 CF_UNICODETEXT（内部 UTF-8 → UTF-16，避免中文变乱码）；
+// 图片走 CF_DIB（32bpp BGRA，自下而上）。返回 false = 写剪贴板失败（被别的进程占用）。
+bool set_clipboard_text(const std::string& utf8);
+bool set_clipboard_image_rgba(int w, int h, const std::uint8_t* rgba);
+
 // ---- 全屏 ----
 inline bool g_fullscreen = false;
 inline WINDOWPLACEMENT g_prev_placement{ sizeof(WINDOWPLACEMENT) };
@@ -330,9 +356,13 @@ inline lr::ReaderState  g_state;      // exe 同目录 reader_state.bin 的全�
 inline lr::DocIdentity  g_identity;   // 当前文档身份（内容指纹 / 路径键 / 页数 / 路径）
 inline std::uint64_t    g_doc_key = 0;  // 当前文档在库里的主键（0 = 无效，不参与存取）
 
-// ---- 侧栏（目录 / 书签 / 缩略图）----
+// ---- 侧栏（目录 / 书签 / 缩略图 / 搜索）----
 inline bool g_show_sidebar = false;
-inline int  g_sidebar_tab = 0;      // 0 目录 / 1 书签 / 2 缩略图
+inline int  g_sidebar_tab = 0;      // 0 目录 / 1 书签 / 2 缩略图 / 3 搜索
+// **一次性**的"强制切到某分栏"请求（-1 = 无）。ImGui 的 TabBar 有自己的选中态，
+// 只改 g_sidebar_tab 并不会切换分栏 —— 必须在下一次绘制时给该分栏带 SetSelected 标志。
+// 只保留一帧：每帧都带会让该分栏被锁死，用户再也点不到别的分栏。
+inline int  g_sidebar_tab_want = -1;
 
 // ---- 视图变换（0/90/180/270 与纸张方案）----
 inline int g_rotation = 0;
@@ -491,6 +521,9 @@ enum class Cmd : int {
     Col1, Col2, Col3, Col4, ToggleSpread, RotateCW, ToggleDark, ToggleWarm,
     // 界面
     ToggleSidebar, ToggleBookmark, OpenSettings, OpenKeys, ToggleDebug, ToggleFullscreen, OpenFile,
+    // 文本（Phase 8）。追加在末尾而不是插进中间：`Cmd` 的整数值虽不落盘（ini 键名是 id 字符串），
+    // 但让已有命令的序号保持稳定，能让任何按序号写的调试代码/日志不至于突然错位。
+    Copy, SelectAll, OpenSearch,
     Count,
 };
 
@@ -535,6 +568,131 @@ std::string chord_to_string(ImGuiKeyChord c);   // ini 存储用（纯 ASCII）
 ImGuiKeyChord chord_from_string(const std::string& s);
 void update_key_capture();              // 每帧推进捕获（在设置窗口绘制之后调用）
 int  find_bind_conflict(int cmd, int slot); // 冲突命令下标；无冲突 -1
+
+// ============================================================================
+// 文本交互 / 剪贴板 / 全文搜索（Phase 8）
+// ============================================================================
+//
+// 坐标一律经 page_map.h 折算：屏幕 ↔ **未旋转页面 pt**。命中测试、选区、高亮、
+// 搜索命中、链接热区全部在这一个坐标系里做；旋转只在"最后映射到屏幕"时体现，
+// 于是旋转视图下不需要任何特殊分支（也正因如此，page_map 的旋转折算被单测钉死）。
+//
+// 线程纪律不变：本层**零 fz_***。文本布局由渲染工作线程抽好后发布快照（render 的
+// request_page_content / take_page_content），本层只做纯浮点命中测试。
+
+// 页面 pt 空间的一个矩形（选区高亮按行合并后的结果）
+struct SelRect {
+    float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
+};
+
+// 选区。**单页**：跨页选择刻意不做 —— 多数阅读器也没有，且它要引入"页序 + 页内偏移"
+// 的复合定位与跨页高亮，收益远小于代价。
+//
+// 关键设计：选区一旦确定，就把**复制端点 + 高亮矩形**冻结进结构里，而不是只存
+// "字符下标"。原因：字符下标只在"当前页的内容快照"里才有意义，而快照会随鼠标移动
+// 到别的页而被换掉（内容缓存只有一页）。若只存下标，用户选好一段、把鼠标移到下一页
+// 再回来右键复制，就会复制失败或复制到错的内容。冻结之后，选区与内容缓存完全解耦。
+struct Selection {
+    bool active = false;
+    int  page = -1;
+    int  anchor = -1;     // 按下时的字符下标（仅拖动期间有效，用于算范围）
+    int  head = -1;       // 当前字符下标（同上）
+    bool dragging = false;
+    // 冻结结果（未旋转页面 pt）
+    float ax_pt = 0.0f, ay_pt = 0.0f;   // 复制端点 a（选区阅读顺序前端）
+    float bx_pt = 0.0f, by_pt = 0.0f;   // 复制端点 b（后端）
+    std::vector<SelRect> rects;         // 高亮矩形（已按行合并）
+};
+inline Selection g_sel;
+inline bool g_select_all_pending = false;   // 全选请求在等内容快照
+// 一次按下/抬起的辅助状态：区分"点击"与"拖拽"、以及"点击是否落在链接上"。
+// 链接存**副本**而不是下标：按下到抬起之间内容快照可能被换掉（鼠标移到了别的页），
+// 下标就失效了；副本里已经带了 uri 与解析好的目标页，与快照解耦。
+inline float        g_press_x = 0.0f, g_press_y = 0.0f;
+inline int          g_press_page = -1;
+inline bool         g_press_link_valid = false;
+inline lr::PageLink g_press_link;
+inline bool         g_press_on_text = false;
+
+// 鼠标所在页的交互内容（文本布局 / 图片矩形 / 链接）。
+// 只请求**鼠标所在那一页**：抽一次 stext 与渲染一页同价，不能对全部可见页盲发。
+inline int             g_content_page = -1;   // 已收到内容的页（-1 = 无）
+inline int             g_content_want = -1;   // 已发出请求的页
+inline double          g_content_since = -1.0;// 该请求的发出时刻（超时重发用，见 update_hovered_content）
+inline lr::PageContent g_content;
+
+// 右键菜单锚点：右键按下那一刻的页、页面 pt、以及该点上的链接（若有，存副本）。
+// 必须**在按下时**记下来 —— 用户点菜单项时鼠标已移出画布，再取实时位置只会取到菜单上。
+inline int          g_ctx_page = -1;
+inline float        g_ctx_x_pt = 0.0f, g_ctx_y_pt = 0.0f;
+inline bool         g_ctx_link_valid = false;
+inline lr::PageLink g_ctx_link;
+inline bool         g_ctx_image_valid = false;   // 右键位置是否落在嵌入图片上（决定「复制图片」可用性）
+// 悬停诊断（F3 浮层用）
+inline int   g_hover_page = -1;
+inline int   g_hover_link = -1;
+inline int   g_hover_char = -1;
+
+// 状态栏短暂提示（"已复制"/"此处没有图片"）。toast 比弹窗轻，不打断阅读。
+inline std::string g_toast;
+inline double      g_toast_since = -1.0;
+
+// ---- 全文搜索 ----
+inline char g_search_buf[256] = {};
+inline bool g_search_focus = false;              // 下一帧把键盘焦点交给输入框
+inline std::vector<lr::SearchHit> g_search_hits;
+inline int  g_search_cur = -1;                   // 当前命中下标（-1 = 未选中）
+inline int  g_search_scanned = 0;                // 已扫描页数（进度显示）
+inline int  g_search_total = 0;                  // 总页数
+inline bool g_search_active = false;             // 仍在检索
+inline bool g_search_truncated = false;          // 命中触顶
+inline bool g_search_scroll_pending = false;     // 有待执行的"滚到当前命中"
+
+// 输入防抖（自动检索）。三件状态必须分开：
+//   committed —— 结果列表对应的关键字（"现在显示的这批命中是谁的"）；
+//   seen      —— 上一帧输入框的内容（用来判定"这一帧用户是否改了字"）；
+//   pending   —— 有改动、正在等防抖计时到期。
+// 为什么不用 committed 直接和输入框比：改了字之后 committed 还没变，会每帧都判定"改了"，
+// 于是计时器每帧被重置、永远等不到到期。必须有一个"已经看见过这次改动"的标记。
+inline std::string g_search_committed;
+inline char        g_search_seen[256] = {};
+inline bool        g_search_pending = false;
+inline double      g_search_edit_at = -1.0;      // 输入内容最后一次变化的时刻（ImGui 时间轴）
+
+// ---- 坐标与命中测试 ----
+[[nodiscard]] bool page_view_of(const ImVec2& origin, int page, PageView& view, PageGeom& geom);
+[[nodiscard]] int  page_at_screen(const ImVec2& origin, const ImVec2& screen);
+// 字符命中测试。clamp_to_nearest = false（悬停 / 按下）**严格**：只有落在某行文字的近旁
+// 才算命中，否则返回 -1 —— 否则整页都会算"可选文本"，鼠标离开文字也不变回箭头。
+// = true（拖拽中）宽松：拖到行尾之外仍吸附到最近字符，选区才能"到底"。
+[[nodiscard]] int  char_index_at(int page, float x_pt, float y_pt, bool clamp_to_nearest);
+[[nodiscard]] int  link_index_at(int page, float x_pt, float y_pt);
+[[nodiscard]] int  image_index_at(int page, float x_pt, float y_pt);
+void selection_clear();
+void selection_select_all();
+void selection_copy();
+// 用右键菜单锚点复制嵌入图片 / 打开链接（锚点无效时退回当前悬停位置）
+void copy_image_at_context();
+void open_link_at_context();
+
+// ---- 文本交互 ----
+// 在画布输入里调用；返回 true = 本帧左键被"文本选择"接管（平移必须让位）。
+[[nodiscard]] bool handle_text_interaction(const ImVec2& origin, const ImVec2& size, bool hovered);
+// 请求/接收鼠标所在页的内容快照（每帧调用）
+void update_hovered_content(const ImVec2& origin, bool hovered);
+// 取走复制结果并写入剪贴板（每帧调用）
+void update_clipboard_results();
+void show_toast(std::string text);
+[[nodiscard]] std::string toast_text();   // 有效期内返回文案，否则空串
+
+// ---- 全文搜索 ----
+void search_start();                 // 用 g_search_buf 发起检索（回车 / 按钮 / 防抖到点）
+void search_stop();                  // 停止在途检索，**保留**已找到的命中（「停止」按钮）
+void search_clear();                 // 清空检索状态与结果（关文档 / 清空关键字）
+void search_goto(int index);         // 跳到第 index 条命中并高亮
+void search_step_hit(int dir);       // 上一条 / 下一条
+void update_search();                // 每帧：输入防抖 + 取新命中 + 处理跳转请求
+[[nodiscard]] bool search_has_query();
 
 // ============================================================================
 // 绘制层（ui.cpp）
@@ -599,6 +757,10 @@ void draw_status_bar();
 void draw_canvas_area(float height);
 void draw_sidebar(float height, float width);   // width 为动画宽度（px），内容仍按整宽排布
 void draw_canvas_context_menu();
+// 页内叠加层（Phase 8）：搜索命中高亮 / 选区高亮 / 链接悬停高亮。
+// 在画布逐页绘制循环里调用（此时裁剪矩形已是画布区，超出部分自然被裁掉）。
+void draw_page_overlays(ImDrawList* dl, const ImVec2& origin, int page);
+void draw_search_tab();     // 侧栏「搜索」分栏（Phase 8）
 void draw_debug_overlay();
 void draw_jump_popup();
 void draw_password_popup();

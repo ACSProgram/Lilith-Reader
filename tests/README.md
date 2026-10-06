@@ -6,7 +6,7 @@
 ## 用法
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(61) + canvas_test(126) + page_cache_test(32) + reader_state_test(110) + tone_test(113) + 菜单文案宽度 + 主题重置 + 资源断言（字体子集 / 图标帧集）
+powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(71) + canvas_test(126) + page_cache_test(32) + reader_state_test(110) + tone_test(113) + page_map_test(26) + render_search_test(13) + 菜单文案宽度 + 主题重置 + 资源断言（字体子集 / 图标帧集）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Probe   # 额外跑 MuPDF 诊断探针（打印 FZ_META_FORMAT 等）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # 复用已有 samples/
 ```
@@ -19,12 +19,14 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # �
 | 文件 | 作用 |
 |---|---|
 | `make_samples.py` | 合成 31 个常规样本（合法/改名/归档冒充/损坏，含**异构页尺寸** `mixed_size.pdf`、**带两级目录** `outline.pdf`、**文字+红图** `with_image.pdf`、**整页一张图** `scan_only.pdf`、**一块纯黑** `ink_black.pdf`）+ 3 个加密 PDF（需 PyMuPDF：`pip install pymupdf`，未装则跳过加密例） |
-| `doc_test.cpp` | 61 例断言表：合法格式、改名放行、归档冒充拒绝、加密三态、扩展名闸门、**逐页尺寸**（形变防线）、**目录解析**（顺序/层级/页号）、**旋转渲染**（0°/180° 尺寸不变、90° 宽高互换）、**纸张方案配色**（深色背景为深暖灰且保留 alpha、暖色 R>B）、**配色分层**（ADR-067：`with_image.pdf` 深色下照片仍是红的、纸面仍变深；`scan_only.pdf` 整页扫描件整体变深；`ink_black.pdf` 正文（纯黑）映射为浅暖灰、**并与纸面暖度一致**——LUT 两端等斜率） |
+| `doc_test.cpp` | 71 例断言表：合法格式、改名放行、归档冒充拒绝、加密三态、扩展名闸门、**逐页尺寸**（形变防线）、**目录解析**（顺序/层级/页号）、**旋转渲染**（0°/180° 尺寸不变、90° 宽高互换）、**纸张方案配色**（深色背景为深暖灰且保留 alpha、暖色 R>B）、**配色分层**（ADR-067：`with_image.pdf` 深色下照片仍是红的、纸面仍变深；`scan_only.pdf` 整页扫描件整体变深；`ink_black.pdf` 正文（纯黑）映射为浅暖灰、**并与纸面暖度一致**——LUT 两端等斜率）、**文本层**（Phase 8，ADR-069/070：`page_content` 抽到字符与行、码点拼回词、`copy_text` 的**选区端点约定**（字符框中心朝外偏 30%，用中心点会少一个字）、`search_page` 命中 / 大小写不敏感 / 无匹配为空表、**自洽检索**（把抽到的**同一行**前 4 个字符拼成关键字再搜自己 —— PDF/EPUB/FB2 通用，不依赖样本文案） |
 | `canvas_test.cpp` | 126 例断言：fit-width 派生、固定缩放居中、内容尺寸、滚动钳制、以鼠标为锚的缩放定点不变性、命中测试、可见范围、列切换锚定、非均匀页尺寸、缩放钳制、空文档、**翻页游标**（矮页视口不卡住 / 多列按行推进 / 与手动滚动同步）、**页间距随缩放**（ADR-029）、**双页对开**（ADR-038：封面单独居中 / 对开分列 / 按行推进 / `spread=false` 回归守卫 / 切换锚定 / **对开与列数同层级互斥**：切列退出对开、`columns` 值保留） |
 | `page_cache_test.cpp` | 32 例断言：预算钳制（0/下限/上限/SIZE_MAX）、自动重试上限与 `should_render_failed`、**LRU 逐出**（最久未用先出、pinned 保护、同序号按下标定序、恰好达标即停、未驻留页跳过、按字节累计）（Phase 4，ADR-030/031） |
 | `reader_state_test.cpp` | 110 例断言（Phase 5，ADR-034；ADR-062/065 增身份分层与位置列表）：序列化往返（含书签/确定性）、容器语义（find/upsert/erase/rekey）、**坏输入一律安全拒绝**（nullptr/magic/版本不配对/路径超长/位置条数或长度超限/超限/截断）、字段钳制（列/旋转/配色/非法 zoom）、文档键（不存在→0、同路径稳定）、**v3 身份与位置往返**（path_key/page_count/多条位置及其顺序/last_location）、**v1 迁移**（旧 key → path_key，位置留空）、**v2 迁移**（单路径 → 位置列表，空路径不进表）、**分层定位**（指纹命中/relocated/回到记过的位置不再询问/关掉智能匹配/页数不符不继承/adopt 改挂主键并累积位置/primary_key/rekey）、**位置记忆**（去重、最近优先、封顶丢最旧）、**内容指纹**（同一文件稳定、改中段或尾段一字节即变、复制到新路径不变） |
 | `mupdf_probe.cpp` | 诊断工具：打印 MuPDF 对每个样本的原始判定（页数、`FZ_META_FORMAT`），新增格式支持时先用它摸底 |
 | `tone_test.cpp` | 113 例断言（ADR-068，含 `src/app/tone.h`）：**原色零改动**（逐通道相等）、**黄金值**（深色/暖色各 13 个角色色的最终 RGB，改参数即红）、**对比度下限**（正文/次要文字/强调色/控件层次的 WCAG 对比度）、**结构不变量**（换色不改变中性族明暗次序 / 强调族不再偏冷 / 语义色仍是红橙且可区分 / 中性族保亮度 = 原值 × level） |
+| `render_search_test.cpp` | 13 例断言（ADR-069/070/071）：**渲染层检索通道的端到端测试**。检索是跨线程的（UI 投递 → 工作线程增量扫描 → UI 取结果），纯函数单测覆盖不到；而"搜不到东西"这类故障恰恰只可能出在接线处。用例真跑整条链路：`open` → 等 Ready → `start_search` → 轮询 `take_search_hits`。断言：页内容通道拿到字符、取到命中、**跨页扫描**（3 页都命中）、**命中矩形落在未旋转页面 pt 空间内**（防坐标空间串台）、收敛状态（inactive + 扫完 + 计数一致）、无匹配为空表、**换关键字不混入旧查询结果**、`cancel_search` 立即收敛、空关键字不启动、**`stop_search` 保留进度与命中（不清零）**、**在途停止后保持静止**、**`cancel_search` 与 `stop_search` 语义区分**（前者清零、后者保留）。**设备传 `nullptr`**：用例只走文本通道、从不 `set_wanted`，故不建纹理（`Renderer` 构造只保存指针） |
+| `page_map_test.cpp` | 26 例断言（ADR-069，含 `src/app/page_map.h`）：屏幕点 ↔ **未旋转页面 pt** 的折算。四类：**四角对应**（90°/180°/270° 下未旋转页面的四个角各落到屏幕矩形的哪个角 —— 这是最容易写反的一处）、**正逆往返一致**（含页外点，拖动选择依赖它）、**退化输入返回 false**（页尺寸/页矩形为 0，不产生 NaN）、**角度归一化**（负数 / 超 360 / 非 90 倍数）。文本选择、复制、超链接命中、搜索高亮全部建立在这组折算之上，而它的错误是"0° 正常、一旋转就整体偏一格"这类肉眼难判的一类 |
 | `check_theme_reset.py` | 主题重置断言（ADR-068）：`apply_theme_colors` 的两个分支必须先 `StyleColorsLight` / `StyleColorsDark` **整套重置**再逐项覆盖 —— 否则未覆盖的颜色项会带着上一个主题的值活过来（深色勾选框曾因此变成亮奶油色）。跨状态残留这类 bug 在代码里毫无痕迹，只能靠结构性约束挡住 |
 | `check_menu_width.py` | 菜单文案宽度断言（ADR-067）：扫描 `src/app/ui.cpp` 的菜单字面量，显示宽度（CJK=2 列）不得超过 12 列 —— 弹出菜单的宽度由最长项决定，一条超长文案会把整张菜单撑宽。补充说明应改用悬停提示 |
 | `../assets/check_icons.py` | 图标资源断言（Phase 7，ADR-051）：每个 `.ico` 的帧集必须完整（17 帧），且每帧位图的**真实解码尺寸**必须等于目录项声明的尺寸 —— 防"小图塞进大槽位 / 只剩一帧"这类只在特定 DPI 下暴露的错 |
@@ -40,6 +42,14 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # �
 - `reader_state_test.exe` 必须链 `reader_state.ixx.obj` + `reader_state.obj`：接口单元发射
   `ReaderState` 的成员函数（`find`/`upsert`/`erase`），实现单元提供 `encode_state`/`document_key` 等。
   用例含内容指纹断言，故编译时还需 `/reference utils.ifc`（`file_fingerprint` 是内联函数，无需额外链 obj）。
+- `render_search_test.exe` 必须链 `render.ixx.obj` + `render.obj` + `document.ixx.obj` + `document.obj`
+  + `page_cache.ixx.obj` + `utils.ixx.obj`，并额外加 `d3d11.lib`（`render.cpp` 里建纹理用；
+  本用例不实际建，但符号必须能解析）。编译 `render.ixx` 时要 `/reference` 它 import 的
+  `document` / `page_cache` / `utils` 三个 `.ifc`。
+- `page_map_test.cpp` / `tone_test.cpp` 只依赖 C++ 标准库，但都要 `/I<repo>\src\app` 才能找到头；
+  两者都是"把 app 层里可判定的纯函数抽出来单测"（ADR-068/069），不需要额外的 .obj。
+  用例里**不要**写 `for (int r : {0,90,180,270})`：range-for 初始化列表需要 `<initializer_list>`，
+  这两个测试刻意只依赖 `<cmath>`/`<cstdio>`，用显式数组即可。
 - `minimal_pdf` 的对象编号约定是 `Page = 5+2i`、`Contents = 6+2i`（`Kids` 必须用前者）。
   第三轮调试前这里写成 `4+2i`，生成的是**非法 PDF**（靠 MuPDF 修复才打开、各页被修成
   默认 Letter 尺寸），曾掩盖"异构页尺寸形变"这一缺陷 —— 改动该函数时务必保持自洽。

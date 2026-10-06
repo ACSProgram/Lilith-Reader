@@ -169,6 +169,74 @@ private:
     Impl* impl_ = nullptr;
 };
 
+// ---- 页面可交互内容：文本布局 / 嵌入图片 / 链接 ----
+//
+// **坐标空间约定（唯一且贯穿全部接口）**：一律是**未旋转的页面 pt 空间**，即
+// fz_stext_page / fz_load_links 原生所在的坐标系（原点在 MediaBox 左上、y 向下、
+// 单位 = 点）。它与 render_page 的像素输出只差一个 ctm：
+//   pixel = transform(point, scale × rotate(user_rotation)) − pixmap 原点
+// 因此**旋转折算由 app 层做**（0/90/180/270 的归一化坐标换算是纯浮点运算），
+// 本模块不必也不该知道用户当前的旋转角 —— 否则同一份抽取结果无法跨旋转复用。
+//
+// 为什么四边形而不是矩形：旋转/斜排的文字外接框不是轴对齐的，用矩形高亮会错位；
+// fz_stext_char 本来就给 quad，原样带出来即可。
+struct TextQuad {
+    float ulx = 0, uly = 0;   // 左上
+    float urx = 0, ury = 0;   // 右上
+    float llx = 0, lly = 0;   // 左下
+    float lrx = 0, lry = 0;   // 右下
+};
+
+// 单个字符。cp <= 0 的字符（MuPDF 用于标记换行/占位的空字符）已在抽取时滤除。
+struct TextChar {
+    std::uint32_t cp = 0;     // Unicode 码点（UTF-32）
+    TextQuad      quad{};     // 外接四边形（页面 pt）
+    int           line = 0;   // 所属行，PageContent::lines 的下标
+};
+
+// 一行文字的外接框。用途：命中测试时"点在行间空白"要吸附到最近的行。
+struct TextLine {
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+};
+
+// 页面内嵌入图片的外接矩形（来自 stext 的 IMAGE 块）。
+struct PageImageRect {
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+};
+
+// 页面内的超链接热区。内部跳转与外部 URL 用同一结构表达：
+// target_page >= 0 ⇒ 文档内跳转（点击翻到该页）；否则看 uri（外部 URL / 无法解析）。
+struct PageLink {
+    float       x0 = 0, y0 = 0, x1 = 0, y1 = 0;   // 热区（页面 pt）
+    int         target_page = -1;                 // 文档内目标页（0 基）；-1 = 外部或无法解析
+    std::string uri;                              // 原始 URI（UTF-8，可能为空）
+};
+
+// 一页的"可交互内容"快照。三部分一次抽好：UI 侧只做纯浮点命中测试，
+// 不必为每次鼠标移动回工作线程（否则拖动选择会与渲染抢线程、明显卡顿）。
+struct PageContent {
+    std::vector<TextChar>      chars;
+    std::vector<TextLine>      lines;
+    std::vector<PageImageRect> images;
+    std::vector<PageLink>      links;
+};
+
+// 复制图片的结果：RGBA8 行主序（stride = w × 4），已是独立 CPU 缓冲（无 fz 生命周期）。
+struct ImageData {
+    int w = 0, h = 0;
+    std::vector<std::uint8_t> rgba;
+    [[nodiscard]] bool valid() const noexcept { return w > 0 && h > 0 && !rgba.empty(); }
+};
+
+// 一次搜索命中。矩形是命中文字的**外接框**（未旋转页面 pt）；snippet 是命中所在行的
+// 文本（结果列表显示上下文用，已截断）。同一处命中可能跨行 —— 跨行时拆成多条，
+// 这是刻意的：列表里逐条可跳转，比一条含换行的记录更好用。
+struct SearchHit {
+    int         page = -1;
+    float       x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    std::string snippet;
+};
+
 // ---- 文档对象 ----
 //
 // 生命周期：open → （可选 authenticate）→ info / page_size / render_page → close
@@ -212,6 +280,36 @@ public:
                          int max_dimension = 8192,
                          int rotation_deg = 0,
                          PageScheme scheme = PageScheme::Original) noexcept;
+
+    // ---- 文本 / 图片 / 链接（Phase 8）----
+    //
+    // 三者都只在拥有本对象的线程内调用（与 render_page 同一纪律）。
+    // 内部维护**一条** stext 缓存（最近一页）：抽一次文本的代价与渲染一页相当，
+    // 而选择/复制会在同一页上反复触发，故必须缓存；只缓存一条即可 —— 交互始终
+    // 集中在鼠标所在的那一页，跨页时重建一次（毫秒级）可接受，且内存有界。
+
+    // 读取一页的可交互内容。**无文本层的页（纯扫描件）返回 Ok 且 chars 为空**，
+    // 这不是错误 —— 本模块不做 OCR（产品决定），上层据此把"选择文本"置灰。
+    // 返回的坐标全部在未旋转页面 pt 空间（见文件头坐标约定）。
+    DocError page_content(int index, PageContent& out) const noexcept;
+
+    // 取选中范围的纯文本。a = 按下点、b = 当前点（均为未旋转页面 pt）。
+    // 内部走 fz_copy_selection：按**阅读顺序**拼接，自动补词间空格与换行 ——
+    // 自己拼字符会漏掉"两个词之间有间隙"这类只有版式知道的信息（英文尤甚）。
+    // 失败或空选区返回 Ok + 空串（复制空串由上层决定是否写剪贴板）。
+    DocError copy_text(int index, float ax, float ay, float bx, float by,
+                       std::string& out) noexcept;
+
+    // 取包含点 (x,y) 的**嵌入图片**（原始分辨率，RGBA8）。
+    // 该点没有图片时返回 DocError::NotFound（不是错误，是"此处无图"）。
+    DocError image_at(int index, float x, float y, ImageData& out) noexcept;
+
+    // 在**单页**内搜索关键字（UTF-8，大小写不敏感；MuPDF 负责 Unicode 归一）。
+    // out 先清空，随后追加该页的命中（最多 max_hits 条，防止病态文档撑爆内存）。
+    // 无文本层的页（扫描件）返回 Ok + 空表 —— 本模块不做 OCR。
+    // 分页搜索的调度（跨页顺序、取消、进度）在 render 层，本模块只负责"一页"。
+    DocError search_page(int index, std::string_view utf8_needle, int max_hits,
+                         std::vector<SearchHit>& out) noexcept;
 
     // 最近一次失败的原始信息（UTF-8，截断到 1024 字节），调试/日志用。
     [[nodiscard]] std::string_view last_error() const noexcept;

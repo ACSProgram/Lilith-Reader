@@ -33,7 +33,8 @@ constexpr const char* kIconGlyphs =
     "\xEE\x9C\xB4\xEE\x9C\x93\xEE\xA2\x97\xEE\x9E\xAD\xEE\x9C\x91\xEE\x9D\x8B"  // E734 E713 E897 E7AD E711 E74B
     "\xEE\x9C\xAA\xEE\x9C\xAB\xEE\xA0\x8F\xEE\xA3\xBD\xEE\xA0\x8A\xEE\x9E\x90"  // E72A E72B E80F E8FD E80A E790
     "\xEE\xA0\xAD\xEE\xA2\xA5\xEE\xA3\xA5\xEE\x9C\xA1"                            // E82D E8A5 E8E5 E721
-    "\xEE\xA2\xB7\xEE\x9D\x8D";                                                    // E8B7 E74D
+    "\xEE\xA2\xB7\xEE\x9D\x8D"                                                     // E8B7 E74D
+    "\xEE\xA3\x88\xEE\xA2\xB9\xEE\x9C\x9B";                                        // E8C8 E8B9 E71B
 
 namespace {
 
@@ -625,6 +626,116 @@ void toggle_fullscreen() {
         SetWindowPlacement(g_hwnd, &g_prev_placement);
         g_fullscreen = false;
     }
+}
+
+// ---------------- 剪贴板（Phase 8） ----------------
+//
+// 为什么不用 ImGui 的 SetClipboardText：它只能放文本，且依赖后端实现；
+// 图片必须走原生 CF_DIB，两者放一处才好统一处理"剪贴板被别的进程占用"这一失败路径
+// （OpenClipboard 会失败，此时必须如实报错，而不是假装复制成功）。
+
+bool set_clipboard_text(const std::string& utf8) {
+    if (utf8.empty()) return false;
+    // 内部一律 UTF-8；剪贴板面向 Windows 应用，用 CF_UNICODETEXT（UTF-16）。
+    // 直接以 UTF-8 写 CF_TEXT 会让中文变乱码（那走的是 ANSI 代码页）。
+    const std::wstring w = lr::utf8_to_wide(utf8);
+    if (w.empty()) return false;
+
+    const std::size_t bytes = (w.size() + 1) * sizeof(wchar_t);   // 含结尾 '\0'
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (mem == nullptr) return false;
+    if (void* dst = GlobalLock(mem)) {
+        std::memcpy(dst, w.c_str(), bytes);
+        GlobalUnlock(mem);
+    } else {
+        GlobalFree(mem);
+        return false;
+    }
+
+    // 剪贴板是全局独占资源：别的进程正开着时 OpenClipboard 会失败。
+    // 重试几次再放弃 —— 实践中多数占用只有几十毫秒。
+    bool ok = false;
+    for (int attempt = 0; attempt < 5 && !ok; ++attempt) {
+        if (!OpenClipboard(g_hwnd)) {
+            Sleep(10);
+            continue;
+        }
+        ok = EmptyClipboard() != FALSE;
+        if (ok) {
+            // SetClipboardData 成功后所有权移交系统；失败则我们必须自己释放。
+            if (SetClipboardData(CF_UNICODETEXT, mem) != nullptr) {
+                mem = nullptr;
+            } else {
+                ok = false;
+            }
+        }
+        CloseClipboard();
+    }
+    if (mem != nullptr) GlobalFree(mem);
+    return ok;
+}
+
+bool set_clipboard_image_rgba(int w, int h, const std::uint8_t* rgba) {
+    if (w <= 0 || h <= 0 || rgba == nullptr) return false;
+
+    // CF_DIB：BITMAPINFOHEADER + 像素。约定要点：
+    //   · 32bpp BI_RGB，**自下而上**存储（第 0 行是图像最后一行）；
+    //   · 通道顺序是 BGRA，不是 RGBA —— 写错会得到"红蓝互换"的图；
+    //   · alpha 一律写成 255：多数应用把 32bpp BI_RGB 当作"不含 alpha"处理，
+    //     若沿用源图的 0，Word/画图里会整张变黑。
+    const std::size_t pixel_bytes = static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u;
+    const std::size_t total = sizeof(BITMAPINFOHEADER) + pixel_bytes;
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, total);
+    if (mem == nullptr) return false;
+
+    if (void* raw = GlobalLock(mem)) {
+        auto* bi = static_cast<BITMAPINFOHEADER*>(raw);
+        std::memset(bi, 0, sizeof(BITMAPINFOHEADER));
+        bi->biSize = sizeof(BITMAPINFOHEADER);
+        bi->biWidth = w;
+        bi->biHeight = h;          // 正值 = 自下而上
+        bi->biPlanes = 1;
+        bi->biBitCount = 32;
+        bi->biCompression = BI_RGB;
+        bi->biSizeImage = static_cast<DWORD>(pixel_bytes);
+
+        auto* dst = reinterpret_cast<std::uint8_t*>(bi + 1);
+        for (int y = 0; y < h; ++y) {
+            const std::uint8_t* srow =
+                rgba + static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 4u;
+            std::uint8_t* drow =
+                dst + static_cast<std::size_t>(h - 1 - y) * static_cast<std::size_t>(w) * 4u;
+            for (int x = 0; x < w; ++x) {
+                drow[x * 4 + 0] = srow[x * 4 + 2];   // B ← R
+                drow[x * 4 + 1] = srow[x * 4 + 1];   // G
+                drow[x * 4 + 2] = srow[x * 4 + 0];   // R ← B
+                drow[x * 4 + 3] = 255;
+            }
+        }
+        GlobalUnlock(mem);
+    } else {
+        GlobalFree(mem);
+        return false;
+    }
+
+    bool ok = false;
+    for (int attempt = 0; attempt < 5 && !ok; ++attempt) {
+        if (!OpenClipboard(g_hwnd)) {
+            Sleep(10);
+            continue;
+        }
+        ok = EmptyClipboard() != FALSE;
+        if (ok) {
+            if (SetClipboardData(CF_DIB, mem) != nullptr) {
+                mem = nullptr;
+            } else {
+                ok = false;
+            }
+        }
+        CloseClipboard();
+    }
+    if (mem != nullptr) GlobalFree(mem);
+    return ok;
 }
 
 }  // namespace lr::app

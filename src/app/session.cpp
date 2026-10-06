@@ -79,6 +79,13 @@ const CmdDef kCmds[kCmdCount] = {
     { "ToggleDebug",    "界面", "调试浮层",                  false, true,  kb(ImGuiKey_F3),             ImGuiKey_None },
     { "ToggleFullscreen","界面","全屏",                      false, true,  kb(ImGuiKey_F11),            kb(ImGuiKey_Escape) },
     { "OpenFile",       "界面", "打开文档…",                 false, true,  kb(ImGuiKey_O, ImGuiMod_Ctrl), ImGuiKey_None },
+
+    // Phase 8：文本。三条都**非全局**（global=false）—— 它们只在阅读态、且画布不在
+    // 文本输入中时派发（见 handle_canvas_input 的 io.WantTextInput 门）：
+    // 搜索框获得焦点时 Ctrl+C/Ctrl+A 必须归输入框，不能被这里抢走。
+    { "Copy",           "文本", "复制选中文本",              false, false, kb(ImGuiKey_C, ImGuiMod_Ctrl), ImGuiKey_None },
+    { "SelectAll",      "文本", "全选当前页文本",            false, false, kb(ImGuiKey_A, ImGuiMod_Ctrl), ImGuiKey_None },
+    { "OpenSearch",     "文本", "查找",                      false, false, kb(ImGuiKey_F, ImGuiMod_Ctrl), ImGuiKey_None },
 };
 
 void reset_binds_to_default() {
@@ -511,6 +518,25 @@ void reset_doc_state() {
     g_rotation = 0;
     g_scheme = 0;
     g_show_sidebar = false;
+    // Phase 8：文本交互与检索状态必须随文档一起清掉 —— 否则换文档后
+    // 选区/命中仍指向旧文档的页与字符下标（会复制出错内容、或高亮到无关位置）。
+    g_sel = Selection{};
+    g_select_all_pending = false;
+    g_content = lr::PageContent{};
+    g_content_page = -1;
+    g_content_want = -1;
+    g_content_since = -1.0;
+    g_ctx_page = -1;
+    g_ctx_link_valid = false;
+    g_ctx_image_valid = false;
+    g_hover_page = g_hover_link = g_hover_char = -1;
+    g_press_link_valid = false;
+    g_press_on_text = false;
+    g_press_page = -1;
+    g_toast.clear();
+    g_toast_since = -1.0;
+    std::memset(g_search_buf, 0, sizeof g_search_buf);
+    search_clear();
     g_open_password = false;
     g_auth_pending = false;
     std::memset(g_password_buf, 0, sizeof g_password_buf);  // 明文密码整个缓冲清零（ADR-039）
@@ -680,7 +706,12 @@ void submit_password() {
 
 void set_sidebar(bool on, int tab) {
     g_show_sidebar = on;
-    if (on && tab >= 0) g_sidebar_tab = tab;
+    if (on && tab >= 0) {
+        g_sidebar_tab = tab;
+        // ImGui 的 TabBar 自带选中态：只改 g_sidebar_tab 不会真的切过去（Ctrl+F 只开了
+        // 侧栏却停在"目录"就是这条）。下一次绘制时对该分栏带一次 SetSelected 才生效。
+        g_sidebar_tab_want = tab;
+    }
 }
 
 void open_jump_popup() {
@@ -847,10 +878,25 @@ void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered)
         }
     }
 
+    // 文本交互（Phase 8）：**先于平移**处理，因为它要决定"这一串左键归谁"。
+    // 规则（人工确认的交互设计）：指针悬停在可选文本上时光标变成 I 型，
+    // **此时拖拽 = 选择文本**；悬停不到文本时拖拽仍是平移（1:1 跟手，手感不变）。
+    const bool text_took_drag = handle_text_interaction(origin, size, hovered);
+
     // 左键拖拽平移（位移直接取鼠标物理像素增量，不做缩放换算）。
     // **刻意不做平滑**：直接操纵必须 1:1 跟手；同时掐掉滚轮残留的平滑尾巴。
     // 在滚动条上按下/拖动时不进入平移 —— 否则"拖滚动条"变成"拖页面"（实测反馈）。
-    if (hovered && !g_scroll_drag && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
+    if (!text_took_drag && hovered && !g_scroll_drag &&
+        ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
+        g_scroll_pending = 0.0f;
+        g_jump_repin_page = -1;
+        g_canvas.scroll_by(-io.MouseDelta.x, -io.MouseDelta.y);
+    }
+
+    // 中键拖拽平移：**任何位置都可用**（Phase 8）。
+    // 为什么必须有：左键在文字上已被"选择文本"接管，而放大到文字铺满视口时，
+    // 左键处处都是选择 —— 没有这个兜底就无法平移。桌面阅读器的通行做法。
+    if (hovered && !g_scroll_drag && ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f)) {
         g_scroll_pending = 0.0f;
         g_jump_repin_page = -1;
         g_canvas.scroll_by(-io.MouseDelta.x, -io.MouseDelta.y);
@@ -891,6 +937,15 @@ void handle_reading_commands(const ImVec2& size) {
 
     if (cmd_pressed(Cmd::ToggleSidebar))  set_sidebar(!g_show_sidebar, 0);
     if (cmd_pressed(Cmd::ToggleBookmark)) toggle_bookmark_current();
+
+    // 文本（Phase 8）。注意本函数只在"无文本输入"时被调用（见 handle_canvas_input 的门），
+    // 因此搜索框/密码框有焦点时 Ctrl+C / Ctrl+A 不会被这里抢走。
+    if (cmd_pressed(Cmd::Copy))      selection_copy();
+    if (cmd_pressed(Cmd::SelectAll)) selection_select_all();
+    if (cmd_pressed(Cmd::OpenSearch)) {
+        set_sidebar(true, 3);
+        g_search_focus = true;
+    }
 }
 
 // 全局命令：任何状态都可用。由 draw_shell 在「无弹窗/无文本输入/未在捕获按键」时调用
@@ -970,6 +1025,564 @@ void emit_wants() {
         if (i >= 0 && i < n && (i < first || i > last)) wants.push_back({ i, scale });
 
     g_renderer->set_wanted(std::move(wants));
+}
+
+// ============================================================================
+// 文本交互 / 剪贴板 / 全文搜索（Phase 8）
+// ============================================================================
+//
+// 坐标纪律：本段所有函数内部只用"未旋转页面 pt"（page_map.h 的约定）。
+// 屏幕上的一切（命中测试、绘制、链接热区）都先经 page_map 折算，故旋转视图下
+// 没有额外分支 —— 这也是把旋转折算单独抽成纯函数并单测的原因。
+
+namespace {
+
+// 选区端点：偏向字符框的哪一侧（false 左 / true 右），偏移量为框宽的 30%。
+// **不取到边缘本身**：字形的前进宽度与墨迹盒并不重合，边缘点可能被 MuPDF 判给相邻字符，
+// 于是复制范围会莫名多/少一个字。取 30% 处既稳稳落在本字符内，又把范围顶到了外侧。
+float sel_point_x(const lr::TextQuad& q, bool right) {
+    const float cx = (q.ulx + q.urx + q.llx + q.lrx) * 0.25f;
+    const float edge = right ? (q.urx + q.lrx) * 0.5f : (q.ulx + q.llx) * 0.5f;
+    return cx + (edge - cx) * 0.3f;
+}
+float sel_point_y(const lr::TextQuad& q) {
+    return (q.uly + q.ury + q.lly + q.lry) * 0.25f;
+}
+
+// 由当前内容快照重算选区几何（复制端点 + 按行合并的高亮矩形），并**冻结**进 g_sel。
+// 冻结的理由见 app_internal.h 的 Selection 注释。
+void selection_rebuild() {
+    g_sel.rects.clear();
+    g_sel.ax_pt = g_sel.ay_pt = g_sel.bx_pt = g_sel.by_pt = 0.0f;
+    if (!g_sel.active || g_sel.page < 0 || g_sel.page != g_content_page) return;
+    const int cnt = static_cast<int>(g_content.chars.size());
+    if (cnt <= 0 || g_sel.anchor < 0 || g_sel.head < 0) return;
+    if (g_sel.anchor >= cnt || g_sel.head >= cnt) return;
+
+    const int lo = std::min(g_sel.anchor, g_sel.head);
+    const int hi = std::max(g_sel.anchor, g_sel.head);
+
+    g_sel.ax_pt = sel_point_x(g_content.chars[lo].quad, false);
+    g_sel.ay_pt = sel_point_y(g_content.chars[lo].quad);
+    g_sel.bx_pt = sel_point_x(g_content.chars[hi].quad, true);
+    g_sel.by_pt = sel_point_y(g_content.chars[hi].quad);
+
+    // 按行合并：逐字符画四边形会因相邻框重叠而出现"深一块浅一块"，看着像马赛克。
+    // 同一行内取并集，得到"一行一段"的干净色块（与桌面阅读器的观感一致）。
+    int     line = -1;
+    SelRect acc{};
+    for (int i = lo; i <= hi; ++i) {
+        const lr::TextQuad& q = g_content.chars[static_cast<std::size_t>(i)].quad;
+        const int cl = g_content.chars[static_cast<std::size_t>(i)].line;
+        const float x0 = std::min(std::min(q.ulx, q.llx), std::min(q.urx, q.lrx));
+        const float x1 = std::max(std::max(q.ulx, q.llx), std::max(q.urx, q.lrx));
+        const float y0 = std::min(std::min(q.uly, q.ury), std::min(q.lly, q.lry));
+        const float y1 = std::max(std::max(q.uly, q.ury), std::max(q.lly, q.lry));
+        if (cl != line) {
+            if (line >= 0) g_sel.rects.push_back(acc);
+            line = cl;
+            acc = SelRect{ x0, y0, x1, y1 };
+        } else {
+            acc.x0 = std::min(acc.x0, x0);
+            acc.y0 = std::min(acc.y0, y0);
+            acc.x1 = std::max(acc.x1, x1);
+            acc.y1 = std::max(acc.y1, y1);
+        }
+    }
+    if (line >= 0) g_sel.rects.push_back(acc);
+}
+
+// 打开一个链接：内部跳转 → 翻页；外部 URL → 交系统默认浏览器。
+void open_link(const lr::PageLink& link) {
+    if (link.target_page >= 0) {
+        request_jump_scroll(link.target_page, 0.0f);
+        show_toast("跳转到第 " + std::to_string(link.target_page + 1) + " 页");
+        return;
+    }
+    if (link.uri.empty()) return;
+    const std::wstring w = lr::utf8_to_wide(link.uri);
+    if (w.empty()) return;
+    // ShellExecuteW：走宽字符，避免非 ASCII 的 URL 在 ANSI 代码页下被打断。
+    // 返回值 ≤ 32 是"伪句柄"，表示失败（这是 ShellExecute 的老约定）。
+    const HINSTANCE r = ShellExecuteW(g_hwnd, L"open", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(r) <= 32) show_toast("无法打开链接");
+}
+
+}  // namespace
+
+bool page_view_of(const ImVec2& origin, int page, PageView& view, PageGeom& geom) {
+    const int n = g_canvas.page_count();
+    if (page < 0 || page >= n) return false;
+    const lr::PageRect r = g_canvas.page_rect(page);
+    view.x = origin.x + r.x;
+    view.y = origin.y + r.y;
+    view.w = r.w;
+    view.h = r.h;
+    // 未旋转页面尺寸：优先逐页真实尺寸（ADR-022），整表缺失时退回首页尺寸
+    if (static_cast<std::size_t>(page) < g_raw_sizes.size()) {
+        geom.w_pt = g_raw_sizes[static_cast<std::size_t>(page)].w;
+        geom.h_pt = g_raw_sizes[static_cast<std::size_t>(page)].h;
+    } else {
+        geom.w_pt = g_raw_default.w;
+        geom.h_pt = g_raw_default.h;
+    }
+    return view.w > 0.0f && view.h > 0.0f && geom.w_pt > 0.0f && geom.h_pt > 0.0f;
+}
+
+int page_at_screen(const ImVec2& origin, const ImVec2& screen) {
+    const int n = g_canvas.page_count();
+    const int vf = g_canvas.visible_first();
+    const int vl = g_canvas.visible_last();
+    if (vf < 0 || n <= 0) return -1;
+    for (int i = vf; i <= vl && i < n; ++i) {
+        const lr::PageRect r = g_canvas.page_rect(i);
+        const float x0 = origin.x + r.x;
+        const float y0 = origin.y + r.y;
+        if (screen.x >= x0 && screen.x <= x0 + r.w &&
+            screen.y >= y0 && screen.y <= y0 + r.h)
+            return i;
+    }
+    return -1;
+}
+
+namespace {
+
+// 行的"文字高度"：取 bbox 高与宽的较小者。
+// 竖排文字的 bbox 高是**文字长度**，直接拿它当行高会得出荒唐的容差（整页都算命中）。
+float line_text_height(const lr::TextLine& L) {
+    return std::max(std::min(L.y1 - L.y0, L.x1 - L.x0), 1.0f);
+}
+
+}  // namespace
+
+int char_index_at(int page, float x_pt, float y_pt, bool clamp_to_nearest) {
+    if (page != g_content_page) return -1;
+    const int cnt = static_cast<int>(g_content.chars.size());
+    if (cnt <= 0) return -1;
+
+    // 1) 选行。带"行高 1/4"的容差：点在行间空白（行距小于半个字高）仍算落在该行。
+    //    **超出容差就是"此处无文字"** —— 悬停/按下走这条路；拖拽时（clamp）才退回最近行。
+    int   hit_line = -1;
+    int   near_line = -1;
+    float near_d = 0.0f;
+    for (std::size_t i = 0; i < g_content.lines.size(); ++i) {
+        const lr::TextLine& L = g_content.lines[i];
+        const float pad = line_text_height(L) * 0.25f;
+        if (y_pt >= L.y0 - pad && y_pt <= L.y1 + pad) {
+            hit_line = static_cast<int>(i);
+            break;
+        }
+        const float d = std::fabs(y_pt - (L.y0 + L.y1) * 0.5f);
+        if (near_line < 0 || d < near_d) {
+            near_line = static_cast<int>(i);
+            near_d = d;
+        }
+    }
+    const int line = (hit_line >= 0) ? hit_line : (clamp_to_nearest ? near_line : -1);
+    if (line < 0) return -1;
+
+    // 2) 行内选字符：x 落在字符框内即命中；否则取 x 距离最近的一个。
+    //    严格模式下只有"离行内字符不超过半个字高"才算命中 —— 于是拖到行尾之外能吸附到
+    //    最后一个字符（拖拽走 clamp），而**在页边空白上悬停则如实报告"没有文字"**。
+    const float pad_x = line_text_height(g_content.lines[static_cast<std::size_t>(line)]) * 0.5f;
+    int   best = -1;
+    float bd = 0.0f;
+    for (int i = 0; i < cnt; ++i) {
+        const lr::TextChar& c = g_content.chars[static_cast<std::size_t>(i)];
+        if (c.line != line) continue;
+        const lr::TextQuad& q = c.quad;
+        const float x0 = std::min(std::min(q.ulx, q.llx), std::min(q.urx, q.lrx));
+        const float x1 = std::max(std::max(q.ulx, q.llx), std::max(q.urx, q.lrx));
+        if (x_pt >= x0 && x_pt <= x1) return i;
+        const float d = (x_pt < x0) ? (x0 - x_pt) : (x_pt - x1);
+        if (best < 0 || d < bd) {
+            best = i;
+            bd = d;
+        }
+    }
+    if (best < 0) return -1;
+    if (clamp_to_nearest || bd <= pad_x) return best;
+    return -1;
+}
+
+int link_index_at(int page, float x_pt, float y_pt) {
+    if (page != g_content_page) return -1;
+    for (std::size_t i = 0; i < g_content.links.size(); ++i) {
+        const lr::PageLink& l = g_content.links[i];
+        // 热区在未旋转 pt 空间是轴对齐矩形；90° 的整数倍旋转仍把矩形映成矩形，
+        // 故"在未旋转空间做点在矩形内测试"与"在屏幕上测"等价。
+        if (x_pt >= l.x0 && x_pt <= l.x1 && y_pt >= l.y0 && y_pt <= l.y1)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+int image_index_at(int page, float x_pt, float y_pt) {
+    if (page != g_content_page) return -1;
+    for (std::size_t i = 0; i < g_content.images.size(); ++i) {
+        const lr::PageImageRect& r = g_content.images[i];
+        if (x_pt >= r.x0 && x_pt <= r.x1 && y_pt >= r.y0 && y_pt <= r.y1)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+void selection_clear() {
+    g_sel = Selection{};
+    g_select_all_pending = false;
+}
+
+void selection_select_all() {
+    // 全选的是"当前正在读的那一页"。内容快照可能还没到（鼠标不在画布上），
+    // 这时先记一个待办，等快照到达后在 update_hovered_content 里补做。
+    const int page = (g_content_page >= 0) ? g_content_page : g_canvas.current_page();
+    if (page < 0) return;
+    if (page != g_content_page) {
+        g_renderer->request_page_content(page);
+        g_content_want = page;
+        g_select_all_pending = true;
+        return;
+    }
+    const int cnt = static_cast<int>(g_content.chars.size());
+    if (cnt <= 0) {
+        show_toast("本页没有可选择的文本");
+        return;
+    }
+    g_sel = Selection{};
+    g_sel.active = true;
+    g_sel.page = page;
+    g_sel.anchor = 0;
+    g_sel.head = cnt - 1;
+    selection_rebuild();
+}
+
+void selection_copy() {
+    if (!g_sel.active || g_sel.page < 0) {
+        show_toast("没有选中文本");
+        return;
+    }
+    if (g_sel.rects.empty()) return;
+    g_renderer->request_copy_text(g_sel.page, g_sel.ax_pt, g_sel.ay_pt, g_sel.bx_pt, g_sel.by_pt);
+}
+
+void copy_image_at_context() {
+    if (g_ctx_page < 0) {
+        show_toast("此处没有可复制的图片");
+        return;
+    }
+    g_renderer->request_copy_image(g_ctx_page, g_ctx_x_pt, g_ctx_y_pt);
+}
+
+void open_link_at_context() {
+    if (!g_ctx_link_valid) return;
+    open_link(g_ctx_link);
+}
+
+void show_toast(std::string text) {
+    g_toast = std::move(text);
+    g_toast_since = ImGui::GetTime();
+}
+
+std::string toast_text() {
+    if (g_toast.empty() || g_toast_since < 0.0) return {};
+    if (ImGui::GetTime() - g_toast_since > kToastSec) return {};
+    return g_toast;
+}
+
+bool handle_text_interaction(const ImVec2& origin, const ImVec2& size, bool hovered) {
+    (void)size;
+    ImGuiIO& io = ImGui::GetIO();
+    const ImVec2 mp = io.MousePos;
+
+    // ---- 1) 悬停：命中测试 + 光标形状 ----
+    g_hover_page = hovered ? page_at_screen(origin, mp) : -1;
+    g_hover_link = -1;
+    g_hover_char = -1;
+    float hx = 0.0f, hy = 0.0f;
+    if (g_hover_page >= 0 && g_hover_page == g_content_page) {
+        PageView view;
+        PageGeom geom;
+        if (page_view_of(origin, g_hover_page, view, geom) &&
+            screen_to_page_pt(view, geom, g_rotation, mp.x, mp.y, hx, hy)) {
+            g_hover_link = link_index_at(g_hover_page, hx, hy);
+            // 严格命中：页边空白 / 图注之外的地方必须如实报告"没有文字"，
+            // 否则光标会在整页上一直是 I 型（实测反馈）。
+            g_hover_char = char_index_at(g_hover_page, hx, hy, /*clamp_to_nearest=*/false);
+        }
+    }
+    // 链接优先于文本：链接常常叠在文字上，此时"手型"比"I 型"更能说明点下去会发生什么。
+    // 悬停在**滚动条**上时不改光标：滚动条压在画布右缘之上，其下若有文字会误报成
+    // "可选文本"（滚动条本身也不是选择区域）。
+    const bool over_bar = g_scroll_drag || g_scroll_hover;
+    if (hovered && !over_bar && g_hover_link >= 0)
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    else if (hovered && !over_bar && g_hover_char >= 0)
+        ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+
+    // ---- 2) 右键：记下菜单锚点（此刻鼠标还在画布上）----
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        g_ctx_page = g_hover_page;
+        g_ctx_x_pt = hx;
+        g_ctx_y_pt = hy;
+        g_ctx_link_valid = (g_hover_link >= 0);
+        if (g_ctx_link_valid) g_ctx_link = g_content.links[static_cast<std::size_t>(g_hover_link)];
+        // 图片命中测试在这里做一次即可：菜单项要据此置灰，而菜单打开后鼠标就离开画布了。
+        g_ctx_image_valid = (g_ctx_page >= 0 && image_index_at(g_ctx_page, hx, hy) >= 0);
+    }
+
+    // ---- 3) 左键按下 ----
+    if (hovered && !g_scroll_drag && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        g_press_x = mp.x;
+        g_press_y = mp.y;
+        g_press_page = g_hover_page;
+        g_press_link_valid = (g_hover_link >= 0);
+        if (g_press_link_valid) g_press_link = g_content.links[static_cast<std::size_t>(g_hover_link)];
+        g_press_on_text = (g_hover_char >= 0);
+        if (g_press_on_text) {
+            g_sel.active = true;
+            g_sel.page = g_hover_page;
+            g_sel.anchor = g_hover_char;
+            g_sel.head = g_hover_char;
+            g_sel.dragging = true;
+            selection_rebuild();
+        }
+        // 按在非文本处**不立刻**清选区：还要等抬起时区分"单击"与"拖拽平移"。
+        // 若在这里清，用户想平移一下再回来看选区就没了。
+    }
+
+    // ---- 4) 拖动：更新拖动端 ----
+    bool took_drag = false;
+    if (g_sel.dragging && g_press_on_text) {
+        took_drag = true;   // 整段拖拽期间接管左键：平移必须让位
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left) && g_sel.page == g_content_page) {
+            PageView view;
+            PageGeom geom;
+            if (page_view_of(origin, g_sel.page, view, geom)) {
+                float x_pt = 0.0f, y_pt = 0.0f;
+                if (screen_to_page_pt(view, geom, g_rotation, mp.x, mp.y, x_pt, y_pt)) {
+                    // 拖拽用 clamp：拖到行尾之外要吸附到最后一个字符，选区能"到底"。
+                    const int idx = char_index_at(g_sel.page, x_pt, y_pt, /*clamp_to_nearest=*/true);
+                    if (idx >= 0) {
+                        g_sel.head = idx;
+                        selection_rebuild();
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- 5) 抬起：区分单击与拖拽 ----
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        const float dx = mp.x - g_press_x;
+        const float dy = mp.y - g_press_y;
+        const float slop = px(kClickSlopPx);
+        const bool is_click = (dx * dx + dy * dy) <= slop * slop;
+        if (is_click) {
+            if (g_press_link_valid) {
+                open_link(g_press_link);
+            } else if (g_press_on_text) {
+                // 单击文字（未拖动）= 取消选区：与"点一下空白即取消"的桌面习惯一致
+                selection_clear();
+            }
+        }
+        g_sel.dragging = false;
+        g_press_on_text = false;
+        g_press_link_valid = false;
+        g_press_page = -1;
+    }
+    return took_drag;
+}
+
+void update_hovered_content(const ImVec2& origin, bool hovered) {
+    if (g_renderer == nullptr) return;
+
+    // 1) 接收新快照
+    if (g_content_want >= 0) {
+        lr::PageContent pc;
+        if (g_renderer->take_page_content(g_content_want, pc)) {
+            g_content = std::move(pc);
+            g_content_page = g_content_want;
+            g_content_since = -1.0;
+            if (g_select_all_pending) {
+                g_select_all_pending = false;
+                selection_select_all();   // 内容到了，补做全选
+            }
+        }
+    }
+
+    // 2) 决定本帧想要哪一页：鼠标所在页。
+    //    只请求"鼠标所在那一页"而不是全部可见页 —— 抽一次 stext 与渲染一页同价，
+    //    全可见页盲发会在滚动时把工作线程塞满，明显拖慢出图。
+    if (!hovered) {
+        // 鼠标离开画布：清掉"在途请求"标记，回到画布时重新投递。
+        // 不清的话，若那一次请求恰好被丢弃（页损坏等），该页会永远等不到内容。
+        g_content_want = -1;
+        g_content_since = -1.0;
+        return;
+    }
+    const int want = page_at_screen(origin, ImGui::GetIO().MousePos);
+    if (want < 0) return;
+
+    const double now = ImGui::GetTime();
+    if (want == g_content_page) return;   // 已就绪
+    if (want != g_content_want) {
+        g_renderer->request_page_content(want);
+        g_content_want = want;
+        g_content_since = now;
+        return;
+    }
+    // 同一页请求在途：超时（0.6s）未到达则重发一次。抽文本可能因页复杂而慢，
+    // 也可能失败（损坏页），超时重发让"失败"不至于变成"永远没有 I 型光标"。
+    if (g_content_since >= 0.0 && (now - g_content_since) > 0.6) {
+        g_renderer->request_page_content(want);
+        g_content_since = now;
+    }
+}
+
+void update_clipboard_results() {
+    if (g_renderer == nullptr) return;
+
+    std::string text;
+    if (g_renderer->take_copy_text(text)) {
+        if (text.empty()) show_toast("没有可复制的文本");
+        else if (set_clipboard_text(text)) show_toast("已复制文本");
+        else show_toast("复制失败：剪贴板被占用");
+    }
+
+    lr::ImageData img;
+    if (g_renderer->take_copy_image(img)) {
+        if (!img.valid()) {
+            show_toast("此处没有可复制的图片");
+        } else if (set_clipboard_image_rgba(img.w, img.h, img.rgba.data())) {
+            show_toast("已复制图片 " + std::to_string(img.w) + "×" + std::to_string(img.h));
+        } else {
+            show_toast("复制失败：剪贴板被占用");
+        }
+    }
+}
+
+// ---------------- 全文搜索 ----------------
+
+bool search_has_query() { return g_search_buf[0] != '\0'; }
+
+void search_clear() {
+    g_search_hits.clear();
+    g_search_cur = -1;
+    g_search_scanned = 0;
+    g_search_total = 0;
+    g_search_active = false;
+    g_search_truncated = false;
+    g_search_scroll_pending = false;
+    g_search_committed.clear();
+    g_search_pending = false;
+    g_search_edit_at = -1.0;
+    g_search_seen[0] = '\0';
+    if (g_renderer != nullptr) g_renderer->cancel_search();
+}
+
+void search_start() {
+    const std::string needle(g_search_buf);
+    g_search_hits.clear();
+    g_search_cur = -1;
+    g_search_scanned = 0;
+    g_search_truncated = false;
+    g_search_scroll_pending = false;
+    // 已经发起检索：防抖计时作废，否则 0.4s 后会被"自动检索"再发一次同样的查询。
+    g_search_pending = false;
+    g_search_edit_at = -1.0;
+    g_search_committed = needle;
+    if (g_renderer == nullptr) return;
+    if (needle.empty()) {
+        g_search_active = false;
+        g_search_total = 0;
+        g_renderer->cancel_search();
+        // 空关键字**要说话**：否则用户按了回车什么都没发生，只会得出"搜索无效"的结论。
+        show_toast("请输入要查找的关键字");
+        return;
+    }
+    g_renderer->start_search(needle);
+    const lr::SearchStatus st = g_renderer->search_status();
+    g_search_total = st.total;
+    g_search_active = st.active;
+}
+
+void search_stop() {
+    g_search_pending = false;
+    g_search_edit_at = -1.0;
+    if (g_renderer != nullptr) g_renderer->stop_search();   // 收手：保留进度与已找到的命中
+    g_search_active = false;
+    // 已找到的命中**刻意保留**：用户按「停止」是想让长检索收手，不是想丢掉已找到的结果。
+    // 但扫描进度停在原处，所以 UI 不能再写"共 N 处"（那是"已扫完全文"的措辞）——
+    // 由 `g_search_scanned < g_search_total` 区分"扫完"与"中途停下"。
+}
+
+void search_goto(int index) {
+    if (index < 0 || index >= static_cast<int>(g_search_hits.size())) return;
+    g_search_cur = index;
+    g_search_scroll_pending = true;
+}
+
+void search_step_hit(int dir) {
+    const int n = static_cast<int>(g_search_hits.size());
+    if (n <= 0) return;
+    int idx = (g_search_cur < 0) ? (dir >= 0 ? 0 : n - 1) : g_search_cur + dir;
+    if (idx < 0) idx = n - 1;         // 环绕
+    if (idx >= n) idx = 0;
+    search_goto(idx);
+}
+
+void update_search() {
+    if (g_renderer == nullptr) return;
+
+    // ---- 1) 输入防抖：关键字一变就作废旧查询，停手 kSearchDebounceSec 后自动检索 ----
+    // 必须放在"取新命中"之前：本帧若判定用户改了字，就不该再把旧查询的命中并进列表。
+    if (std::strcmp(g_search_buf, g_search_seen) != 0) {
+        std::snprintf(g_search_seen, sizeof g_search_seen, "%s", g_search_buf);
+        g_search_edit_at = ImGui::GetTime();
+        g_search_pending = true;
+        // 立即停掉在途检索：关键字已经变了，旧查询的结果既没意义、又白占工作线程
+        // （它与渲染抢同一个线程，不停会明显拖慢出图）。这就是"改词即取消"。
+        if (g_search_active) {
+            g_renderer->cancel_search();
+            g_search_active = false;
+        }
+        // 旧结果立即清掉：结果列表必须与关键字一致，否则列表里是"别的词"的命中，
+        // 点进去跳到的地方与输入框里的词对不上（用户会当成"搜索不准"）。
+        g_search_hits.clear();
+        g_search_cur = -1;
+        g_search_scanned = 0;
+        g_search_truncated = false;
+        g_search_committed.clear();
+    }
+    if (g_search_pending && ImGui::GetTime() - g_search_edit_at >= kSearchDebounceSec) {
+        if (g_search_buf[0] == '\0') {
+            // 清空关键字 = 收场。**不弹**"请输入要查找的关键字"：用户是在删除，
+            // 不是在搜空词，弹提示只会让人以为操作错了。
+            g_search_pending = false;
+            g_search_edit_at = -1.0;
+            g_search_total = 0;
+        } else {
+            search_start();   // 内部会清空并重新发起，同时把 committed 落定
+        }
+    }
+
+    // ---- 2) 增量取用新命中（渲染层边搜边发布）----
+    const std::size_t before = g_search_hits.size();
+    g_renderer->take_search_hits(g_search_hits);
+    if (g_search_hits.size() > before && g_search_cur < 0)
+        search_goto(0);   // 首批结果到达：自动选中并滚到第一条
+
+    const lr::SearchStatus st = g_renderer->search_status();
+    g_search_active = st.active;
+    g_search_scanned = st.scanned;
+    g_search_total = st.total;
+    g_search_truncated = st.truncated;
+
+    if (g_search_scroll_pending) {
+        g_search_scroll_pending = false;
+        if (g_search_cur >= 0 && g_search_cur < static_cast<int>(g_search_hits.size()))
+            request_jump_scroll(g_search_hits[static_cast<std::size_t>(g_search_cur)].page, 0.0f);
+    }
 }
 
 }  // namespace lr::app

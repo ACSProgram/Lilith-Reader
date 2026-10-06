@@ -18,11 +18,14 @@ module;
 
 #include <mupdf/fitz.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <memory>
 #include <new>
 #include <string>
+#include <string_view>
+#include <vector>
 
 // MSVC 会对 C++（/EHsc）中出现的任何 _setjmp 报 C4611「_setjmp 与 C++ 对象析构的
 // 交互不可移植」，且**与函数内是否真有待析构对象无关**。已用最小样例验证：
@@ -51,6 +54,13 @@ constexpr int kComponents = 4;
 
 // 错误信息缓冲区（POD，可安全跨越 longjmp）
 constexpr std::size_t kErrCap = 1024;
+
+// 单页搜索命中上限：防止"文档里全是 e"这类病态查询把命中表撑到几十万条。
+// 200 条/页 × 数千页仍可能有几十万条，故 render 层另设**全局**上限（见 render.cpp）。
+constexpr int kMaxSearchHitsPerPage = 200;
+
+// 结果列表里的上下文片段上限（字节）。按 UTF-8 边界截断，避免半个汉字。
+constexpr std::size_t kSnippetCap = 160;
 
 // fz_context 的共享所有权句柄。
 //
@@ -790,10 +800,25 @@ struct Document::Impl {
     int          needs_password = 0;
     std::string  last_error;
 
+    // ---- 文本抽取缓存（Phase 8）----
+    // 只缓存**一页**：选择/复制会在同一页上反复触发（每次重建 stext 与渲染一页同价），
+    // 而交互始终集中在鼠标所在的那一页。跨页时重建一次（毫秒级），内存因此有界。
+    // 归属：stext 由本 ctx 创建，必须先于 ctx 释放。
+    fz_stext_page* stext_ = nullptr;
+    int            stext_page_ = -1;
+
     ~Impl() { destroy(); }
+
+    // 丢弃文本抽取缓存（fz_drop_* 不抛异常）
+    void drop_stext() noexcept {
+        if (stext_ != nullptr && ctx != nullptr) fz_drop_stext_page(ctx, stext_);
+        stext_ = nullptr;
+        stext_page_ = -1;
+    }
 
     // 释放 MuPDF 资源。doc 必须先于 ctx 释放。fz_drop_* 不抛异常。
     void destroy() noexcept {
+        drop_stext();
         if (doc && ctx) {
             fz_drop_document(ctx, doc);
             doc = nullptr;
@@ -816,6 +841,124 @@ void set_error(std::string& dest, const char* msg) noexcept {
     std::size_t n = 0;
     while (msg[n] != '\0' && n < kErrCap) ++n;
     dest.assign(msg, n);
+}
+
+// ---- 文本抽取（Phase 8：选择/复制/搜索共用）----
+
+// 取某页的 stext（必要时重建并写入 cache）。
+//
+// 为什么带缓存：建一次 stext 与渲染一页同价（要跑内容流 + 逐字形定位），而选择/复制/
+// 搜索会在同一页上反复触发 —— 不缓存的话每次鼠标移动都要重跑一遍内容流。
+// 为什么只缓存一页：交互始终集中在鼠标所在的那一页；跨页重建一次（毫秒级）可接受，
+// 而缓存多页会让内存随页数增长（stext 含每字符的 quad + 字体引用）。
+//
+// cache / cache_page 由调用方（Document::Impl）持有，本函数只做"取或建"。
+// 失败返回 nullptr 并把原因写进 err_out；此时 cache 保持原样（不破坏已有缓存）。
+fz_stext_page* acquire_stext(fz_context* ctx, fz_document* doc, int index,
+                             fz_stext_page*& cache, int& cache_page,
+                             std::string& err_out) noexcept {
+    if (cache != nullptr && cache_page == index) return cache;
+    if (ctx == nullptr || doc == nullptr || index < 0) return nullptr;
+
+    fz_page*         page = nullptr;
+    fz_stext_page*   st = nullptr;
+    DocError         result = DocError::Ok;
+    char             err[kErrCap] = {};
+    fz_stext_options opts = {};
+    // 必须带 PRESERVE_IMAGES：否则 stext 里没有 IMAGE 块，"复制鼠标下的嵌入图片"
+    // 就无从定位图片对象。代价只是多存几个块头，图片像素并不因此解码。
+    opts.flags = FZ_STEXT_PRESERVE_IMAGES;
+
+    fz_try(ctx) {
+        fz_var(page);
+        fz_var(st);
+        page = fz_load_page(ctx, doc, index);
+        st = fz_new_stext_page_from_page(ctx, page, &opts);
+    }
+    fz_always(ctx) {
+        if (page) fz_drop_page(ctx, page);
+    }
+    fz_catch(ctx) {
+        if (st) { fz_drop_stext_page(ctx, st); st = nullptr; }
+        result = classify(ctx);
+        copy_caught_message(ctx, err, kErrCap);
+    }
+
+    if (result != DocError::Ok || st == nullptr) {
+        set_error(err_out, err);
+        return nullptr;
+    }
+    if (cache != nullptr) fz_drop_stext_page(ctx, cache);
+    cache = st;
+    cache_page = index;
+    return st;
+}
+
+// 解析内部链接的目标页（0 基）。外部 URL 或无法解析返回 -1。
+// 失败**不视为错误**：链接热区仍要显示，只是点击时不跳转（按外部处理）。
+int resolve_link_target(fz_context* ctx, fz_document* doc, const char* uri) noexcept {
+    if (ctx == nullptr || doc == nullptr || uri == nullptr) return -1;
+    int page = -1;
+    fz_try(ctx) {
+        fz_var(page);
+        const fz_link_dest d = fz_resolve_link_dest(ctx, doc, uri);
+        if (d.loc.page >= 0) page = fz_page_number_from_location(ctx, doc, d.loc);
+    }
+    fz_catch(ctx) { page = -1; }
+    return page;
+}
+
+// 取命中所在行的文本，作为结果列表的上下文片段（按 UTF-8 边界截断）。
+// 找不到行 / 复制失败返回空串 —— 结果列表宁可不显示上下文，也不能因此丢命中。
+void line_snippet(fz_context* ctx, fz_stext_page* st, fz_quad q, std::string& out) {
+    out.clear();
+    if (ctx == nullptr || st == nullptr) return;
+
+    // 命中四边形的中心；跨行命中时中心可能落在两行之间，故带"最近行"兜底。
+    const float cx = (q.ul.x + q.ur.x + q.ll.x + q.lr.x) * 0.25f;
+    const float cy = (q.ul.y + q.ur.y + q.ll.y + q.lr.y) * 0.25f;
+
+    fz_rect best{};
+    float   best_d = 0.0f;
+    int     found = 0;
+    for (fz_stext_block* b = st->first_block; b != nullptr; b = b->next) {
+        if (b->type != FZ_STEXT_BLOCK_TEXT) continue;
+        for (fz_stext_line* ln = b->u.t.first_line; ln != nullptr; ln = ln->next) {
+            const fz_rect r = ln->bbox;
+            if (cx >= r.x0 && cx <= r.x1 && cy >= r.y0 && cy <= r.y1) {
+                best = r;
+                found = 1;
+                best_d = 0.0f;
+                break;
+            }
+            const float d = std::fabs(cy - (r.y0 + r.y1) * 0.5f);
+            if (!found || d < best_d) { best = r; best_d = d; found = 1; }
+        }
+        if (found && best_d == 0.0f) break;
+    }
+    if (!found) return;
+
+    char* text = nullptr;
+    fz_try(ctx) {
+        fz_var(text);
+        text = fz_copy_rectangle(ctx, st, best, 0);
+    }
+    fz_catch(ctx) { text = nullptr; }
+    if (text == nullptr) return;
+
+    std::size_t n = 0;
+    while (text[n] != '\0') ++n;
+    out.assign(text, n);
+    fz_free(ctx, text);
+
+    // 折叠换行（行文本本不该有，防御性），再按 UTF-8 边界截断
+    for (char& c : out) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    if (out.size() > kSnippetCap) {
+        std::size_t cut = kSnippetCap;
+        while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0u) == 0x80u) --cut;
+        out.resize(cut);
+        out += "…";
+    }
 }
 
 // 创建并初始化一个 MuPDF 单线程上下文，写入 out（共享句柄持有所有权）。
@@ -1213,6 +1356,286 @@ DocError Document::outline(std::vector<OutlineItem>& out) const noexcept {
     }
     delete[] buf;
 
+    s.last_error.clear();
+    return DocError::Ok;
+}
+
+// ---- 文本 / 图片 / 链接（Phase 8）----
+
+DocError Document::page_content(int index, PageContent& out) const noexcept {
+    out = PageContent{};
+    if (!impl_ || !impl_->doc || !impl_->ctx) return DocError::NotOpen;
+    if (index < 0) return DocError::Internal;
+    Impl& s = *impl_;
+
+    // 1) 文本布局（带缓存）。无文本层的页（扫描件）得到空 stext，不是错误。
+    fz_stext_page* st = acquire_stext(s.ctx, s.doc, index, s.stext_, s.stext_page_, s.last_error);
+    if (st == nullptr) return DocError::Internal;
+
+    // 2) 链接。fz_load_links 的入口是 fz_page 而不是 stext，故需再取一次页
+    //    （fz_load_page 只读页字典、不跑内容流，成本可忽略）。
+    //    链接加载失败**不影响文本**：复制/选择比链接重要，故失败只丢链接。
+    fz_page* page = nullptr;
+    fz_link* links = nullptr;
+    DocError link_result = DocError::Ok;
+    char     err[kErrCap] = {};
+    fz_try(s.ctx) {
+        fz_var(page);
+        fz_var(links);
+        page = fz_load_page(s.ctx, s.doc, index);
+        links = fz_load_links(s.ctx, page);
+    }
+    fz_always(s.ctx) {
+        if (page) fz_drop_page(s.ctx, page);
+    }
+    fz_catch(s.ctx) {
+        links = nullptr;
+        link_result = classify(s.ctx);
+        copy_caught_message(s.ctx, err, kErrCap);
+    }
+
+    // 3) 遍历（fz_try 之外：可安全构造 std::vector/std::string）
+    for (fz_stext_block* b = st->first_block; b != nullptr; b = b->next) {
+        if (b->type == FZ_STEXT_BLOCK_TEXT) {
+            for (fz_stext_line* ln = b->u.t.first_line; ln != nullptr; ln = ln->next) {
+                TextLine tl;
+                tl.x0 = ln->bbox.x0;
+                tl.y0 = ln->bbox.y0;
+                tl.x1 = ln->bbox.x1;
+                tl.y1 = ln->bbox.y1;
+                const int li = static_cast<int>(out.lines.size());
+                out.lines.push_back(tl);
+
+                for (fz_stext_char* c = ln->first_char; c != nullptr; c = c->next) {
+                    if (c->c <= 0) continue;   // MuPDF 用非正码点标记换行/占位
+                    TextChar tc;
+                    tc.cp = static_cast<std::uint32_t>(c->c);
+                    tc.quad.ulx = c->quad.ul.x; tc.quad.uly = c->quad.ul.y;
+                    tc.quad.urx = c->quad.ur.x; tc.quad.ury = c->quad.ur.y;
+                    tc.quad.llx = c->quad.ll.x; tc.quad.lly = c->quad.ll.y;
+                    tc.quad.lrx = c->quad.lr.x; tc.quad.lry = c->quad.lr.y;
+                    tc.line = li;
+                    out.chars.push_back(tc);
+                }
+            }
+        } else if (b->type == FZ_STEXT_BLOCK_IMAGE) {
+            PageImageRect r;
+            r.x0 = b->bbox.x0;
+            r.y0 = b->bbox.y0;
+            r.x1 = b->bbox.x1;
+            r.y1 = b->bbox.y1;
+            out.images.push_back(r);
+        }
+    }
+
+    if (links != nullptr) {
+        for (fz_link* l = links; l != nullptr; l = l->next) {
+            // 退化热区（宽或高为 0）没有可点面积，跳过 —— 否则会命中测试到一个看不见的链接。
+            if (!(l->rect.x1 > l->rect.x0) || !(l->rect.y1 > l->rect.y0)) continue;
+            PageLink pl;
+            pl.x0 = l->rect.x0;
+            pl.y0 = l->rect.y0;
+            pl.x1 = l->rect.x1;
+            pl.y1 = l->rect.y1;
+            if (l->uri != nullptr) {
+                pl.uri.assign(l->uri);
+                pl.target_page = resolve_link_target(s.ctx, s.doc, l->uri);
+            }
+            out.links.push_back(std::move(pl));
+        }
+        fz_drop_link(s.ctx, links);
+    }
+
+    if (link_result != DocError::Ok) set_error(s.last_error, err);
+    else                              s.last_error.clear();
+    return DocError::Ok;
+}
+
+DocError Document::copy_text(int index, float ax, float ay, float bx, float by,
+                             std::string& out) noexcept {
+    out.clear();
+    if (!impl_ || !impl_->doc || !impl_->ctx) return DocError::NotOpen;
+    if (index < 0) return DocError::Internal;
+    Impl& s = *impl_;
+
+    fz_stext_page* st = acquire_stext(s.ctx, s.doc, index, s.stext_, s.stext_page_, s.last_error);
+    if (st == nullptr) return DocError::Internal;
+
+    fz_point a{};   // POD：可安全跨越 longjmp
+    fz_point b{};
+    a.x = ax; a.y = ay;
+    b.x = bx; b.y = by;
+
+    char*    text = nullptr;
+    DocError result = DocError::Ok;
+    char     err[kErrCap] = {};
+    fz_try(s.ctx) {
+        fz_var(text);
+        // crlf = 1：剪贴板面向 Windows 应用（记事本/Word），用 \r\n 更省事。
+        text = fz_copy_selection(s.ctx, st, a, b, 1);
+    }
+    fz_catch(s.ctx) {
+        result = classify(s.ctx);
+        copy_caught_message(s.ctx, err, kErrCap);
+    }
+
+    if (result != DocError::Ok) {
+        set_error(s.last_error, err);
+        return result;
+    }
+    if (text != nullptr) {
+        out.assign(text);
+        fz_free(s.ctx, text);
+    }
+    s.last_error.clear();
+    return DocError::Ok;
+}
+
+DocError Document::image_at(int index, float x, float y, ImageData& out) noexcept {
+    out = ImageData{};
+    if (!impl_ || !impl_->doc || !impl_->ctx) return DocError::NotOpen;
+    if (index < 0) return DocError::Internal;
+    Impl& s = *impl_;
+
+    fz_stext_page* st = acquire_stext(s.ctx, s.doc, index, s.stext_, s.stext_page_, s.last_error);
+    if (st == nullptr) return DocError::Internal;
+
+    // 取**最后**一个命中（块按绘制顺序排列，后画的在上层）。
+    // fz_image 是 stext 借出的指针，寿命同 stext（本函数内有效）。
+    fz_image* img = nullptr;
+    for (fz_stext_block* b = st->first_block; b != nullptr; b = b->next) {
+        if (b->type != FZ_STEXT_BLOCK_IMAGE) continue;
+        if (x >= b->bbox.x0 && x <= b->bbox.x1 && y >= b->bbox.y0 && y <= b->bbox.y1)
+            img = b->u.i.image;
+    }
+    if (img == nullptr) return DocError::NotFound;
+
+    fz_pixmap* src = nullptr;
+    fz_pixmap* conv = nullptr;
+    DocError   result = DocError::Ok;
+    char       err[kErrCap] = {};
+    fz_try(s.ctx) {
+        fz_var(src);
+        fz_var(conv);
+        int iw = 0, ih = 0;
+        // subarea / ctm 传 nullptr：要整张原图、不做子采样
+        src = fz_get_pixmap_from_image(s.ctx, img, nullptr, nullptr, &iw, &ih);
+        // 统一到 RGB（keep_alpha=1 ⇒ 原图带 alpha 时得到 RGBA，否则 RGB）。
+        // 不直接用 src：嵌入图可能是 CMYK / ICC / 灰度 / 单色蒙版，分量数不定，
+        // 后面按 3/4 分量展开即可覆盖，其余交给 MuPDF 的色彩管理。
+        conv = fz_convert_pixmap(s.ctx, src, fz_device_rgb(s.ctx), nullptr, nullptr,
+                                 fz_default_color_params, 1);
+    }
+    fz_always(s.ctx) {
+        if (src) fz_drop_pixmap(s.ctx, src);
+    }
+    fz_catch(s.ctx) {
+        if (conv) { fz_drop_pixmap(s.ctx, conv); conv = nullptr; }
+        result = classify(s.ctx);
+        copy_caught_message(s.ctx, err, kErrCap);
+    }
+
+    if (result != DocError::Ok) {
+        set_error(s.last_error, err);
+        return result;
+    }
+    if (conv == nullptr) {
+        set_error(s.last_error, "image conversion returned null");
+        return DocError::Internal;
+    }
+
+    const int w = fz_pixmap_width(s.ctx, conv);
+    const int h = fz_pixmap_height(s.ctx, conv);
+    const int n = fz_pixmap_components(s.ctx, conv);
+    const int stride = fz_pixmap_stride(s.ctx, conv);
+    const std::uint8_t* px = fz_pixmap_samples(s.ctx, conv);
+    if (w <= 0 || h <= 0 || px == nullptr || n < 3) {
+        fz_drop_pixmap(s.ctx, conv);
+        set_error(s.last_error, "unexpected image pixmap format");
+        return DocError::Internal;
+    }
+
+    // 展开为 RGBA8（fz_try 之外）
+    out.w = w;
+    out.h = h;
+    out.rgba.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u);
+    for (int yy = 0; yy < h; ++yy) {
+        const std::uint8_t* srow = px + static_cast<std::size_t>(yy) * static_cast<std::size_t>(stride);
+        std::uint8_t* drow = out.rgba.data() +
+                             static_cast<std::size_t>(yy) * static_cast<std::size_t>(w) * 4u;
+        for (int xx = 0; xx < w; ++xx) {
+            drow[xx * 4 + 0] = srow[xx * n + 0];
+            drow[xx * 4 + 1] = srow[xx * n + 1];
+            drow[xx * 4 + 2] = srow[xx * n + 2];
+            drow[xx * 4 + 3] = (n >= 4) ? srow[xx * n + 3] : 255;
+        }
+    }
+    fz_drop_pixmap(s.ctx, conv);
+    s.last_error.clear();
+    return DocError::Ok;
+}
+
+DocError Document::search_page(int index, std::string_view utf8_needle, int max_hits,
+                               std::vector<SearchHit>& out) noexcept {
+    out.clear();
+    if (!impl_ || !impl_->doc || !impl_->ctx) return DocError::NotOpen;
+    if (index < 0) return DocError::Internal;
+    if (utf8_needle.empty()) return DocError::Ok;
+    Impl& s = *impl_;
+
+    fz_stext_page* st = acquire_stext(s.ctx, s.doc, index, s.stext_, s.stext_page_, s.last_error);
+    if (st == nullptr) return DocError::Internal;
+
+    if (max_hits <= 0) max_hits = 1;
+    if (max_hits > kMaxSearchHitsPerPage) max_hits = kMaxSearchHitsPerPage;
+
+    // 关键字与命中缓冲都在 fz_try 之外备好（std::string 的 c_str 保证 '\0' 结尾）
+    const std::string needle(utf8_needle);
+    const std::size_t cap = static_cast<std::size_t>(max_hits);
+    fz_quad* quads = new (std::nothrow) fz_quad[cap];
+    int*     marks = new (std::nothrow) int[cap];
+    if (quads == nullptr || marks == nullptr) {
+        delete[] quads;
+        delete[] marks;
+        set_error(s.last_error, "out of memory allocating search buffers");
+        return DocError::Internal;
+    }
+
+    int      n = 0;
+    DocError result = DocError::Ok;
+    char     err[kErrCap] = {};
+    fz_try(s.ctx) {
+        fz_var(n);
+        n = fz_search_stext_page(s.ctx, st, needle.c_str(), marks, quads, max_hits);
+    }
+    fz_catch(s.ctx) {
+        result = classify(s.ctx);
+        copy_caught_message(s.ctx, err, kErrCap);
+    }
+
+    if (result != DocError::Ok) {
+        delete[] quads;
+        delete[] marks;
+        set_error(s.last_error, err);
+        return result;
+    }
+    if (n < 0) n = 0;
+    if (n > max_hits) n = max_hits;
+
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        const fz_quad& q = quads[i];
+        SearchHit h;
+        h.page = index;
+        h.x0 = std::min(std::min(q.ul.x, q.ur.x), std::min(q.ll.x, q.lr.x));
+        h.y0 = std::min(std::min(q.ul.y, q.ur.y), std::min(q.ll.y, q.lr.y));
+        h.x1 = std::max(std::max(q.ul.x, q.ur.x), std::max(q.ll.x, q.lr.x));
+        h.y1 = std::max(std::max(q.ul.y, q.ur.y), std::max(q.ll.y, q.lr.y));
+        line_snippet(s.ctx, st, q, h.snippet);
+        out.push_back(std::move(h));
+    }
+    delete[] quads;
+    delete[] marks;
     s.last_error.clear();
     return DocError::Ok;
 }

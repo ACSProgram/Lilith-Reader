@@ -234,6 +234,70 @@ void draw_page_placeholder(ImDrawList* dl, const ImVec2& pmin, const ImVec2& pma
     }
 }
 
+// ---------------- 页内叠加层：选区 / 搜索命中 / 链接悬停（Phase 8） ----------------
+
+namespace {
+
+// 换掉颜色的 alpha（保留 RGB）
+inline ImU32 with_alpha(ImU32 c, float a) {
+    const float cl = a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
+    return (c & 0x00FFFFFFu) | (static_cast<ImU32>(std::lround(cl * 255.0f)) << 24);
+}
+
+// 把一个"未旋转页面 pt 矩形"画到屏幕上。
+// 90° 的整数倍旋转把轴对齐矩形映成轴对齐矩形，故只需换算**两个对角点**再归一化 ——
+// 不必逐角换算再拼多边形。
+void draw_pt_rect(ImDrawList* dl, const PageView& view, const PageGeom& geom, int rot,
+                  float x0, float y0, float x1, float y1, ImU32 col) {
+    float ax = 0, ay = 0, bx = 0, by = 0;
+    if (!page_pt_to_screen(view, geom, rot, x0, y0, ax, ay)) return;
+    if (!page_pt_to_screen(view, geom, rot, x1, y1, bx, by)) return;
+    dl->AddRectFilled(ImVec2(std::min(ax, bx), std::min(ay, by)),
+                      ImVec2(std::max(ax, bx), std::max(ay, by)), col);
+}
+
+}  // namespace
+
+void draw_page_overlays(ImDrawList* dl, const ImVec2& origin, int page) {
+    PageView view;
+    PageGeom geom;
+    if (!page_view_of(origin, page, view, geom)) return;
+
+    // 1) 搜索命中：先画普通命中，**当前命中最后画**（叠在最上层，颜色也更重），
+    //    否则当前命中会被后画的普通命中盖住一角。
+    const int hn = static_cast<int>(g_search_hits.size());
+    if (hn > 0) {
+        const ImU32 normal = with_alpha(g_pal.accent, kFindAlpha);
+        const ImU32 current = with_alpha(g_pal.accent, 0.55f);
+        for (int i = 0; i < hn; ++i) {
+            if (i == g_search_cur) continue;
+            const lr::SearchHit& h = g_search_hits[static_cast<std::size_t>(i)];
+            if (h.page != page) continue;
+            draw_pt_rect(dl, view, geom, g_rotation, h.x0, h.y0, h.x1, h.y1, normal);
+        }
+        if (g_search_cur >= 0 && g_search_cur < hn) {
+            const lr::SearchHit& h = g_search_hits[static_cast<std::size_t>(g_search_cur)];
+            if (h.page == page)
+                draw_pt_rect(dl, view, geom, g_rotation, h.x0, h.y0, h.x1, h.y1, current);
+        }
+    }
+
+    // 2) 选区
+    if (g_sel.active && g_sel.page == page) {
+        const ImU32 col = with_alpha(g_pal.accent, kSelectAlpha);
+        for (const SelRect& r : g_sel.rects)
+            draw_pt_rect(dl, view, geom, g_rotation, r.x0, r.y0, r.x1, r.y1, col);
+    }
+
+    // 3) 链接悬停：淡色底（点击的落点提示，与手型光标互为印证）
+    if (g_hover_link >= 0 && g_hover_page == page && g_content_page == page &&
+        g_hover_link < static_cast<int>(g_content.links.size())) {
+        const lr::PageLink& l = g_content.links[static_cast<std::size_t>(g_hover_link)];
+        draw_pt_rect(dl, view, geom, g_rotation, l.x0, l.y0, l.x1, l.y1,
+                     with_alpha(g_pal.accent, 0.16f));
+    }
+}
+
 // 画布区：高度由 draw_shell 显式给出（不依赖 ImGui 的相邻项间距，见 draw_shell 注释）
 void draw_canvas_area(float height) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
@@ -295,6 +359,10 @@ void draw_canvas_area(float height) {
             }
         }
     }
+
+    // 页内容快照（文本布局 / 图片矩形 / 链接）：接收上一帧请求的结果，并按鼠标位置发起新请求。
+    // **必须在 handle_canvas_input 之前** —— 文本命中测试与光标形状都依赖它。
+    update_hovered_content(origin, hovered);
 
     // 设置窗口/弹窗打开时画布不再吞键盘（否则方向键会同时翻页与移动焦点）。
     if (!g_open_jump && !g_open_password && !g_show_settings)
@@ -364,6 +432,9 @@ void draw_canvas_area(float height) {
             g_page_fade[static_cast<std::size_t>(i)].alpha = 1.0f;
             draw_page_placeholder(dl, pmin, pmax, s);
         }
+        // 页内叠加层（选区 / 搜索命中 / 链接悬停）。画在**占位框之上**：
+        // 纹理还没到位时选区照样看得见，语义上更一致（选区属于"页"而不是"纹理"）。
+        draw_page_overlays(dl, origin, i);
     }
     dl->PopClipRect();
 
@@ -418,6 +489,18 @@ void draw_status_bar() {
     if (g_scheme == 1) chip("深色");
     else if (g_scheme == 2) chip("暖色");
     if (current_page_has_bookmark()) chip("已加书签");
+
+    // 操作提示（Phase 8）：居中显示"已复制 / 此处没有图片"这类一次性反馈。
+    // 居中而不是挤在左侧：左侧已承载页码与状态 chip，右侧是格式信息，中间正好空着。
+    // 用状态栏而不是弹窗：复制是高频小动作，弹窗会打断阅读。
+    {
+        const std::string toast = toast_text();
+        if (!toast.empty()) {
+            const float tw = ImGui::CalcTextSize(toast.c_str()).x;
+            ImGui::SetCursorPos(ImVec2((ws.x - tw) * 0.5f, ty));
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_pal.accent), "%s", toast.c_str());
+        }
+    }
 
     // 右侧：格式（扩展名与内容不符时把提示也放这里，不挤占顶栏）。
     std::string right;
@@ -501,6 +584,24 @@ void draw_debug_overlay() {
             ImGui::TextDisabled("canvas hover %d  focus %d  text-input %d  r-click down/up %d/%d",
                                 g_canvas_hovered ? 1 : 0, g_canvas_focused ? 1 : 0,
                                 ImGui::GetIO().WantTextInput ? 1 : 0, g_dbg_r_down, g_dbg_r_up);
+            // 文本交互读数（Phase 8）：排查"选不中 / 光标不变 / 复制没反应"时先看这里 ——
+            // hover_char 为 -1 说明内容快照还没到（content 行能看到是哪一页），
+            // 而不是命中测试算错了。
+            ImGui::TextDisabled("hover: page %d link %d char %d", g_hover_page, g_hover_link,
+                                g_hover_char);
+            ImGui::TextDisabled("content: page %d (want %d)  chars %d lines %d links %d img %d",
+                                g_content_page, g_content_want,
+                                static_cast<int>(g_content.chars.size()),
+                                static_cast<int>(g_content.lines.size()),
+                                static_cast<int>(g_content.links.size()),
+                                static_cast<int>(g_content.images.size()));
+            ImGui::TextDisabled("sel: %s page %d anchor %d head %d rects %d",
+                                g_sel.active ? "on" : "off", g_sel.page, g_sel.anchor, g_sel.head,
+                                static_cast<int>(g_sel.rects.size()));
+            ImGui::TextDisabled("find: active %d %d/%d  hits %d  cur %d  trunc %d  pend %d",
+                                g_search_active ? 1 : 0, g_search_scanned, g_search_total,
+                                static_cast<int>(g_search_hits.size()), g_search_cur,
+                                g_search_truncated ? 1 : 0, g_search_pending ? 1 : 0);
         }
         if (g_doc.kind == UiDoc::Kind::Failed && !g_doc.detail_u8.empty())
             ImGui::TextDisabled("last_error: %.120s", g_doc.detail_u8.c_str());
@@ -683,11 +784,122 @@ void draw_sidebar(float height, float width) {
                       ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoScrollbar |
                       ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
+    // 分栏标题栏不贴着窗口上沿：那里是"顶栏自动唤出带"，紧贴着放会让点标题的手感
+    // 变成"在顶栏边缘试探"（实测反馈）。留一点上边距，命中目标就明确了。
+    ImGui::Dummy(ImVec2(0.0f, px(6.0f)));
+
+    // 强制切换请求只在**被绘制的那一帧**消费一次：侧栏是滑入的，请求可能在侧栏还没
+    // 露出来时就发出（Ctrl+F），故标志要留到真正绘制时才清。
+    const int want_tab = g_sidebar_tab_want;
+    g_sidebar_tab_want = -1;
+    auto tab_flags = [want_tab](int i) {
+        return (i == want_tab) ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+    };
     if (ImGui::BeginTabBar("##sidebar_tabs")) {
-        if (ImGui::BeginTabItem("目录")) { g_sidebar_tab = 0; draw_outline_tab(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("书签")) { g_sidebar_tab = 1; draw_bookmarks_tab(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("缩略图")) { g_sidebar_tab = 2; draw_thumbnails_tab(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("目录", nullptr, tab_flags(0))) { g_sidebar_tab = 0; draw_outline_tab(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("书签", nullptr, tab_flags(1))) { g_sidebar_tab = 1; draw_bookmarks_tab(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("缩略图", nullptr, tab_flags(2))) { g_sidebar_tab = 2; draw_thumbnails_tab(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("搜索", nullptr, tab_flags(3))) { g_sidebar_tab = 3; draw_search_tab(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
+    }
+    ImGui::EndChild();
+}
+
+// 侧栏「搜索」分栏（Phase 8）：输入框 + 进度/统计 + 结果列表。
+//
+// 为什么放在侧栏而不是独立窗口：它天然是"列表 + 跳转"的形态，与目录/书签/缩略图同类；
+// 复用侧栏即可继承既有的滑入滑出、宽度与开关（`O` 或 `Ctrl+F`），不必再造一个窗口，
+// 也不会遮挡正文。中文输入由既有的输入法关联切换自动支持（ADR-028/040）。
+void draw_search_tab() {
+    // 输入框：**改字即取消旧查询，停手 kSearchDebounceSec 后自动检索**（防抖）。
+    // 回车与「搜索」按钮是"不等防抖、立刻检索"的快捷路；「停止」让长检索收手。
+    // 为什么必须有「停止」：此前只能"把关键字删掉再按一次搜索"才能中断，是反直觉的操作。
+    if (g_search_focus) {
+        ImGui::SetKeyboardFocusHere();
+        g_search_focus = false;
+    }
+    ImGui::SetNextItemWidth(-1.0f);
+    const bool enter = ImGui::InputTextWithHint("##search", "输入关键字，停手自动搜索",
+                                                g_search_buf, sizeof g_search_buf,
+                                                ImGuiInputTextFlags_EnterReturnsTrue);
+    const float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+    const bool click = ImGui::Button("搜索", ImVec2(bw, 0.0f));
+    ImGui::SameLine();
+    // 「停止」只在"有检索在跑"或"防抖计时中"时可用：其余时候置灰，避免用户误以为点了没反应。
+    ImGui::BeginDisabled(!(g_search_active || g_search_pending));
+    const bool stop = ImGui::Button("停止", ImVec2(bw, 0.0f));
+    ImGui::EndDisabled();
+    if (enter || click) {
+        search_start();
+        g_search_focus = true;   // 保持焦点，方便连续改词
+    }
+    if (stop) search_stop();
+
+    const int n = static_cast<int>(g_search_hits.size());
+    // "扫完"与"中途停下"必须分开说：停下时若也写"共 N 处"，用户会以为全文只有这么多命中。
+    const bool scanned_all = (g_search_scanned >= g_search_total);
+    if (!search_has_query()) {
+        ImGui::TextDisabled("在全文范围内查找文字");
+    } else if (g_search_pending) {
+        ImGui::TextDisabled("待检索…（停手后自动搜索）");
+    } else if (g_search_active) {
+        ImGui::TextDisabled("检索中… %d / %d 页 · 已找到 %d 处",
+                            g_search_scanned, g_search_total, n);
+    } else if (n == 0) {
+        if (scanned_all)
+            ImGui::TextDisabled("没有找到「%s」", g_search_buf);
+        else
+            ImGui::TextDisabled("已停止 · 已扫描 %d / %d 页 · 未找到",
+                                g_search_scanned, g_search_total);
+    } else {
+        if (scanned_all)
+            ImGui::TextDisabled("共 %d 处", n);
+        else
+            ImGui::TextDisabled("已停止 · 已扫描 %d / %d 页 · 已找到 %d 处",
+                                g_search_scanned, g_search_total, n);
+        if (g_search_truncated) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("（已达上限）");
+        }
+    }
+
+    const bool has_hits = (n > 0);
+    ImGui::BeginDisabled(!has_hits);
+    if (ImGui::Button("上一处")) search_step_hit(-1);
+    ImGui::SameLine();
+    if (ImGui::Button("下一处")) search_step_hit(+1);
+    ImGui::EndDisabled();
+    if (has_hits) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d / %d", g_search_cur + 1, n);
+    }
+
+    ImGui::Separator();
+
+    // 结果列表。用 ListClipper 虚拟化：命中可达数千条，不虚拟化会每帧排版全部文本而掉帧。
+    // 每条两行（页码 + 折行的上下文），故 items_height 按两行给 —— Clipper 需要一个
+    // 代表值来估算滚动范围，给成一行会让滚动条偏短。
+    const float list_h = ImGui::GetContentRegionAvail().y;
+    if (list_h <= 1.0f) return;
+    ImGui::BeginChild("##search_list", ImVec2(0, list_h), false);
+    ImGuiListClipper clipper;
+    clipper.Begin(n, ImGui::GetTextLineHeightWithSpacing() * 2.0f);
+    while (clipper.Step()) {
+        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+            const lr::SearchHit& h = g_search_hits[static_cast<std::size_t>(i)];
+            ImGui::PushID(i);
+            char label[64];
+            std::snprintf(label, sizeof label, "第 %d 页", h.page + 1);
+            if (ImGui::Selectable(label, i == g_search_cur)) search_goto(i);
+            if (!h.snippet.empty()) {
+                ImGui::Indent(px(8));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim));
+                ImGui::TextWrapped("%s", h.snippet.c_str());
+                ImGui::PopStyleColor();
+                ImGui::Unindent(px(8));
+            }
+            ImGui::PopID();
+        }
     }
     ImGui::EndChild();
 }
@@ -924,6 +1136,10 @@ void draw_main_menu_contents() {
         draw_zoom_menu_contents(); ImGui::EndMenu();
     }
     ImGui::Separator();
+    if (menu_item_cmd(kIcSearch, "查找…", Cmd::OpenSearch, false, rd)) {
+        set_sidebar(true, 3);
+        g_search_focus = true;
+    }
     if (menu_item_cmd(kIcSettings, "设置…", Cmd::OpenSettings)) g_show_settings = true;
     if (menu_item_cmd(kIcHelp, "按键设置…", Cmd::OpenKeys)) {
         g_show_settings = true;
@@ -940,6 +1156,27 @@ void draw_canvas_context_menu() {
     if (g_open_canvas_ctx) { g_open_canvas_ctx = false; ImGui::OpenPopup("##canvas_ctx"); }
     push_popup_style();
     if (ImGui::BeginPopupContextWindow("##canvas_ctx", ImGuiPopupFlags_MouseButtonRight)) {
+        // ---- 文本 / 图片 / 链接（Phase 8）----
+        // 置灰规则：没有选区 → 「复制」不可用；右键位置不在页面上 → 「复制图片」不可用；
+        // 该位置没有链接 → 链接两项不可用。宁可置灰也不隐藏：菜单长度稳定，用户能找到功能。
+        const bool has_sel = g_sel.active && !g_sel.rects.empty();
+        const bool has_link = g_ctx_link_valid;
+        if (menu_item_cmd(kIcCopy, "复制", Cmd::Copy, false, has_sel,
+                          "复制选中的文本（在文字上拖拽即可选择）"))
+            selection_copy();
+        if (menu_item(kIcImage, "复制图片", nullptr, false, g_ctx_image_valid,
+                      "复制此处的嵌入图片（原始分辨率）"))
+            copy_image_at_context();
+        if (menu_item(kIcLink, "打开链接", nullptr, false, has_link))
+            open_link_at_context();
+        if (menu_item(kIcLink, "复制链接", nullptr, false, has_link && !g_ctx_link.uri.empty())) {
+            if (set_clipboard_text(g_ctx_link.uri)) show_toast("已复制链接地址");
+        }
+        if (menu_item_cmd(kIcSearch, "查找…", Cmd::OpenSearch)) {
+            set_sidebar(true, 3);
+            g_search_focus = true;
+        }
+        ImGui::Separator();
         if (menu_item_cmd(kIcPrev, "上一页", Cmd::PrevRow, false, true, "上一页（对开时按整行推进）"))
             scroll_by_rows(-1);
         if (menu_item_cmd(kIcNext, "下一页", Cmd::NextRow, false, true, "下一页（对开时按整行推进）"))
@@ -984,12 +1221,23 @@ void update_toolbar_visibility() {
     }
     const ImVec2 mp = ImGui::GetIO().MousePos;
     const ImVec2 vp = ImGui::GetMainViewport()->Pos;
-    const bool near_top = (mp.y - vp.y) <= px(kTopBarH + kToolbarRevealBandPx);
+
+    // **侧栏区不参与顶栏的唤起/收起。** 侧栏的分栏标题栏就在窗口最上方，鼠标必然要贴到
+    // 顶端才点得到它；而"贴近顶端即唤出顶栏"会把顶栏滑出来，顶栏一出来整条侧栏（连同
+    // 标题栏）就被推下去 40px —— 正要点的分栏跳走，反而点中刚滑出的顶栏（实测反馈：
+    // "选择的时候容易唤出菜单栏，手感不好"）。故鼠标在侧栏区时**冻结**顶栏状态：
+    // 既不因它而唤起，也不因离开顶端带而收起（后者会让侧栏在光标下又滑回去）。
+    // 顶栏仍可从画布一侧的顶端带唤起（x 在侧栏右侧），或用固定显示/设置窗口。
+    const bool over_sidebar = g_show_sidebar && g_sidebar_w > 1.0f &&
+                              (mp.x - vp.x) < g_sidebar_w;
+    const bool near_top = !over_sidebar &&
+                          (mp.y - vp.y) <= px(kTopBarH + kToolbarRevealBandPx);
     if (near_top || g_show_settings || g_toolbar_pinned) {
         g_toolbar_visible = true;
         g_toolbar_idle_since = -1.0;
         return;
     }
+    if (over_sidebar) return;   // 冻结：不推进"该收起了"的计时
     if (!g_toolbar_visible) return;
     const double now = ImGui::GetTime();
     if (g_toolbar_idle_since < 0.0) {
@@ -1823,7 +2071,9 @@ void draw_settings_keys_tab() {
                             : ("按住 " + mod + " + 滚轮");
             ref("滚轮", "上下滚动");
             ref(wheel_zoom.c_str(), "以鼠标位置为中心缩放（修饰键可改，见上）");
-            ref("左键拖拽", "平移页面");
+            ref("左键拖拽", "在文字上 = 选择文本；在非文字处 = 平移页面");
+            ref("中键拖拽", "平移页面（任何位置都可用）");
+            ref("左键单击", "点链接即打开；点文字处取消选区");
             ref("右键", "打开画布菜单（Shift+F10 / 菜单键同效）");
             ref("拖拽右侧滚动条 / 点轨道", "定位到该处");
             ref("单击「渲染失败」占位", "重试渲染该页");
@@ -1949,6 +2199,8 @@ bool any_dialog_open() {
 void draw_shell() {
     poll_document();
     g_renderer->drain_retired();  // 帧首：释放上一帧退役的纹理
+    update_clipboard_results();   // 帧首：取走复制结果并写剪贴板（Phase 8）
+    update_search();              // 帧首：取走检索的新命中 + 执行待办跳转（Phase 8）
     update_ime_association();     // 输入法关联随文本输入激活状态切换（ADR-028）
     if (g_apply_scale_pending) {  // 界面缩放改动：样式只在帧首换，绝不在一帧中途换
         g_apply_scale_pending = false;

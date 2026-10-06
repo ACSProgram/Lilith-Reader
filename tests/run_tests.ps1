@@ -145,6 +145,22 @@ Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\page_cache.ifc", "/Fo$out\pag
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\page_cache.ifc",
     "/Fo$out\page_cache_test.obj", (Join-Path $tests "page_cache_test.cpp"))) "编译 page_cache_test.cpp"
 
+# Phase 8：渲染层「文本通道 + 全文检索」端到端测试（跨线程，纯函数单测覆盖不到）。
+# 设备传 nullptr：用例只走文本通道，不建纹理，故不需要真的 D3D 设备。
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\document.ifc",
+    "/reference", "$out\page_cache.ifc", "/reference", "$out\utils.ifc",
+    "/ifcOutput$out\render.ifc", "/Fo$out\render.ixx.obj",
+    (Join-Path $src "render\render.ixx"))) "编译 render.ixx"
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\render.ifc",
+    "/reference", "$out\document.ifc", "/reference", "$out\page_cache.ifc",
+    "/reference", "$out\utils.ifc",
+    "/Fo$out\render.obj", (Join-Path $src "render\render.cpp"))) "编译 render.cpp"
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\render.ifc",
+    "/reference", "$out\document.ifc", "/reference", "$out\page_cache.ifc",
+    "/reference", "$out\utils.ifc",
+    "/Fo$out\render_search_test.obj",
+    (Join-Path $tests "render_search_test.cpp"))) "编译 render_search_test.cpp"
+
 # Phase 5：阅读状态持久化（纯序列化 + Win32 文件 I/O），单独编译成 reader_state_test.exe
 Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\reader_state.ifc", "/Fo$out\reader_state.ixx.obj",
     (Join-Path $src "state\reader_state.ixx"))) "编译 reader_state.ixx"
@@ -181,6 +197,13 @@ Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\canvas_test.exe", "$out\canvas_test.obj
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\page_cache_test.exe", "$out\page_cache_test.obj",
     "$out\page_cache.ixx.obj", "/link") + $libdirs) "链接 page_cache_test.exe"
 
+# 渲染层检索测试：链 render 接口单元 + 实现单元 + 它依赖的 document/page_cache/utils，
+# 以及 d3d11（render.cpp 里建纹理用；本用例不实际建，但符号必须能解析）。
+Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\render_search_test.exe", "$out\render_search_test.obj",
+    "$out\render.obj", "$out\render.ixx.obj", "$out\document.obj", "$out\document.ixx.obj",
+    "$out\page_cache.ixx.obj", "$out\utils.ixx.obj",
+    "/link") + $libdirs + $libs + @("d3d11.lib")) "链接 render_search_test.exe"
+
 # 阅读状态测试：链 reader_state 的接口单元与实现单元。
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\reader_state_test.exe", "$out\reader_state_test.obj",
     "$out\reader_state.ixx.obj", "$out\reader_state.obj", "/link") + $libdirs) "链接 reader_state_test.exe"
@@ -188,6 +211,13 @@ Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\reader_state_test.exe", "$out\reader_st
 # 色调测试只用 C++ 标准库。
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\tone_test.exe", "$out\tone_test.obj", "/link") +
     $libdirs) "链接 tone_test.exe"
+
+# 坐标折算（Phase 8）：纯函数、零依赖（只用 <cmath>/<cstdio>），单独编译成 page_map_test.exe。
+# 它与 tone_test 同一性质：app 层里被抽出来的"可判定"部分（旋转折算的角对应与往返一致）。
+Invoke-Cl ($defs + @("/I$(Join-Path $src 'app')") + $incs + @("/c",
+    "/Fo$out\page_map_test.obj", (Join-Path $tests "page_map_test.cpp"))) "编译 page_map_test.cpp"
+Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\page_map_test.exe", "$out\page_map_test.obj", "/link") +
+    $libdirs) "链接 page_map_test.exe"
 
 # ---- 4. 运行测试 ---------------------------------------------------------------
 
@@ -242,6 +272,26 @@ try {
 }
 $toneExit = $LASTEXITCODE
 Write-Host "  tone_test.exe 退出码 = $toneExit"
+
+Step "运行坐标折算测试"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & "$out\page_map_test.exe"
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$pageMapExit = $LASTEXITCODE
+Write-Host "  page_map_test.exe 退出码 = $pageMapExit"
+
+Step "运行渲染层检索测试"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & "$out\render_search_test.exe" $samples
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$renderSearchExit = $LASTEXITCODE
+Write-Host "  render_search_test.exe 退出码 = $renderSearchExit"
 
 if ($Probe) {
     Step "编译并运行 MuPDF 诊断探针"
@@ -304,8 +354,9 @@ Write-Host "  check_theme_reset.py 退出码 = $themeExit"
 
 Step "结束"
 if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $stateExit -eq 0 -and
-    $toneExit -eq 0 -and $fontExit -eq 0 -and $iconExit -eq 0 -and $menuExit -eq 0 -and
-    $themeExit -eq 0) {
+    $toneExit -eq 0 -and $pageMapExit -eq 0 -and $renderSearchExit -eq 0 -and
+    $fontExit -eq 0 -and $iconExit -eq 0 -and
+    $menuExit -eq 0 -and $themeExit -eq 0) {
     Write-Host "全部通过。" -ForegroundColor Green
 } else {
     Write-Host "存在失败用例。" -ForegroundColor Red
@@ -315,6 +366,8 @@ if ($canvasExit -ne 0) { exit $canvasExit }
 if ($cacheExit -ne 0) { exit $cacheExit }
 if ($stateExit -ne 0) { exit $stateExit }
 if ($toneExit -ne 0) { exit $toneExit }
+if ($pageMapExit -ne 0) { exit $pageMapExit }
+if ($renderSearchExit -ne 0) { exit $renderSearchExit }
 if ($fontExit -ne 0) { exit $fontExit }
 if ($iconExit -ne 0) { exit $iconExit }
 if ($menuExit -ne 0) { exit $menuExit }

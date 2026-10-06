@@ -21,8 +21,10 @@
 #define NOMINMAX
 #include <windows.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -646,6 +648,187 @@ void run_scheme_layer_cases(const std::wstring& dir) {
     }
 }
 
+// ---- 文本层：抽取 / 复制 / 搜索（Phase 8，ADR-069）----
+//
+// real.pdf 每页都有一段文字 "page"（见 make_samples.py 的最小 PDF 生成器）。
+// 断言"可程序判定"的部分：page_content 抽到字符与行、码点能拼回词、copy_text 走
+// fz_copy_selection 能还原出词、search_page 命中且大小写不敏感、无匹配返回空表。
+// 不覆盖的部分（高亮位置是否与字形重合、光标形状）留给人工验证清单 12-1~12-9。
+void run_text_cases(const std::wstring& dir) {
+    std::printf("\n-- 文本层：抽取 / 复制 / 搜索（Phase 8）--\n");
+    const std::wstring path = dir + L"\\real.pdf";
+    if (!file_exists(path)) { skip("real.pdf", "文本层"); return; }
+
+    lr::Document doc;
+    if (doc.open(path) != lr::DocError::Ok) { fail("real.pdf", "文本层", "打不开"); return; }
+
+    lr::PageContent pc;
+    if (doc.page_content(0, pc) != lr::DocError::Ok) {
+        fail("real.pdf", "page_content 返回 Ok", "调用失败");
+        return;
+    }
+    if (!pc.chars.empty() && !pc.lines.empty())
+        pass("real.pdf", "page_content：抽到字符与行");
+    else
+        fail("real.pdf", "page_content：抽到字符与行", "chars 或 lines 为空");
+
+    // 码点拼回文本：应含 "page"（这里只取 ASCII，样本正文就是 ASCII）
+    std::string text;
+    for (const lr::TextChar& c : pc.chars)
+        if (c.cp > 0 && c.cp < 128) text.push_back(static_cast<char>(c.cp));
+    if (text.find("page") != std::string::npos)
+        pass("real.pdf", "page_content：码点拼回 page");
+    else
+        fail("real.pdf", "page_content：码点拼回 page", text.c_str());
+
+    // 复制：选区两端按 app 层的约定取（字符框中心再朝外偏 30%，见 session.cpp 的 sel_point_x）。
+    // 刻意**不用**字符框中心：fz_copy_selection 按"点落在字符中线的哪一侧"决定含不含该字符，
+    // 用中心点会把末字判在选区之外（实测得到 "pag"）。这里钉住的正是这条约定。
+    if (!pc.chars.empty()) {
+        auto center_x = [](const lr::TextQuad& q) { return (q.ulx + q.urx + q.llx + q.lrx) * 0.25f; };
+        auto center_y = [](const lr::TextQuad& q) { return (q.uly + q.ury + q.lly + q.lry) * 0.25f; };
+        auto edge_x = [](const lr::TextQuad& q, bool right) {
+            return right ? (q.urx + q.lrx) * 0.5f : (q.ulx + q.llx) * 0.5f;
+        };
+        auto sel_x = [&](const lr::TextQuad& q, bool right) {
+            const float c = center_x(q);
+            return c + (edge_x(q, right) - c) * 0.3f;
+        };
+        const lr::TextQuad& qa = pc.chars.front().quad;
+        const lr::TextQuad& qb = pc.chars.back().quad;
+        std::string copied;
+        const lr::DocError e = doc.copy_text(0, sel_x(qa, false), center_y(qa),
+                                             sel_x(qb, true), center_y(qb), copied);
+        if (e == lr::DocError::Ok && copied.find("page") != std::string::npos)
+            pass("real.pdf", "copy_text：还原出 page");
+        else
+            fail("real.pdf", "copy_text：还原出 page", copied.c_str());
+    }
+
+    std::vector<lr::SearchHit> hits;
+    if (doc.search_page(0, "page", 200, hits) != lr::DocError::Ok)
+        fail("real.pdf", "search_page 返回 Ok", "调用失败");
+    else if (!hits.empty())
+        pass("real.pdf", "search_page：命中 page");
+    else
+        fail("real.pdf", "search_page：命中 page", "0 条命中");
+
+    std::vector<lr::SearchHit> upper;
+    if (doc.search_page(0, "PAGE", 200, upper) != lr::DocError::Ok)
+        fail("real.pdf", "search_page 大小写不敏感", "调用失败");
+    else if (!upper.empty())
+        pass("real.pdf", "search_page：大小写不敏感");
+    else
+        fail("real.pdf", "search_page：大小写不敏感", "0 条命中");
+
+    std::vector<lr::SearchHit> none;
+    if (doc.search_page(0, "zzzz", 200, none) == lr::DocError::Ok && none.empty())
+        pass("real.pdf", "search_page：无匹配返回空表");
+    else
+        fail("real.pdf", "search_page：无匹配返回空表", "结果不符");
+
+    // 自洽断言：把某页抽到的**同一行内**几个非空白字符拼成关键字，再拿它去搜 ——
+    // 任何有文本层的文档都必须"搜得到自己"。这条不依赖样本的具体文案，故 PDF / EPUB /
+    // XPS / FB2 通用（用户读的可能是 EPUB，而"搜不到东西"最怕的就是只有某种格式失效）。
+    //
+    // **必须取同一行**：跨行/跨块的关键字在版式上本就不连续，搜不到是正确行为，
+    // 拿它当断言只会误报（EPUB 样本的"第一章"在 h1、"测试正文。"在 p，就是这种情形）。
+    const wchar_t* const others[] = { L"\\real.pdf", L"\\real.epub", L"\\real.xps", L"\\real.fb2" };
+    for (const wchar_t* rel : others) {
+        const std::wstring p = dir + rel;
+        const char* name = "real.pdf";
+        if (std::wcsstr(rel, L"epub")) name = "real.epub";
+        else if (std::wcsstr(rel, L"xps")) name = "real.xps";
+        else if (std::wcsstr(rel, L"fb2")) name = "real.fb2";
+        if (!file_exists(p)) { skip(name, "自洽检索（样本缺失）"); continue; }
+
+        lr::Document d2;
+        if (d2.open(p) != lr::DocError::Ok) { skip(name, "自洽检索（打不开）"); continue; }
+        lr::DocumentInfo inf2;
+        if (d2.info(inf2) != lr::DocError::Ok || inf2.page_count <= 0) {
+            skip(name, "自洽检索（info 失败）");
+            continue;
+        }
+        // 首页未必有文字（XPS 样本首页只有一个三角形、FB2 的标题页也常是空的），
+        // 故取"前几页里第一个有文本层的页"。
+        const int probe_max = (inf2.page_count < 4) ? inf2.page_count : 4;
+        int   text_page = -1;
+        lr::PageContent c2;
+        for (int pg = 0; pg < probe_max; ++pg) {
+            lr::PageContent tmp;
+            if (d2.page_content(pg, tmp) != lr::DocError::Ok) continue;
+            if (!tmp.chars.empty()) { text_page = pg; c2 = std::move(tmp); break; }
+        }
+        if (text_page < 0) {
+            skip(name, "自洽检索（前几页都没有文本层）");
+            continue;
+        }
+
+        // 找第一个"非空白字符数 ≥ 4"的行，取该行前 4 个非空白字符（UTF-8 编码）
+        int line_use = -1;
+        int count = 0;
+        for (const lr::TextChar& c : c2.chars) {
+            if (line_use < 0) line_use = c.line;
+            if (c.line != line_use) {
+                if (count >= 4) break;
+                line_use = c.line;
+                count = 0;
+            }
+            if (c.cp > 32) ++count;
+        }
+        if (count < 4) { skip(name, "自洽检索（没有足够长的行）"); continue; }
+
+        std::string needle;
+        int taken = 0;
+        for (const lr::TextChar& c : c2.chars) {
+            if (c.line != line_use || c.cp <= 32) continue;
+            const std::uint32_t cp = c.cp;
+            if (cp < 0x80) {
+                needle.push_back(static_cast<char>(cp));
+            } else if (cp < 0x800) {
+                needle.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+                needle.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else if (cp < 0x10000) {
+                needle.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                needle.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                needle.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else {
+                needle.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+                needle.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+                needle.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                needle.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+            if (++taken >= 4) break;
+        }
+        if (taken < 4) { skip(name, "自洽检索（没有足够长的行）"); continue; }
+
+        std::vector<lr::SearchHit> h2;
+        const lr::DocError se = d2.search_page(text_page, needle, 200, h2);
+        if (se == lr::DocError::Ok && !h2.empty()) {
+            pass(name, "自洽检索：抽到的文本搜得到自己");
+        } else {
+            char d2msg[160];
+            std::snprintf(d2msg, sizeof d2msg, "%s（关键字 %s）",
+                          (se == lr::DocError::Ok) ? "0 条命中" : "search_page 失败",
+                          needle.c_str());
+            fail(name, "自洽检索：抽到的文本搜得到自己", d2msg);
+        }
+    }
+
+    // 无文本层样本：scan_only.pdf 应"抽不到字符但不是错误"
+    const std::wstring scan = dir + L"\\scan_only.pdf";
+    if (file_exists(scan)) {
+        lr::Document sd;
+        if (sd.open(scan) == lr::DocError::Ok) {
+            lr::PageContent spc;
+            if (sd.page_content(0, spc) == lr::DocError::Ok && spc.chars.empty())
+                pass("scan_only.pdf", "无文本层：返回 Ok 且字符为空（不做 OCR）");
+            else
+                fail("scan_only.pdf", "无文本层：返回 Ok 且字符为空（不做 OCR）", "结果不符");
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -675,6 +858,7 @@ int main(int argc, char** argv) {
     run_outline_cases(dir);
     run_render_cases(dir);
     run_scheme_layer_cases(dir);
+    run_text_cases(dir);
 
     std::printf("\n=== 结果：%d 通过 / %d 失败 / %d 跳过 ===\n", g_pass, g_fail, g_skip);
     if (g_fail > 0) {
