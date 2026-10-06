@@ -87,6 +87,24 @@ triplet 的独立目录可一并消除，故在 `src/LilithReader.vcxproj` 中�
 `overlay-ports/gumbo/` 是修正上游归档哈希的覆盖端口（[ADR-011](docs/03-决策记录.md)）；
 旧 `vcpkg_installed/` 已删除（一直在 `.gitignore` 里，不影响构建）。
 
+## 安装
+
+发布形态是一个 Inno Setup 安装包（`installer/LilithReader.iss`）：
+
+```
+installer\build_installer.bat        :: 需 Inno Setup 6；先跑过 build.bat
+→ installer\dist\LilithReader-<版本>-setup.exe
+```
+
+- **每用户安装**，装到 `%LOCALAPPDATA%\Programs\Lilith Reader`，**不需要管理员权限**。
+  这是刻意的：程序把 `LilithReader.ini` 与 `reader_state.bin` 写在 exe 同目录（便携），
+  装在 `Program Files` 下普通权限写不进去，设置与阅读进度会静默失效（[ADR-052](docs/03-决策记录.md)）。
+- **文件关联**在向导里勾选（文档格式默认全勾、图片格式默认全不勾），全部写 HKCU；
+  卸载时按记录精确回收。
+- **升级是就地覆盖**：自动沿用上次的安装目录与勾选，阅读数据原样保留（[ADR-053](docs/03-决策记录.md)）。
+- **卸载**时若存在阅读数据，会问一次"保留 / 一并删除"，默认保留；静默卸载一律保留。
+- 安装包里的版本号与 `bin\Release\LilithReader.exe` 的版本资源**编译期强校验**，不一致直接编译失败。
+
 ## 状态
 
 | 阶段 | 状态 |
@@ -98,6 +116,7 @@ triplet 的独立目录可一并消除，故在 `src/LilithReader.vcxproj` 中�
 | Phase 4 渲染调度与纹理管理 | ✅ 完成并人工验证通过（2026-10-06）；余 4-2/4-5 两个资源/构造性项待执行 |
 | Phase 5 阅读功能 | ✅ 完成并人工验证通过（2026-10-06） |
 | Phase 6 美化 | ✅ 完成（2026-10-05 外壳 + 2026-10-06 收尾：动效/字体子集/显式布局/可拖滚动条），6-1~6-6 与重构回归 R-1~R-4 已人工验证通过；收尾项的主观验收待执行 |
+| Phase 7 稳定性加固与发布 | 🚧 进行中（2026-10-06）：发布打包已落地（版本资源 / 图标帧集 / Inno 安装包，ADR-051~053）；崩溃防线、压力测试、静态分析待做 |
 
 各阶段实施细节、调试修复过程与验证记录见 [docs/archive/](docs/archive/README.md)（按 [归档索引](docs/archive/README.md) 查）。
 
@@ -114,7 +133,7 @@ triplet 的独立目录可一并消除，故在 `src/LilithReader.vcxproj` 中�
 - **Windows Defender 误报**：未签名 + 静态 CRT 的小体积 exe 容易被启发式引擎误判。缓解与根治方案：
   1. 本机：把项目 `bin\` 目录加入 Defender 排除项，或从"保护历史"还原被隔离的 exe
   2. 上报误报：https://www.microsoft.com/en-us/wdsi/filesubmission （通常 24~72h 内更新病毒定义）
-  3. 中期：Phase 7 加入版本资源与图标（无版本信息的空壳 exe 更易被命中）
+  3. 已做：加入版本资源、应用图标与文件类型关联图标（无版本信息的空壳 exe 更易被命中）
   4. 根治：购买代码签名证书对发布版签名（自签名无效；EV 证书可获得即时信誉）
 
 ## 纪律

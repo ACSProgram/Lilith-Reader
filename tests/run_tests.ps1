@@ -246,9 +246,22 @@ try {
 $fontExit = $LASTEXITCODE
 Write-Host "  check_font_coverage.py 退出码 = $fontExit"
 
+# 图标资源断言：.ico 的帧集必须完整、每帧尺寸必须名实相符。
+# 这是"图标发糊 + 一圈灰边"那类问题的防线 —— 曾经 .ico 里只剩 16×16 一帧，
+# Explorer 把它放大到 48/256，整套文件图标全糊。
+Step "图标资源断言"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & $Python (Join-Path $repo "assets\check_icons.py")
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$iconExit = $LASTEXITCODE
+Write-Host "  check_icons.py 退出码 = $iconExit"
+
 Step "结束"
 if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $stateExit -eq 0 -and
-    $fontExit -eq 0) {
+    $fontExit -eq 0 -and $iconExit -eq 0) {
     Write-Host "全部通过。" -ForegroundColor Green
 } else {
     Write-Host "存在失败用例。" -ForegroundColor Red
@@ -257,4 +270,5 @@ if ($testExit -ne 0) { exit $testExit }
 if ($canvasExit -ne 0) { exit $canvasExit }
 if ($cacheExit -ne 0) { exit $cacheExit }
 if ($stateExit -ne 0) { exit $stateExit }
-exit $fontExit
+if ($fontExit -ne 0) { exit $fontExit }
+exit $iconExit

@@ -17,6 +17,9 @@ build/
 out/
 bin/
 
+# 安装包构建产物（脚本与图标入库，setup exe 不入库）
+installer/dist/
+
 # 自动化测试的生成物（样本集与中间产物；生成脚本 tests/make_samples.py 入库）
 tests/samples/
 tests/_build/

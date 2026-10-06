@@ -6,7 +6,7 @@
 ## 用法
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(55) + canvas_test(126) + page_cache_test(32) + reader_state_test(43)
+powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(55) + canvas_test(126) + page_cache_test(32) + reader_state_test(43) + 资源断言（字体子集 / 图标帧集）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Probe   # 额外跑 MuPDF 诊断探针（打印 FZ_META_FORMAT 等）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # 复用已有 samples/
 ```
@@ -24,6 +24,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # �
 | `page_cache_test.cpp` | 32 例断言：预算钳制（0/下限/上限/SIZE_MAX）、自动重试上限与 `should_render_failed`、**LRU 逐出**（最久未用先出、pinned 保护、同序号按下标定序、恰好达标即停、未驻留页跳过、按字节累计）（Phase 4，ADR-030/031） |
 | `reader_state_test.cpp` | 43 例断言（Phase 5，ADR-034）：序列化往返（含书签/确定性）、容器语义（find/upsert/erase）、**坏输入一律安全拒绝**（nullptr/magic/版本/超限/截断）、字段钳制（列/旋转/配色/非法 zoom）、文档键（不存在→0、同路径稳定） |
 | `mupdf_probe.cpp` | 诊断工具：打印 MuPDF 对每个样本的原始判定（页数、`FZ_META_FORMAT`），新增格式支持时先用它摸底 |
+| `../assets/check_icons.py` | 图标资源断言（Phase 7，ADR-051）：每个 `.ico` 的帧集必须完整（17 帧），且每帧位图的**真实解码尺寸**必须等于目录项声明的尺寸 —— 防"小图塞进大槽位 / 只剩一帧"这类只在特定 DPI 下暴露的错 |
 | `run_tests.ps1` | 一键编译 + 运行；`cl.exe` 直调，链接配置独立于 `build.bat` 的 vcpkg，MuPDF 升级时需同步其库列表 |
 
 ## 注意
