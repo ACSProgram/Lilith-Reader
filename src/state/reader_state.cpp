@@ -114,7 +114,7 @@ void clamp_record(DocRecord& r) noexcept {
     r.rotation %= 360;
     if (r.rotation < 0) r.rotation += 360;
     r.rotation = (r.rotation / 90) * 90;
-    r.color_mode = r.color_mode < 0 ? 0 : (r.color_mode > 2 ? 2 : r.color_mode);
+    r.scheme = r.scheme < 0 ? 0 : (r.scheme > 2 ? 2 : r.scheme);
     if (!(r.zoom > 0.0f) || r.zoom > 100.0f) r.zoom = 1.0f;
     if (r.page < 0) r.page = 0;
     if (r.page_count < 0) r.page_count = 0;
@@ -157,7 +157,7 @@ bool read_record_v3(Reader& rd, std::uint64_t key, ReaderState& tmp) noexcept {
     r.columns = rd.i32();
     r.rotation = rd.i32();
     const std::uint32_t flags = rd.u32();
-    r.color_mode = rd.i32();
+    r.scheme = rd.i32();
     r.fit_width = (flags & 1u) != 0;
     r.spread = (flags & 2u) != 0;
     if (rd.bad) return false;
@@ -183,7 +183,7 @@ bool read_record_v2(Reader& rd, std::uint64_t key, ReaderState& tmp) noexcept {
     r.columns = rd.i32();
     r.rotation = rd.i32();
     const std::uint32_t flags = rd.u32();
-    r.color_mode = rd.i32();
+    r.scheme = rd.i32();
     r.fit_width = (flags & 1u) != 0;
     r.spread = (flags & 2u) != 0;
     if (rd.bad) return false;
@@ -202,7 +202,7 @@ bool read_record_v1(Reader& rd, std::uint64_t key, ReaderState& tmp) noexcept {
     r.columns = rd.i32();
     r.rotation = rd.i32();
     const std::uint32_t flags = rd.u32();
-    r.color_mode = rd.i32();
+    r.scheme = rd.i32();
     r.fit_width = (flags & 1u) != 0;
     r.spread = (flags & 2u) != 0;
     if (rd.bad) return false;
@@ -388,7 +388,7 @@ std::vector<std::uint8_t> encode_state(const ReaderState& s) {
         if (r.fit_width) flags |= 1u;
         if (r.spread)    flags |= 2u;
         put_u32(b, flags);
-        put_u32(b, static_cast<std::uint32_t>(r.color_mode));
+        put_u32(b, static_cast<std::uint32_t>(r.scheme));
 
         const std::uint32_t bm =
             static_cast<std::uint32_t>(r.bookmarks.size() > kMaxBookmarksPerDoc

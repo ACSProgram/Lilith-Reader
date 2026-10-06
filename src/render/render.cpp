@@ -137,7 +137,7 @@ struct Renderer::Impl {
     // ---- 视图变换（Phase 5）----
     // 全局（文档级）的旋转与配色：渲染每一页时传给 Document::render_page。
     int rotation_ = 0;      // 0/90/180/270
-    int color_mode_ = 0;    // 见 document.ixx 的 ColorMode
+    int scheme_ = 0;        // 见 document.ixx 的 PageScheme
 
     // ---- 缩略图通道（Phase 5）----
     // 与页缓存分开存储、独立字节记账；不参与页缓存 LRU/预算。
@@ -520,7 +520,7 @@ struct Renderer::Impl {
         for (;;) {
             PageBitmap bmp;
             DocError err = doc_engine.render_page(page, scale, bmp, 8192, rotation_,
-                                                  static_cast<ColorMode>(color_mode_));
+                                                  static_cast<PageScheme>(scheme_));
 
             ID3D11ShaderResourceView* srv = nullptr;
             if (err == DocError::Ok &&
@@ -634,7 +634,7 @@ struct Renderer::Impl {
 
         PageBitmap bmp;
         DocError err = doc_engine.render_page(page, scale, bmp, 4096, rotation_,
-                                              static_cast<ColorMode>(color_mode_));
+                                              static_cast<PageScheme>(scheme_));
         ID3D11ShaderResourceView* srv = nullptr;
         if (err == DocError::Ok &&
             !create_page_texture(device, bmp.samples(), bmp.width(), bmp.height(),
@@ -808,19 +808,19 @@ void Renderer::retry_page(int page) {
 
 // ---- 视图变换（Phase 5）----
 
-void Renderer::set_view_transform(int rotation_deg, ColorMode color_mode) {
+void Renderer::set_view_transform(int rotation_deg, PageScheme scheme) {
     if (!impl_) return;
     int rot = rotation_deg % 360;
     if (rot < 0) rot += 360;
     rot = (rot / 90) * 90;
-    const int mode = static_cast<int>(color_mode);
+    const int mode = static_cast<int>(scheme);
     if (mode < 0 || mode > 2) return;  // 非法配色忽略
 
     std::lock_guard lock(impl_->mtx);
-    if (impl_->rotation_ == rot && impl_->color_mode_ == mode) return;
+    if (impl_->rotation_ == rot && impl_->scheme_ == mode) return;
     const bool rot_changed = (impl_->rotation_ != rot);
     impl_->rotation_ = rot;
-    impl_->color_mode_ = mode;
+    impl_->scheme_ = mode;
 
     // 保留本帧请求，作废/标记全部纹理后原样重新投递（触发整篇重渲）。
     const std::vector<RenderWant> keep_wants = impl_->last_wants;

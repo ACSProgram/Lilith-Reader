@@ -59,21 +59,28 @@ enum class DocError : std::int32_t {
 [[nodiscard]] bool format_matches_extension(std::string_view format_utf8,
                                             std::string_view ext_utf8) noexcept;
 
-// ---- 页面配色（Phase 5）----
+// ---- 纸张方案（页面配色，Phase 5；分层渲染见 ADR-067）----
 //
-// 在渲染线程对渲染结果做一次色彩变换（位置决策见 ADR-036；反色端点见 ADR-043）：
-//   Normal  原样；
-//   Invert  反色（暗色背景阅读）——柔化映射：白→#1F1D1B、黑→#D8D4CE（逐通道 LUT），保留 alpha；
-//   EyeCare 护眼（暖色纸张）——RGB 经线性 LUT 映射 黑→#2B2318、白→#F6EEDC。
+// 决策位置见 ADR-036/043；**按内容分层**见 ADR-067。这里只描述对外语义：
+//   Original  原样（不做任何变换，走单遍快路径）；
+//   Dark      「深色」：深暖灰纸面 + 浅暖灰墨迹（柔化暗色映射，白→#1F1D1B、黑→#D7D5D3）；
+//   Warm      「暖色」：米黄纸面 + 深褐墨迹（黑→#2B2318、白→#F6EEDC）。
+//
+// **变换只作用于"纸墨层"（背景/文字/矢量/单色蒙版图），照片与插图原样保留**
+// （按 kImageDim 略降不透明度压暗，见 document.cpp）。这是本模块与「整张位图套一个 LUT」
+// 的关键差别：后者分不清纸墨与照片，会把照片一起变成负片或一起染黄。
+//
 // 为什么不用 fz_invert_pixmap / fz_tint_pixmap：这两者面向 RGB/Gray，对 **RGBA（带 alpha）
 // 的 4 分量 pixmap** 行为不在公开契约里（tint 明确只写 RGB/BGR/Gray）；自实现逐像素变换
 // 只改 RGB、保留 alpha，行为可控且可单测。
 // 之所以放在渲染层而不是 UI 层叠 shader：纹理是 IMMUTABLE 且零拷贝上传，
-// 变换必须发生在像素进入 GPU 之前；且配色变化即触发一次重渲染（缓存整体失效）。
-enum class ColorMode : int {
-    Normal = 0,
-    Invert = 1,
-    EyeCare = 2,
+// 变换必须发生在像素进入 GPU 之前；且纸张方案变化即触发一次重渲染（缓存整体失效）。
+//
+// **枚举数值 0/1/2 是持久化契约**（reader_state.bin 的 scheme 字段），不得重排。
+enum class PageScheme : int {
+    Original = 0,
+    Dark     = 1,
+    Warm     = 2,
 };
 
 // ---- 文档元信息 ----
@@ -198,12 +205,13 @@ public:
     //                  （结果见 PageBitmap::effective_scale()），保证不 OOM。
     //   rotation_deg : 页面旋转（0/90/180/270，顺时针）。90/270 时输出宽高互换；
     //                  max_dimension 按**旋转后**包围盒钳制。
-    //   color_mode   : 页面配色（Normal/Invert/EyeCare），在像素上传前于渲染线程完成。
+    //   scheme       : 纸张方案（Original/Dark/Warm）。变换在像素上传前于渲染线程完成，
+    //                  **只作用于纸墨层**，照片与插图原样保留（ADR-067）。
     // 只在拥有本对象的线程内调用；out 会被先重置。
     DocError render_page(int index, float scale, PageBitmap& out,
                          int max_dimension = 8192,
                          int rotation_deg = 0,
-                         ColorMode color_mode = ColorMode::Normal) noexcept;
+                         PageScheme scheme = PageScheme::Original) noexcept;
 
     // 最近一次失败的原始信息（UTF-8，截断到 1024 字节），调试/日志用。
     [[nodiscard]] std::string_view last_error() const noexcept;

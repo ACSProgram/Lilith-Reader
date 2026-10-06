@@ -77,12 +77,12 @@ lr::ReaderState make_state() {
     lr::ReaderState s;
     lr::DocRecord& a = s.upsert(0x1122334455667788ull);
     a.page = 42; a.zoom = 1.75f; a.columns = 2; a.rotation = 90;
-    a.fit_width = false; a.spread = true; a.color_mode = 2;
+    a.fit_width = false; a.spread = true; a.scheme = 2;
     a.bookmarks.push_back(lr::Bookmark{ 3, "start" });
     a.bookmarks.push_back(lr::Bookmark{ 100, "" });
     lr::DocRecord& b = s.upsert(0xdeadbeefcafebabeull);
     b.page = 0; b.zoom = 1.0f; b.columns = 4; b.rotation = 270;
-    b.fit_width = true; b.spread = false; b.color_mode = 1;
+    b.fit_width = true; b.spread = false; b.scheme = 1;
     return s;
 }
 
@@ -105,7 +105,7 @@ void test_round_trip() {
         check(a->rotation == 90, "A.rotation");
         check(a->fit_width == false, "A.fit_width");
         check(a->spread == true, "A.spread");
-        check(a->color_mode == 2, "A.color_mode");
+        check(a->scheme == 2, "A.scheme");
         check(a->bookmarks.size() == 2, "A 书签数 = 2");
         if (a->bookmarks.size() == 2) {
             check(a->bookmarks[0].page == 3 && a->bookmarks[0].label == "start", "书签 0 内容");
@@ -113,7 +113,7 @@ void test_round_trip() {
         }
     }
     const lr::DocRecord* b = out.find(0xdeadbeefcafebabeull);
-    check(b != nullptr && b->rotation == 270 && b->color_mode == 1, "文档 B 字段");
+    check(b != nullptr && b->rotation == 270 && b->scheme == 1, "文档 B 字段");
 
     // 往返二次编码应逐字节一致（确定性）
     const std::vector<std::uint8_t> bytes2 = lr::encode_state(out);
@@ -209,7 +209,7 @@ void test_bad_input() {
     put_u32(bm_over, 1);           // columns
     put_u32(bm_over, 0);           // rotation
     put_u32(bm_over, 0);           // flags
-    put_u32(bm_over, 0);           // color_mode
+    put_u32(bm_over, 0);           // scheme
     put_u32(bm_over, lr::kMaxBookmarksPerDoc + 1);  // 书签数超限
     check(!lr::decode_state(bm_over.data(), bm_over.size(), out), "书签数超上限拒绝");
 }
@@ -224,7 +224,7 @@ void test_field_clamping() {
     put_u32(b, 99);             // columns 越界 → 钳到 4
     put_u32(b, 450);            // rotation 450 → 归一到 90
     put_u32(b, 0);              // flags
-    put_u32(b, 77);             // color_mode 越界 → 钳到 2
+    put_u32(b, 77);             // scheme 越界 → 钳到 2
     put_u32(b, 0);              // 书签数 0
 
     lr::ReaderState out;
@@ -234,7 +234,7 @@ void test_field_clamping() {
     if (r) {
         check(r->columns == 4, "columns 钳到 4");
         check(r->rotation == 90, "rotation 450 归一到 90");
-        check(r->color_mode == 2, "color_mode 钳到 2");
+        check(r->scheme == 2, "scheme 钳到 2");
         check_near(r->zoom, 1.0f, "非法 zoom 回落到 1.0");
     }
 }
@@ -293,7 +293,7 @@ void test_v1_migration() {
     put_u32(b, 1);                // columns
     put_u32(b, 0);                // rotation
     put_u32(b, 0);                // flags
-    put_u32(b, 0);                // color_mode
+    put_u32(b, 0);                // scheme
     put_u32(b, 0);                // 书签数
 
     lr::ReaderState out;
@@ -322,7 +322,7 @@ void test_v2_migration() {
     put_u32(b, 1);                // columns
     put_u32(b, 0);                // rotation
     put_u32(b, 1);                // flags: fit_width
-    put_u32(b, 0);                // color_mode
+    put_u32(b, 0);                // scheme
     put_u32(b, 0);                // 书签数
 
     lr::ReaderState out;

@@ -18,6 +18,7 @@ module;
 
 #include <mupdf/fitz.h>
 
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -147,18 +148,22 @@ float clamp_scale(fz_rect bounds, float scale, int max_dimension) noexcept {
     return s;
 }
 
-// ---- 页面配色变换（Phase 5）----
+// ---- 页面配色（Phase 5；按内容分层见 ADR-067）----
+//
+// 配色变换 = 一张逐通道 LUT，**只作用于"纸墨层"**（背景/文字/矢量/单色蒙版图），
+// 照片与插图由分流设备留在另一层、原样叠回（见下面的 SplitDevice）。
+//
+//   mode 1（深色）：**柔化**的暗色映射，而非纯黑底白字（纯反色刺眼）：
+//                   白 → 深暖灰 #1F1D1B，黑 → 浅暖灰 #D7D5D3（= 纸色逐通道 + 184），
+//                   中间调线性过渡；逐通道 LUT，等价于"先反相再把对比度压到 [暗,亮] 区间"。
+//                   两端点**必须等斜率**，否则"越亮的那一端越暖"（见下面 kLight 处的说明）。
+//   mode 2（暖色）：RGB 经 LUT 线性映射 黑→#2B2318、白→#F6EEDC（暖色纸张）
 //
 // 为什么不用 fz_invert_pixmap / fz_tint_pixmap：这两者面向 RGB/Gray，对 **RGBA（带 alpha）
 // 的 4 分量 pixmap** 的行为不在公开契约里（tint 明确只写 RGB/BGR/Gray）。本函数只处理
 // 已知的 RGBA8（n==4），逐像素改 RGB、**保留 alpha**，行为完全可控且可单测。
 // 只做 POD 运算、不构造 C++ 对象，故可安全放在 fz_try 内调用。
-//
-//   mode 1（反色）：**柔化**的暗色映射，而非纯黑底白字（纯反色刺眼）：
-//                   白 → 深暖灰 #1F1D1B，黑 → 浅暖灰 #D8D4CE，中间调线性过渡；
-//                   逐通道 LUT，等价于"先反相再把对比度压到 [暗,亮] 区间"。
-//   mode 2（护眼）：RGB 经 LUT 线性映射 黑→#2B2318、白→#F6EEDC（暖色纸张）
-void apply_color_transform(fz_context* ctx, fz_pixmap* pix, int mode) noexcept {
+void apply_scheme_lut(fz_context* ctx, fz_pixmap* pix, int mode) noexcept {
     if (pix == nullptr || mode == 0) return;
     if (fz_pixmap_components(ctx, pix) != kComponents) return;  // 只处理 RGBA8
     const int w = fz_pixmap_width(ctx, pix);
@@ -168,8 +173,12 @@ void apply_color_transform(fz_context* ctx, fz_pixmap* pix, int mode) noexcept {
     if (p == nullptr || w <= 0 || h <= 0 || stride <= 0) return;
 
     if (mode == 1) {
+        // 两个端点必须让**逐通道斜率相同**（kLight = kDark + 184），否则"越亮的那一端越暖"：
+        // 原端点 #D8D4CE 的 r−b 差是 10，而纸面 #1F1D1B 只有 4 —— 正文比纸面暖 2.5 倍，
+        // 深色下正文于是发黄（与 ADR-068"亮、面积小、对比强的元素，一点色相就非常显眼"同一条规律）。
+        // 等斜率后，整个映射等价于"按亮度一个标量 + 一个**恒定**暖偏"：两端与中间调暖度一致。
         constexpr unsigned char kDark[3]  = { 0x1F, 0x1D, 0x1B };  // 白 → 深暖灰
-        constexpr unsigned char kLight[3] = { 0xD8, 0xD4, 0xCE };  // 黑 → 浅暖灰
+        constexpr unsigned char kLight[3] = { 0xD7, 0xD5, 0xD3 };  // 黑 → 浅暖灰（= kDark + 184）
         unsigned char lut[3][256];
         for (int c = 0; c < 3; ++c)
             for (int v = 0; v < 256; ++v)
@@ -202,6 +211,306 @@ void apply_color_transform(fz_context* ctx, fz_pixmap* pix, int mode) noexcept {
             }
         }
     }
+}
+
+// ---- 内容分流设备（ADR-067）----
+//
+// 页面绘制是"把页对象喂给一个 fz_device"（fz_run_page）。这里在页面与真正的 draw device
+// 之间夹一个**转发设备**，按"这一笔是不是照片/插图"决定本层放不放行：
+//
+//   纸墨层（kSplitInk）  ：放行一切，**拦下 fill_image**（照片位置留白底）；
+//   图像层（kSplitImage）：只放行 fill_image，并以 dim 降 alpha 压暗后叠回。
+//
+// 于是纸墨与照片分两遍绘到**同一张 pixmap**：先纸墨、套配色 LUT、再把照片叠回去 ——
+// 照片因此不参与配色变换。这解决了"整张位图套一个 LUT"分不清纸墨与照片、
+// 把照片一起变成负片（深色）或一起染黄（暖色）的根因。
+//
+// 为什么自己写转发函数：MuPDF 没有内置的"过滤设备"。fz_device 的回调表虽是公开结构，
+// 但**派生设备的状态就存在基础结构之后**（回调里把 dev 直接 cast 成自己的派生类型），
+// 所以"拷贝一份回调表"会读到越界内存；只能逐个显式转发。每个转发函数只做两件事：
+// 判断本层是否放行、放行就调对应的公开 fz_* 包装（包装内部对 NULL 回调有保护，
+// 故 inner 未实现的调用自然成为空操作）。
+//
+// 分类规则（唯一需要拍板的一条）：只有 **fill_image（真正的位图绘制）** 算图像层；
+// **fill_image_mask（单色蒙版图，如 logo/图标）算墨迹** —— 它画出来的是"墨色形状"，
+// 深色模式下必须跟着变浅，否则黑白 logo 会是一块白。
+// 只裁剪不涂色的调用（clip_* / pop_clip / begin_mask / end_mask）与容器类调用
+// （group / tile / layer / structure）**两层都转发**，保证两层看到同一套裁剪与容器状态。
+// 蒙版内容（begin_mask 与 end_mask 之间）两层都放行：它不进画面、只是各自栅格化一份，
+// 若只放行一层，另一层的软蒙版会是空的、被它蒙住的照片会整块消失。
+enum { kSplitInk = 0, kSplitImage = 1 };
+
+// 图像层压暗：照片以 (1 - dim) 的比例与纸面混合，避免暗环境里照片"发光"。
+// 纸墨层不用它（纸墨是要被 LUT 整体重映射的）；整页扫描件也不用（见下面 scanned 分支）。
+constexpr float kImageDim = 0.88f;
+
+// 判定"整页扫描件"的两个阈值（两个条件同时成立才算，见 render_page）：
+//   kScanCoverageFloor：图像覆盖面积 / 页面面积 的下限 —— 少于此比例说明页面还有别的版面。
+//   kPaperBlankFloor  ：纸墨层墨迹覆盖率的上限 —— 高于它说明页面上有真正的文字/矢量，
+//                       那种情况（如"整页底图 + 正文"的杂志封面）应当只变换文字、保留底图。
+// 两个阈值都是抽样/几何估算，不追求精确；目的是把"扫描书"与"有插图的正文页"分开。
+constexpr double kScanCoverageFloor = 0.55;
+constexpr double kPaperBlankFloor = 0.005;
+
+struct SplitDevice {
+    fz_device  base;    // 必须是首成员：回调里按派生类型读回本结构
+    fz_device* inner;   // 下游真正的 draw device
+    int        pass;    // kSplitInk / kSplitImage
+    int        mask_depth;  // >0 表示正在 begin_mask/end_mask 之间（此区间两层都放行）
+    float      dim;     // 图像层的不透明度系数
+    int        images;  // 本层放行过的图像数（调用方据此判断页面是否只有图像）
+    float      image_area;  // 放行过的图像覆盖面积之和（像素²）：单位方格经 ctm 后的 |det|
+};
+
+// 本层是否放行该调用。is_image 只在 fill_image 上为真。
+inline bool split_allow(const SplitDevice* d, bool is_image) noexcept {
+    if (d->mask_depth > 0) return true;
+    return d->pass == kSplitImage ? is_image : !is_image;
+}
+
+inline SplitDevice* as_split(fz_device* dev) noexcept {
+    return reinterpret_cast<SplitDevice*>(dev);
+}
+
+// 关闭与释放。两条纪律，都是踩过坑才写下的：
+//   1. **不碰 inner**：inner 由调用方显式 close/drop，避免双重关闭与双重释放；
+//   2. **不释放自己**：设备结构由 `fz_drop_device` 统一回收（它在调用 drop_device 之后
+//      自己 fz_free 掉整块内存）。这里再 fz_free 一次就是双重释放，实测症状是
+//      0xC0000374 堆损坏 —— 而且**只在 drop 那一刻炸**，与页面内容无关，极易误判成渲染 bug。
+void split_close(fz_context*, fz_device*) noexcept {}
+
+void split_drop(fz_context*, fz_device*) noexcept {}
+
+void split_fill_path(fz_context* ctx, fz_device* dev, const fz_path* path, int even_odd,
+                     fz_matrix ctm, fz_colorspace* cs, const float* color, float alpha,
+                     fz_color_params cp) {
+    SplitDevice* d = as_split(dev);
+    if (split_allow(d, false)) fz_fill_path(ctx, d->inner, path, even_odd, ctm, cs, color, alpha, cp);
+}
+
+void split_stroke_path(fz_context* ctx, fz_device* dev, const fz_path* path,
+                       const fz_stroke_state* stroke, fz_matrix ctm, fz_colorspace* cs,
+                       const float* color, float alpha, fz_color_params cp) {
+    SplitDevice* d = as_split(dev);
+    if (split_allow(d, false)) fz_stroke_path(ctx, d->inner, path, stroke, ctm, cs, color, alpha, cp);
+}
+
+void split_clip_path(fz_context* ctx, fz_device* dev, const fz_path* path, int even_odd,
+                     fz_matrix ctm, fz_rect scissor) {
+    SplitDevice* d = as_split(dev);
+    fz_clip_path(ctx, d->inner, path, even_odd, ctm, scissor);
+}
+
+void split_clip_stroke_path(fz_context* ctx, fz_device* dev, const fz_path* path,
+                            const fz_stroke_state* stroke, fz_matrix ctm, fz_rect scissor) {
+    SplitDevice* d = as_split(dev);
+    fz_clip_stroke_path(ctx, d->inner, path, stroke, ctm, scissor);
+}
+
+void split_fill_text(fz_context* ctx, fz_device* dev, const fz_text* text, fz_matrix ctm,
+                     fz_colorspace* cs, const float* color, float alpha, fz_color_params cp) {
+    SplitDevice* d = as_split(dev);
+    if (split_allow(d, false)) fz_fill_text(ctx, d->inner, text, ctm, cs, color, alpha, cp);
+}
+
+void split_stroke_text(fz_context* ctx, fz_device* dev, const fz_text* text,
+                       const fz_stroke_state* stroke, fz_matrix ctm, fz_colorspace* cs,
+                       const float* color, float alpha, fz_color_params cp) {
+    SplitDevice* d = as_split(dev);
+    if (split_allow(d, false)) fz_stroke_text(ctx, d->inner, text, stroke, ctm, cs, color, alpha, cp);
+}
+
+void split_clip_text(fz_context* ctx, fz_device* dev, const fz_text* text, fz_matrix ctm,
+                     fz_rect scissor) {
+    SplitDevice* d = as_split(dev);
+    fz_clip_text(ctx, d->inner, text, ctm, scissor);
+}
+
+void split_clip_stroke_text(fz_context* ctx, fz_device* dev, const fz_text* text,
+                            const fz_stroke_state* stroke, fz_matrix ctm, fz_rect scissor) {
+    SplitDevice* d = as_split(dev);
+    fz_clip_stroke_text(ctx, d->inner, text, stroke, ctm, scissor);
+}
+
+void split_ignore_text(fz_context* ctx, fz_device* dev, const fz_text* text, fz_matrix ctm) {
+    SplitDevice* d = as_split(dev);
+    fz_ignore_text(ctx, d->inner, text, ctm);
+}
+
+void split_fill_shade(fz_context* ctx, fz_device* dev, fz_shade* shd, fz_matrix ctm, float alpha,
+                      fz_color_params cp) {
+    SplitDevice* d = as_split(dev);
+    if (split_allow(d, false)) fz_fill_shade(ctx, d->inner, shd, ctm, alpha, cp);
+}
+
+// 唯一归入图像层的一笔。叠回时按 dim 降不透明度，得到"保留色彩但压暗"的效果。
+void split_fill_image(fz_context* ctx, fz_device* dev, fz_image* img, fz_matrix ctm, float alpha,
+                      fz_color_params cp) {
+    SplitDevice* d = as_split(dev);
+    // 统计**先于**放行判断：计数回答的是"这一页画了几笔图"（纸墨层要为它留白、
+    // 还要据此判断是不是整页扫描件），与"本层放不放行"是两件事。
+    ++d->images;
+    // 单位方格经 ctm 仿射变换后的面积 = |det|（cm 里 a·d − b·c）。多次绘制会累加，
+    // 用于判断"这一页是不是就一张图"（整页扫描件，见 render_page 的 scanned）。
+    d->image_area += std::fabs(ctm.a * ctm.d - ctm.b * ctm.c);
+    if (!split_allow(d, true)) return;
+    const float a = (d->pass == kSplitImage && d->mask_depth == 0) ? alpha * d->dim : alpha;
+    fz_fill_image(ctx, d->inner, img, ctm, a, cp);
+}
+
+void split_fill_image_mask(fz_context* ctx, fz_device* dev, fz_image* img, fz_matrix ctm,
+                           fz_colorspace* cs, const float* color, float alpha, fz_color_params cp) {
+    SplitDevice* d = as_split(dev);
+    if (split_allow(d, false)) fz_fill_image_mask(ctx, d->inner, img, ctm, cs, color, alpha, cp);
+}
+
+void split_clip_image_mask(fz_context* ctx, fz_device* dev, fz_image* img, fz_matrix ctm,
+                           fz_rect scissor) {
+    SplitDevice* d = as_split(dev);
+    fz_clip_image_mask(ctx, d->inner, img, ctm, scissor);
+}
+
+void split_pop_clip(fz_context* ctx, fz_device* dev) {
+    fz_pop_clip(ctx, as_split(dev)->inner);
+}
+
+void split_begin_mask(fz_context* ctx, fz_device* dev, fz_rect area, int luminosity,
+                      fz_colorspace* cs, const float* bc, fz_color_params cp) {
+    SplitDevice* d = as_split(dev);
+    ++d->mask_depth;
+    fz_begin_mask(ctx, d->inner, area, luminosity, cs, bc, cp);
+}
+
+void split_end_mask(fz_context* ctx, fz_device* dev, fz_function* fn) {
+    SplitDevice* d = as_split(dev);
+    if (d->mask_depth > 0) --d->mask_depth;
+    fz_end_mask_tr(ctx, d->inner, fn);
+}
+
+void split_begin_group(fz_context* ctx, fz_device* dev, fz_rect area, fz_colorspace* cs,
+                       int isolated, int knockout, int blendmode, float alpha) {
+    fz_begin_group(ctx, as_split(dev)->inner, area, cs, isolated, knockout, blendmode, alpha);
+}
+
+void split_end_group(fz_context* ctx, fz_device* dev) {
+    fz_end_group(ctx, as_split(dev)->inner);
+}
+
+int split_begin_tile(fz_context* ctx, fz_device* dev, fz_rect area, fz_rect view, float xstep,
+                     float ystep, fz_matrix ctm, int id, int doc_id) {
+    return fz_begin_tile_tid(ctx, as_split(dev)->inner, area, view, xstep, ystep, ctm, id, doc_id);
+}
+
+void split_end_tile(fz_context* ctx, fz_device* dev) {
+    fz_end_tile(ctx, as_split(dev)->inner);
+}
+
+void split_render_flags(fz_context* ctx, fz_device* dev, int set, int clear) {
+    fz_render_flags(ctx, as_split(dev)->inner, set, clear);
+}
+
+void split_set_default_colorspaces(fz_context* ctx, fz_device* dev, fz_default_colorspaces* cs) {
+    fz_set_default_colorspaces(ctx, as_split(dev)->inner, cs);
+}
+
+void split_begin_layer(fz_context* ctx, fz_device* dev, const char* name) {
+    fz_begin_layer(ctx, as_split(dev)->inner, name);
+}
+
+void split_end_layer(fz_context* ctx, fz_device* dev) {
+    fz_end_layer(ctx, as_split(dev)->inner);
+}
+
+void split_begin_structure(fz_context* ctx, fz_device* dev, fz_structure standard, const char* raw,
+                           int idx) {
+    fz_begin_structure(ctx, as_split(dev)->inner, standard, raw, idx);
+}
+
+void split_end_structure(fz_context* ctx, fz_device* dev) {
+    fz_end_structure(ctx, as_split(dev)->inner);
+}
+
+void split_begin_metatext(fz_context* ctx, fz_device* dev, fz_metatext meta, const char* text) {
+    fz_begin_metatext(ctx, as_split(dev)->inner, meta, text);
+}
+
+void split_end_metatext(fz_context* ctx, fz_device* dev) {
+    fz_end_metatext(ctx, as_split(dev)->inner);
+}
+
+// 建一个分流设备。可能抛异常（分配失败），故必须在 fz_try 内调用。
+//
+// 这里显式清零整份基础结构（不依赖 `fz_new_device_of_size` 是否已清零）：`container` /
+// `container_len` / `d1_rect` 这些字段本项目不用，但 `fz_drop_device` 回收时会顺着
+// `container` 走一遍，留脏值就等于把野指针交回去。
+fz_device* split_new(fz_context* ctx, fz_device* inner, int pass, float dim) {
+    // 注意用 reinterpret_cast：SplitDevice **不是**从 fz_device 继承的（首成员是 base），
+    // 只是按"派生设备"惯例把额外状态接在基础结构之后。
+    SplitDevice* d = reinterpret_cast<SplitDevice*>(
+        fz_new_device_of_size(ctx, static_cast<int>(sizeof(SplitDevice))));
+    std::memset(&d->base, 0, sizeof(d->base));
+    d->base.refs = 1;
+    d->base.hints = inner->hints;
+    d->base.flags = inner->flags;
+    d->base.close_device = split_close;
+    d->base.drop_device = split_drop;
+    d->base.fill_path = split_fill_path;
+    d->base.stroke_path = split_stroke_path;
+    d->base.clip_path = split_clip_path;
+    d->base.clip_stroke_path = split_clip_stroke_path;
+    d->base.fill_text = split_fill_text;
+    d->base.stroke_text = split_stroke_text;
+    d->base.clip_text = split_clip_text;
+    d->base.clip_stroke_text = split_clip_stroke_text;
+    d->base.ignore_text = split_ignore_text;
+    d->base.fill_shade = split_fill_shade;
+    d->base.fill_image = split_fill_image;
+    d->base.fill_image_mask = split_fill_image_mask;
+    d->base.clip_image_mask = split_clip_image_mask;
+    d->base.pop_clip = split_pop_clip;
+    d->base.begin_mask = split_begin_mask;
+    d->base.end_mask = split_end_mask;
+    d->base.begin_group = split_begin_group;
+    d->base.end_group = split_end_group;
+    d->base.begin_tile = split_begin_tile;
+    d->base.end_tile = split_end_tile;
+    d->base.render_flags = split_render_flags;
+    d->base.set_default_colorspaces = split_set_default_colorspaces;
+    d->base.begin_layer = split_begin_layer;
+    d->base.end_layer = split_end_layer;
+    d->base.begin_structure = split_begin_structure;
+    d->base.end_structure = split_end_structure;
+    d->base.begin_metatext = split_begin_metatext;
+    d->base.end_metatext = split_end_metatext;
+    d->inner = inner;
+    d->pass = pass;
+    d->mask_depth = 0;
+    d->dim = dim;
+    d->images = 0;
+    d->image_area = 0.0f;
+    return &d->base;
+}
+
+// 纸墨层是否"近乎空白"：抽样统计非纸色（白）像素的占比。整页扫描件为真。
+bool paper_is_blank(fz_context* ctx, fz_pixmap* pix) noexcept {
+    const int w = fz_pixmap_width(ctx, pix);
+    const int h = fz_pixmap_height(ctx, pix);
+    const int stride = fz_pixmap_stride(ctx, pix);
+    const unsigned char* p = fz_pixmap_samples(ctx, pix);
+    if (p == nullptr || w <= 0 || h <= 0 || stride <= 0) return false;
+    constexpr int kStep = 2;          // 隔点抽样：分辨"整页扫描"与"少量文字"足够，代价 1/4
+    constexpr int kInkDelta = 12;     // 与纸色（255）的差超过它才算墨
+    long long total = 0;
+    long long ink = 0;
+    for (int y = 0; y < h; y += kStep) {
+        const unsigned char* row = p + static_cast<std::size_t>(y) * static_cast<std::size_t>(stride);
+        for (int x = 0; x < w; x += kStep) {
+            const unsigned char* q = row + static_cast<std::size_t>(x) * 4;
+            if (255 - q[0] > kInkDelta || 255 - q[1] > kInkDelta || 255 - q[2] > kInkDelta) ++ink;
+            ++total;
+        }
+    }
+    return total == 0 || static_cast<double>(ink) < kPaperBlankFloor * static_cast<double>(total);
 }
 
 // ---- 目录遍历（Phase 5）----
@@ -910,7 +1219,7 @@ DocError Document::outline(std::vector<OutlineItem>& out) const noexcept {
 
 DocError Document::render_page(int index, float scale, PageBitmap& out,
                                int max_dimension, int rotation_deg,
-                               ColorMode color_mode) noexcept {
+                               PageScheme scheme) noexcept {
     out.reset();
     if (!impl_ || !impl_->doc || !impl_->ctx) return DocError::NotOpen;
     if (index < 0 || !(scale > 0.0f)) return DocError::Internal;
@@ -925,9 +1234,10 @@ DocError Document::render_page(int index, float scale, PageBitmap& out,
 
     fz_page*   page = nullptr;
     fz_pixmap* pix = nullptr;
-    fz_device* dev = nullptr;
+    fz_device* dev = nullptr;        // 当前的分流设备（转发壳）
+    fz_device* dev_inner = nullptr;  // 它的下游 draw device
     float      used = scale;
-    int        mode = static_cast<int>(color_mode);
+    int        mode = static_cast<int>(scheme);
     DocError   result = DocError::Ok;
     char       err[kErrCap] = {};
 
@@ -935,6 +1245,7 @@ DocError Document::render_page(int index, float scale, PageBitmap& out,
         fz_var(page);
         fz_var(pix);
         fz_var(dev);
+        fz_var(dev_inner);
         fz_var(used);
 
         page = fz_load_page(s.ctx, s.doc, index);
@@ -951,19 +1262,57 @@ DocError Document::render_page(int index, float scale, PageBitmap& out,
 
         // RGB + alpha ⇒ 4 分量 RGBA8，可直接上传 DXGI_FORMAT_R8G8B8A8_UNORM
         pix = fz_new_pixmap_with_bbox(s.ctx, fz_device_rgb(s.ctx), bbox, nullptr, 1);
-        // 不透明白底：所有分量填 0xFF。之后页面内容以 SRC_OVER 合成，
+        // 不透明白底（即"纸色"）：所有分量填 0xFF。之后页面内容以 SRC_OVER 合成，
         // 因目标 alpha 恒为 255，结果 alpha 也恒为 255，无需再做反预乘。
         fz_clear_pixmap_with_value(s.ctx, pix, 0xFF);
 
-        dev = fz_new_draw_device(s.ctx, ctm, pix);
-        fz_run_page(s.ctx, page, dev, fz_identity, nullptr);
-        // fz_drop_device 不会隐式关闭设备，必须显式 close（Lilith 原版漏了这步）
-        fz_close_device(s.ctx, dev);
-        fz_drop_device(s.ctx, dev);
-        dev = nullptr;
+        if (mode == 0) {
+            // 原色：单遍直绘，与分层之前的路径逐字节等价（也是绝大多数时候的快路径）
+            dev_inner = fz_new_draw_device(s.ctx, ctm, pix);
+            fz_run_page(s.ctx, page, dev_inner, fz_identity, nullptr);
+            fz_close_device(s.ctx, dev_inner);
+            fz_drop_device(s.ctx, dev_inner);
+            dev_inner = nullptr;
+        } else {
+            // 第一遍：纸墨层（拦掉照片）。此时若有照片，它的位置只是白纸。
+            dev_inner = fz_new_draw_device(s.ctx, ctm, pix);
+            dev = split_new(s.ctx, dev_inner, kSplitInk, 1.0f);
+            fz_run_page(s.ctx, page, dev, fz_identity, nullptr);
+            const int   images     = as_split(dev)->images;
+            const float image_area = as_split(dev)->image_area;
+            fz_close_device(s.ctx, dev);
+            fz_drop_device(s.ctx, dev);        // 只回收转发壳，inner 由下一行负责
+            dev = nullptr;
+            fz_close_device(s.ctx, dev_inner);
+            fz_drop_device(s.ctx, dev_inner);
+            dev_inner = nullptr;
 
-        // 配色变换：设备已关闭、内容全部落盘后再做（POD 运算，无 C++ 对象）。
-        apply_color_transform(s.ctx, pix, mode);
+            // 整页扫描件：图像几乎铺满整页、且纸墨层没画什么东西（扫描书、扫描证件…）。
+            // 这类页面的内容**全在图像里**，若照常"纸墨层套配色、照片原样叠回"，深色模式下
+            // 会得到一整页白 —— 等于没开。故改走：图像原样铺满 → 最后整体套一次配色。
+            // 反例（不触发）：整页底图 + 正文的杂志封面 —— 纸墨层有文字，就该只变换文字。
+            const float page_area =
+                static_cast<float>(fz_pixmap_width(s.ctx, pix)) *
+                static_cast<float>(fz_pixmap_height(s.ctx, pix));
+            const bool scanned = (images > 0) && page_area > 0.0f &&
+                                 image_area >= static_cast<float>(kScanCoverageFloor) * page_area &&
+                                 paper_is_blank(s.ctx, pix);
+            if (!scanned) apply_scheme_lut(s.ctx, pix, mode);
+
+            // 第二遍：图像层（只放行照片）。压暗后叠回，照片保留原本的色彩。
+            if (images > 0) {
+                dev_inner = fz_new_draw_device(s.ctx, ctm, pix);
+                dev = split_new(s.ctx, dev_inner, kSplitImage, scanned ? 1.0f : kImageDim);
+                fz_run_page(s.ctx, page, dev, fz_identity, nullptr);
+                fz_close_device(s.ctx, dev);
+                fz_drop_device(s.ctx, dev);
+                dev = nullptr;
+                fz_close_device(s.ctx, dev_inner);
+                fz_drop_device(s.ctx, dev_inner);
+                dev_inner = nullptr;
+                if (scanned) apply_scheme_lut(s.ctx, pix, mode);
+            }
+        }
 
         fz_drop_page(s.ctx, page);
         page = nullptr;
@@ -972,6 +1321,7 @@ DocError Document::render_page(int index, float scale, PageBitmap& out,
         // 出错路径：dev 未 close 就 drop，MuPDF 会给出 "dropping unclosed device" 警告，
         // 但不会泄漏 —— fz_always 内不得调用可能抛异常的 fz_close_device。
         if (dev) fz_drop_device(s.ctx, dev);
+        if (dev_inner) fz_drop_device(s.ctx, dev_inner);
         if (page) fz_drop_page(s.ctx, page);
     }
     fz_catch(s.ctx) {

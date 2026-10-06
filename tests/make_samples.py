@@ -250,6 +250,94 @@ def make_encrypted(out_dir, log):
 
 # ---------------------------------------------------------------- 主流程
 
+def build_pdf(objs):
+    """把对象体列表（1 基编号）拼成合法 PDF（xref 正确）。"""
+    out = io.BytesIO()
+    out.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(out.tell())
+        out.write(f"{i} 0 obj\n".encode() + body + b"\nendobj\n")
+    xref = out.tell()
+    n = len(objs) + 1
+    out.write(f"xref\n0 {n}\n".encode())
+    out.write(b"0000000000 65535 f \n")
+    for off in offsets:
+        out.write(f"{off:010d} 00000 n \n".encode())
+    out.write(f"trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return out.getvalue()
+
+
+def _image_xobj(rgb, size=8):
+    """size×size 的 DeviceRGB 图像 XObject 体（RGB 为 (r,g,b) 单色填充）。"""
+    data = bytes(rgb) * (size * size)
+    return (f"<< /Type /XObject /Subtype /Image /Width {size} /Height {size} "
+            f"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {len(data)} >>\n"
+            f"stream\n").encode() + data + b"\nendstream"
+
+
+def pdf_image_and_text():
+    """一页：顶部文字 + 下半部分**纯红色照片**。
+
+    供 doc_test 断言"配色只作用于纸墨层"：深色方案下纸面变深、而红图必须仍是红的
+    （若被 LUT 一起变换，红会变成青蓝色调）。
+    """
+    content = (b"BT /F1 24 Tf 20 220 Td (page) Tj ET\n"
+               b"q 200 0 0 100 0 0 cm /Im1 Do Q")
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [ 5 0 R ] /Count 1 >>",
+        b"<< /Font << /F1 4 0 R >> /XObject << /Im1 7 0 R >> >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 200 300 ] "
+        b"/Resources 3 0 R /Contents 6 0 R >>",
+        b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream",
+        _image_xobj((255, 0, 0)),
+    ]
+    return build_pdf(objs)
+
+
+def pdf_scan_only():
+    """整页就是一张图（模拟扫描书）：没有文字、图像铺满整页。
+
+    供 doc_test 断言"整页扫描件回退"：深色方案下整页（含图）必须变深，
+    否则扫描书开了深色模式仍是一整页白。
+    """
+    content = b"q 200 0 0 300 0 0 cm /Im1 Do Q"
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [ 5 0 R ] /Count 1 >>",
+        b"<< /Font << /F1 4 0 R >> /XObject << /Im1 7 0 R >> >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 200 300 ] "
+        b"/Resources 3 0 R /Contents 6 0 R >>",
+        b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream",
+        _image_xobj((255, 255, 255)),
+    ]
+    return build_pdf(objs)
+
+
+def pdf_ink_black():
+    """页面中央一块**纯黑**矩形，其余是白纸（无文字、无图像）。
+
+    供 doc_test 断言深色 LUT 的**墨色端点**：纯黑是"最深的墨"，映射后就是 LUT 亮端；
+    它与纸面（白底映射）的暖度必须一致 —— 两端点逐通道等斜率是"整页暖度统一"的前提。
+    否则越亮的那一端越暖（正文会比纸面黄），而这在只看纸面的断言里完全看不出来。
+    """
+    # PDF 坐标 y 轴朝上：矩形 (40,100)-(160,200) ⇒ 设备坐标 y 反向后仍是 100..200
+    content = b"q 0 0 0 rg 40 100 120 100 re f Q"
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [ 5 0 R ] /Count 1 >>",
+        b"<< /Font << /F1 4 0 R >> >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 200 300 ] "
+        b"/Resources 3 0 R /Contents 6 0 R >>",
+        b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream",
+    ]
+    return build_pdf(objs)
+
+
 def main():
     out_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "samples")
@@ -286,6 +374,13 @@ def main():
     write("comic.cbz", zip_of([("1.png", png), ("2.png", png_1x1(120)), ("3.png", png_1x1(60))]))
     # 带两级目录的 PDF：供 doc_test 断言 outline() 的层级/页号解析
     write("outline.pdf", pdf_with_outline(3))
+    # 配色分层渲染的两个样本（ADR-067）：
+    #   with_image.pdf 文字 + 红图 → 断言"深色方案下照片不变色"；
+    #   scan_only.pdf  整页一张图   → 断言"整页扫描件整体回退变换"；
+    #   ink_black.pdf  一块纯黑     → 断言"墨色与纸面暖度一致"（LUT 两端等斜率）。
+    write("with_image.pdf", pdf_image_and_text())
+    write("scan_only.pdf", pdf_scan_only())
+    write("ink_black.pdf", pdf_ink_black())
 
     log("== 2. 改名但内容可正常读（应打开，界面提示不符） ==")
     write("img_named_pdf.pdf", png)

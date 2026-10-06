@@ -47,6 +47,7 @@ import lilithreader.render;
 import lilithreader.reader_state;
 
 #include "imgui.h"
+#include "tone.h"     // 纸张方案 → chrome 色调（纯函数，自身不依赖 ImGui/Win32）
 
 // 链接依赖（app 层 TUs 共用；放在头里避免每个 .cpp 重复声明）
 #pragma comment(lib, "d3d11.lib")
@@ -187,7 +188,13 @@ inline float px(float base) { return base * ui_scale(); }
 inline HWND g_hwnd = nullptr;
 
 // ---- 主题调色板 ----
-// 阅读器有三套 chrome 表现：浅色/深色/跟随系统；反色模式下强制深色（ADR-043）。
+// chrome 表现由两个正交维度决定（ADR-067/068）：
+//   · **界面主题**（浅/深/跟随系统）—— 用户偏好，管顶栏/菜单/设置窗的明暗；
+//   · **纸张方案**（原色/深色/暖色）—— 管页面，同时通过 g_tone 决定 chrome 的色调
+//     （深色方案强制深色 chrome，并把中性族旋到与暖黑纸面同色相；暖色方案旋到米黄纸面色相）。
+// 这里只定义**两套中性底**（kPalLight / kPalDark）；实际用到的颜色由 g_tone 现场派生 ——
+// 手写 4~5 套相近调色板既难保持一致、又容易漏改某几个色，派生则天然同步，
+// 且"保持亮度/换强调色/保语义色"等规则集中在一处（见 tone.h）。
 // 画布/顶栏/状态栏是自绘的，故颜色放进可切换的调色板 g_pal；ImGui 控件配色另行设置。
 struct Palette {
     ImU32 backdrop;          // 画布（页面区）背景
@@ -210,11 +217,17 @@ extern const Palette kPalDark;
 
 inline Palette g_pal = kPalLight;
 inline bool g_dark_theme = false;      // 当前是否为深色 chrome
-inline bool g_theme_applied = false;   // g_pal / ImGui 颜色是否已按 g_dark_theme 应用
+inline Tone g_tone{};                  // 当前纸张方案的色调（inactive = 原色，见 tone.h）
+inline bool g_theme_applied = false;   // g_pal / ImGui 颜色是否已按当前主题应用
 inline bool g_icons_ok = false;        // 图标字形是否已成功合并进字体（否则退化为文字标签）
 
+// 按当前纸张方案的色调派生一个颜色（保持 alpha）。ui.cpp 里自绘的文字色/强调色也走它，
+// 否则会出现"调色板暖了、这几处还是冷灰"这种局部漏改（ADR-068）。
+[[nodiscard]] ImU32 tone_apply(ImU32 c);
+[[nodiscard]] ImVec4 tone_apply(ImVec4 c);
+
 void apply_theme_colors();
-void sync_theme(int color_mode);       // 主题偏好 + 文档配色 → chrome 明暗（帧首调用）
+void sync_theme(int scheme);           // 主题偏好 + 纸张方案 → chrome 明暗与色调（帧首调用）
 
 // ---- D3D11（RAII） ----
 struct Graphics {
@@ -321,9 +334,9 @@ inline std::uint64_t    g_doc_key = 0;  // 当前文档在库里的主键（0 = 
 inline bool g_show_sidebar = false;
 inline int  g_sidebar_tab = 0;      // 0 目录 / 1 书签 / 2 缩略图
 
-// ---- 视图变换（0/90/180/270 与配色）----
+// ---- 视图变换（0/90/180/270 与纸张方案）----
 inline int g_rotation = 0;
-inline int g_color_mode = 0;        // 0 正常 / 1 反色 / 2 护眼
+inline int g_scheme = 0;            // 0 原色 / 1 深色 / 2 暖色（与 lr::PageScheme 同值）
 // 未旋转的逐页尺寸（点）；旋转 90/270 时交换宽高后再交给画布。
 inline std::vector<lr::PageSizePt> g_raw_sizes;
 inline lr::PageSizePt g_raw_default{ 595.0f, 842.0f };
@@ -424,11 +437,11 @@ void clear_unknown_reading_data();
 [[nodiscard]] int unknown_reading_data_count();
 
 void push_canvas_sizes();           // 逐页尺寸（含旋转折算）下发画布
-void apply_view_transform();        // 旋转/配色下发渲染层
+void apply_view_transform();        // 旋转/纸张方案下发渲染层
 void set_rotation(int deg);
 void rotate_view(int delta);
-void set_color_mode(int mode);
-void toggle_color_mode(int mode);
+void set_scheme(int scheme);
+void toggle_scheme(int scheme);
 
 void save_reading_state();
 bool current_page_has_bookmark();
@@ -475,7 +488,7 @@ enum class Cmd : int {
     // 命令，故不参与 cmd_pressed 派发，只由 handle_canvas_input 读取（见 wheel_zoom_mod_held）。
     ZoomWheelMod,
     // 视图
-    Col1, Col2, Col3, Col4, ToggleSpread, RotateCW, ToggleInvert, ToggleSepia,
+    Col1, Col2, Col3, Col4, ToggleSpread, RotateCW, ToggleDark, ToggleWarm,
     // 界面
     ToggleSidebar, ToggleBookmark, OpenSettings, OpenKeys, ToggleDebug, ToggleFullscreen, OpenFile,
     Count,

@@ -42,12 +42,14 @@ constexpr double kScrollIndHoldSec = 1.2;      // 滚动指示条静止后渐隐
 // ---------------- 引导 / 状态页 ----------------
 
 // 引导页文字颜色**必须随主题**：早期写死浅色，浅色主题下几乎看不见（已修）。
-ImVec4 col_text()   { return g_dark_theme ? ImVec4(0.90f, 0.91f, 0.93f, 1.0f)
-                                          : ImVec4(0.15f, 0.17f, 0.20f, 1.0f); }
-ImVec4 col_dim()    { return g_dark_theme ? ImVec4(0.58f, 0.61f, 0.65f, 1.0f)
-                                          : ImVec4(0.42f, 0.46f, 0.51f, 1.0f); }
-ImVec4 col_warn()   { return g_dark_theme ? ImVec4(0.95f, 0.72f, 0.42f, 1.0f)
-                                          : ImVec4(0.72f, 0.35f, 0.10f, 1.0f); }
+// 还要**随纸张方案**（tone_apply）：状态页画在画布底色上，不跟着走就会在暖色/深色下
+// 留下一块纯中性灰的字（ADR-068 统一走同一处派生）。
+ImVec4 col_text()   { return tone_apply(g_dark_theme ? ImVec4(0.90f, 0.91f, 0.93f, 1.0f)
+                                                     : ImVec4(0.15f, 0.17f, 0.20f, 1.0f)); }
+ImVec4 col_dim()    { return tone_apply(g_dark_theme ? ImVec4(0.58f, 0.61f, 0.65f, 1.0f)
+                                                     : ImVec4(0.42f, 0.46f, 0.51f, 1.0f)); }
+ImVec4 col_warn()   { return tone_apply(g_dark_theme ? ImVec4(0.95f, 0.72f, 0.42f, 1.0f)
+                                                     : ImVec4(0.72f, 0.35f, 0.10f, 1.0f)); }
 
 // 居中排版要有一个**整帧稳定**的参考框：逐次读取 GetContentRegionAvail 会随文本放置而漂移。
 struct CenterArea { ImVec2 origin; ImVec2 avail; };
@@ -413,8 +415,8 @@ void draw_status_bar() {
     if (g_canvas.state().spread) chip("对开");
     else if (g_canvas.state().columns > 1) chip("%d 列", g_canvas.state().columns);
     if (g_rotation != 0) chip("旋转 %d°", g_rotation);
-    if (g_color_mode == 1) chip("反色");
-    else if (g_color_mode == 2) chip("护眼");
+    if (g_scheme == 1) chip("深色");
+    else if (g_scheme == 2) chip("暖色");
     if (current_page_has_bookmark()) chip("已加书签");
 
     // 右侧：格式（扩展名与内容不符时把提示也放这里，不挤占顶栏）。
@@ -476,7 +478,7 @@ void draw_debug_overlay() {
             ImGui::Text("cols: %d  fit: %d", g_canvas.state().columns,
                         g_canvas.state().fit_width ? 1 : 0);
             ImGui::Text("rot: %d  color: %d  spread: %d",
-                        g_rotation, g_color_mode, g_canvas.state().spread ? 1 : 0);
+                        g_rotation, g_scheme, g_canvas.state().spread ? 1 : 0);
             const lr::DocRecord* rec = g_state.find(g_doc_key);
             ImGui::TextDisabled("outline: %d  bookmarks: %d  sidebar: %d tab %d",
                                 static_cast<int>(g_outline.size()),
@@ -715,7 +717,8 @@ void draw_password_popup() {
         if (g_auth_pending)
             ImGui::TextDisabled("验证中…");
         else if (!g_password_error.empty())
-            ImGui::TextColored(ImVec4(0.9f, 0.35f, 0.35f, 1.0f), "%s", g_password_error.c_str());
+            ImGui::TextColored(tone_apply(ImVec4(0.9f, 0.35f, 0.35f, 1.0f)), "%s",
+                               g_password_error.c_str());
         ImGui::BeginDisabled(locked);
         const bool ok = enter || ImGui::Button("解锁");
         ImGui::SameLine();
@@ -743,26 +746,35 @@ std::string with_icon(const char* icon, const char* text) {
     return s;
 }
 
-// 菜单项：图标 + 文案 + 快捷键 + 勾选 / 可用状态。
+// 菜单项：图标 + 文案 + 快捷键 + 勾选 / 可用状态 + 可选悬停说明。
+//
+// **文案有长度上限（12 个 CJK 列）**：弹出菜单的宽度由最长那一项决定，只要出现一项
+// 特别长的，整张菜单就被撑宽、其余短项显得空荡（人工反馈：一条很长的内容影响感官）。
+// 所以"括号里的补充说明"一律不进文案，改走 tip（悬停提示）—— 信息不丢，宽度可控。
+// 该上限由 tests/check_menu_width.py 对所有菜单字面量持续断言，防止再次腐化。
 bool menu_item(const char* icon, const char* label, const char* shortcut,
-               bool checked = false, bool enabled = true) {
+               bool checked = false, bool enabled = true, const char* tip = nullptr) {
     const std::string s = with_icon(icon, label);
-    return ImGui::MenuItem(s.c_str(), shortcut, checked, enabled);
+    const bool clicked = ImGui::MenuItem(s.c_str(), shortcut, checked, enabled);
+    if (tip && tip[0] && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("%s", tip);
+    return clicked;
 }
 
 // 快捷键一栏取**当前绑定**（用户改键后菜单同步），而不是写死的字符串（ADR-054）。
 bool menu_item_cmd(const char* icon, const char* label, Cmd shortcut_cmd,
-                   bool checked = false, bool enabled = true) {
+                   bool checked = false, bool enabled = true, const char* tip = nullptr) {
     const std::string sc = chord_label(g_binds[static_cast<int>(shortcut_cmd)][0]);
-    return menu_item(icon, label, sc.c_str(), checked, enabled);
+    return menu_item(icon, label, sc.c_str(), checked, enabled, tip);
 }
 
 // 扁平按钮配色（顶栏/工具条，ADR-045）：
 // 默认**无底色**——否则一排按钮就是一排灰块，工具栏显脏；悬停/按下才浮现柔和底色。
 // active（如"侧栏已开/设置已开"）用低透明强调色底表示状态，而不是加粗边框。
 void push_flat_button(bool active) {
-    const ImVec4 accent = g_dark_theme ? ImVec4(0.42f, 0.65f, 0.94f, 1.0f)
-                                       : ImVec4(0.23f, 0.49f, 0.85f, 1.0f);
+    // 强调色也过一遍纸张方案的色调（ADR-068）：否则暖色方案下会出现"页面暖、按钮冷"。
+    const ImVec4 accent = tone_apply(g_dark_theme ? ImVec4(0.42f, 0.65f, 0.94f, 1.0f)
+                                                  : ImVec4(0.23f, 0.49f, 0.85f, 1.0f));
     const ImVec4 ink    = g_dark_theme ? ImVec4(1, 1, 1, 1) : ImVec4(0, 0, 0, 1);
     ImGui::PushStyleColor(ImGuiCol_Button,
         active ? ImVec4(accent.x, accent.y, accent.z, 0.18f) : ImVec4(0, 0, 0, 0));
@@ -850,7 +862,8 @@ void draw_view_menu_contents() {
         ImGui::EndMenu();
     }
     const bool spread = g_canvas.state().spread;
-    if (menu_item_cmd(kIcBook, "双页对开（书籍模式）", Cmd::ToggleSpread, spread, rd))
+    if (menu_item_cmd(kIcBook, "双页对开", Cmd::ToggleSpread, spread, rd,
+                      "双页对开（书籍模式）：封面单独成页，其余两页并列"))
         g_canvas.set_spread(!spread);
     if (ImGui::BeginMenu(with_icon(kIcRotate, "旋转").c_str(), rd)) {
         const int degs[] = { 0, 90, 180, 270 };
@@ -866,11 +879,11 @@ void draw_view_menu_contents() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu(with_icon(kIcPalette, "配色").c_str(), rd)) {
-        if (ImGui::MenuItem("正常", nullptr, g_color_mode == 0)) set_color_mode(0);
-        const std::string si = chord_label(g_binds[static_cast<int>(Cmd::ToggleInvert)][0]);
-        const std::string se = chord_label(g_binds[static_cast<int>(Cmd::ToggleSepia)][0]);
-        if (ImGui::MenuItem("反色（深色）", si.c_str(), g_color_mode == 1)) set_color_mode(1);
-        if (ImGui::MenuItem("护眼（暖色）", se.c_str(), g_color_mode == 2)) set_color_mode(2);
+        if (ImGui::MenuItem("原色", nullptr, g_scheme == 0)) set_scheme(0);
+        const std::string si = chord_label(g_binds[static_cast<int>(Cmd::ToggleDark)][0]);
+        const std::string se = chord_label(g_binds[static_cast<int>(Cmd::ToggleWarm)][0]);
+        if (ImGui::MenuItem("深色", si.c_str(), g_scheme == 1)) set_scheme(1);
+        if (ImGui::MenuItem("暖色", se.c_str(), g_scheme == 2)) set_scheme(2);
         ImGui::EndMenu();
     }
     ImGui::Separator();
@@ -881,14 +894,17 @@ void draw_view_menu_contents() {
 void draw_nav_menu_contents() {
     const bool rd = (g_doc.kind == UiDoc::Kind::Reading);
     if (menu_item_cmd(kIcHome, "首页", Cmd::FirstPage, false, rd)) request_jump_scroll(0, 0.0f);
-    if (menu_item_cmd(kIcPrev, "上一页 / 上一行", Cmd::PrevRow, false, rd)) scroll_by_rows(-1);
-    if (menu_item_cmd(kIcNext, "下一页 / 下一行", Cmd::NextRow, false, rd)) scroll_by_rows(+1);
+    if (menu_item_cmd(kIcPrev, "上一页", Cmd::PrevRow, false, rd, "上一页（多列或对开时按整行推进）"))
+        scroll_by_rows(-1);
+    if (menu_item_cmd(kIcNext, "下一页", Cmd::NextRow, false, rd, "下一页（多列或对开时按整行推进）"))
+        scroll_by_rows(+1);
     if (menu_item_cmd(kIcArrowDown, "末页", Cmd::LastPage, false, rd))
         request_jump_scroll(g_canvas.page_count() - 1, 0.0f);
     ImGui::Separator();
     if (menu_item_cmd(kIcSearch, "跳转页码…", Cmd::JumpPage, false, rd)) open_jump_popup();
-    if (menu_item_cmd(kIcStar, current_page_has_bookmark() ? "删除本页书签" : "添加本页书签",
-                      Cmd::ToggleBookmark, current_page_has_bookmark(), rd))
+    if (menu_item_cmd(kIcStar, current_page_has_bookmark() ? "删除书签" : "添加书签",
+                      Cmd::ToggleBookmark, current_page_has_bookmark(), rd,
+                      "为当前页添加 / 移除书签"))
         toggle_bookmark_current();
 }
 
@@ -924,8 +940,10 @@ void draw_canvas_context_menu() {
     if (g_open_canvas_ctx) { g_open_canvas_ctx = false; ImGui::OpenPopup("##canvas_ctx"); }
     push_popup_style();
     if (ImGui::BeginPopupContextWindow("##canvas_ctx", ImGuiPopupFlags_MouseButtonRight)) {
-        if (menu_item_cmd(kIcPrev, "上一页", Cmd::PrevRow)) scroll_by_rows(-1);
-        if (menu_item_cmd(kIcNext, "下一页", Cmd::NextRow)) scroll_by_rows(+1);
+        if (menu_item_cmd(kIcPrev, "上一页", Cmd::PrevRow, false, true, "上一页（对开时按整行推进）"))
+            scroll_by_rows(-1);
+        if (menu_item_cmd(kIcNext, "下一页", Cmd::NextRow, false, true, "下一页（对开时按整行推进）"))
+            scroll_by_rows(+1);
         ImGui::Separator();
         if (ImGui::BeginMenu(with_icon(kIcExpand, "缩放").c_str())) {
             draw_zoom_menu_contents(); ImGui::EndMenu();
@@ -935,8 +953,9 @@ void draw_canvas_context_menu() {
         }
         ImGui::Separator();
         if (menu_item_cmd(kIcSearch, "跳转页码…", Cmd::JumpPage)) open_jump_popup();
-        if (menu_item_cmd(kIcStar, current_page_has_bookmark() ? "删除本页书签" : "添加本页书签",
-                          Cmd::ToggleBookmark, current_page_has_bookmark()))
+        if (menu_item_cmd(kIcStar, current_page_has_bookmark() ? "删除书签" : "添加书签",
+                          Cmd::ToggleBookmark, current_page_has_bookmark(), true,
+                          "为当前页添加 / 移除书签"))
             toggle_bookmark_current();
         if (menu_item_cmd(kIcList, "侧栏", Cmd::ToggleSidebar, g_show_sidebar))
             set_sidebar(!g_show_sidebar, 0);
@@ -1303,9 +1322,10 @@ std::string ellipsize(const std::string& s, float max_w, bool middle) {
 }
 
 // 危险动作的按钮配色（无底色 → 悬停浮出红）：删除图标与"清空 / 清理"文字按钮共用。
+// 红色属**语义色**，tone_apply 只把它的色相往方案色相拉近一个小比例，保住"红=危险"。
 ImVec4 danger_ink() {
-    return g_dark_theme ? ImVec4(0.95f, 0.47f, 0.45f, 1.0f)
-                        : ImVec4(0.76f, 0.22f, 0.19f, 1.0f);
+    return tone_apply(g_dark_theme ? ImVec4(0.95f, 0.47f, 0.45f, 1.0f)
+                                   : ImVec4(0.76f, 0.22f, 0.19f, 1.0f));
 }
 void push_danger_button(bool hovered) {
     const ImVec4 red = danger_ink();
@@ -1644,11 +1664,11 @@ void draw_settings_reading_tab() {
         }
         settings_note("页与页之间的留白比例");
 
-        settings_row("当前配色");
-        const char* colors[] = { "正常", "反色", "护眼" };
-        int cm = g_color_mode;
-        if (ImGui::Combo("##color", &cm, colors, IM_ARRAYSIZE(colors))) set_color_mode(cm);
-        settings_note("快捷键见「按键」分栏");
+        settings_row("纸张方案");
+        const char* schemes[] = { "原色", "深色", "暖色" };
+        int cm = g_scheme;
+        if (ImGui::Combo("##scheme", &cm, schemes, IM_ARRAYSIZE(schemes))) set_scheme(cm);
+        settings_note("只改页面；照片与插图保持原色。快捷键见「按键」分栏");
         settings_rows_end();
     }
 }
@@ -1692,9 +1712,9 @@ void draw_bind_button(int cmd, int slot) {
                                                               : chord_label(c));
     ImGui::PushID(slot);
     if (capturing) {
-        ImGui::PushStyleColor(ImGuiCol_Button,
+        ImGui::PushStyleColor(ImGuiCol_Button, tone_apply(
             g_dark_theme ? ImVec4(0.42f, 0.65f, 0.94f, 0.35f)
-                         : ImVec4(0.23f, 0.49f, 0.85f, 0.28f));
+                         : ImVec4(0.23f, 0.49f, 0.85f, 0.28f)));
     }
     const bool clicked = ImGui::Button(label.c_str(), ImVec2(-FLT_MIN, 0));
     if (capturing) ImGui::PopStyleColor();
@@ -1934,7 +1954,7 @@ void draw_shell() {
         g_apply_scale_pending = false;
         apply_ui_scale();
     }
-    sync_theme(g_color_mode);     // 主题/反色 → chrome 明暗（含 ImGui 控件配色，也在帧首）
+    sync_theme(g_scheme);         // 主题 + 纸张方案 → chrome 明暗与暖化（含 ImGui 控件配色，帧首）
     update_toolbar_visibility();  // 顶栏自动隐藏
 
     // 全局命令：命令表驱动（ADR-054）。门 = 无文本输入 + 未在捕获按键 + 无对话框级界面。

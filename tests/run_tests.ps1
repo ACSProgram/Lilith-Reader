@@ -154,6 +154,11 @@ Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\utils.ifc",
     "/reference", "$out\reader_state.ifc",
     "/Fo$out\reader_state_test.obj", (Join-Path $tests "reader_state_test.cpp"))) "编译 reader_state_test.cpp"
 
+# 配色色调映射（ADR-068）：纯数学 + 无 ImGui/Win32 依赖的头，单独编译成 tone_test.exe。
+# 它把"配色的骨架"（色相/饱和度/对比度）钉死，观感仍留给人工验证。
+Invoke-Cl ($defs + @("/I$(Join-Path $src 'app')") + $incs + @("/c",
+    "/Fo$out\tone_test.obj", (Join-Path $tests "tone_test.cpp"))) "编译 tone_test.cpp"
+
 # 依赖库清单取自 unofficial-libmupdf 的 INTERFACE_LINK_LIBRARIES（不能改成"链上 lib\*.lib"：
 # jpeg.lib 与 turbojpeg.lib 会符号冲突）
 $libs = @("libmupdf.lib", "freetype.lib", "harfbuzz.lib", "jbig2dec.lib", "jpeg.lib",
@@ -179,6 +184,10 @@ Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\page_cache_test.exe", "$out\page_cache_
 # 阅读状态测试：链 reader_state 的接口单元与实现单元。
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\reader_state_test.exe", "$out\reader_state_test.obj",
     "$out\reader_state.ixx.obj", "$out\reader_state.obj", "/link") + $libdirs) "链接 reader_state_test.exe"
+
+# 色调测试只用 C++ 标准库。
+Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\tone_test.exe", "$out\tone_test.obj", "/link") +
+    $libdirs) "链接 tone_test.exe"
 
 # ---- 4. 运行测试 ---------------------------------------------------------------
 
@@ -224,6 +233,16 @@ try {
 $stateExit = $LASTEXITCODE
 Write-Host "  reader_state_test.exe 退出码 = $stateExit"
 
+Step "运行配色色调测试"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & "$out\tone_test.exe"
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$toneExit = $LASTEXITCODE
+Write-Host "  tone_test.exe 退出码 = $toneExit"
+
 if ($Probe) {
     Step "编译并运行 MuPDF 诊断探针"
     Invoke-Cl ($defs + $incs + @("/c", "/Fo$out\mupdf_probe.obj",
@@ -260,9 +279,33 @@ try {
 $iconExit = $LASTEXITCODE
 Write-Host "  check_icons.py 退出码 = $iconExit"
 
+# 菜单文案宽度断言（ADR-067）：弹出菜单的宽度由最长项决定，一条超长文案会把整张菜单撑宽。
+Step "菜单文案宽度断言"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & $Python (Join-Path $repo "tests\check_menu_width.py")
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$menuExit = $LASTEXITCODE
+Write-Host "  check_menu_width.py 退出码 = $menuExit"
+
+# 主题重置断言（ADR-068）：apply_theme_colors 的两个分支必须先整套重置 ImGui 样式，
+# 否则未覆盖的颜色项会带着上一个主题的值活过来（深色勾选框曾因此变成亮奶油色）。
+Step "主题重置断言"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & $Python (Join-Path $repo "tests\check_theme_reset.py")
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$themeExit = $LASTEXITCODE
+Write-Host "  check_theme_reset.py 退出码 = $themeExit"
+
 Step "结束"
 if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $stateExit -eq 0 -and
-    $fontExit -eq 0 -and $iconExit -eq 0) {
+    $toneExit -eq 0 -and $fontExit -eq 0 -and $iconExit -eq 0 -and $menuExit -eq 0 -and
+    $themeExit -eq 0) {
     Write-Host "全部通过。" -ForegroundColor Green
 } else {
     Write-Host "存在失败用例。" -ForegroundColor Red
@@ -271,5 +314,8 @@ if ($testExit -ne 0) { exit $testExit }
 if ($canvasExit -ne 0) { exit $canvasExit }
 if ($cacheExit -ne 0) { exit $cacheExit }
 if ($stateExit -ne 0) { exit $stateExit }
+if ($toneExit -ne 0) { exit $toneExit }
 if ($fontExit -ne 0) { exit $fontExit }
-exit $iconExit
+if ($iconExit -ne 0) { exit $iconExit }
+if ($menuExit -ne 0) { exit $menuExit }
+exit $themeExit

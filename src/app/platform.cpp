@@ -4,7 +4,7 @@
 //   · D3D11 设备与交换链（RAII）
 //   · ImGui 上下文与后端引导、中文字体 + 图标字形合并
 //   · DPI / 界面缩放（g_dpi_scale × g_user_scale）
-//   · 主题（浅/深/跟随系统；反色强制深色）与配色
+//   · 主题（浅/深/跟随系统）与纸张方案派生出的 chrome 明暗/暖化
 //   · 用户偏好持久化（exe 同目录 LilithReader.ini）
 //   · 输入法关联切换（ADR-028/040）与全屏
 //
@@ -161,11 +161,77 @@ bool system_prefers_dark_cached() {
 
 }  // namespace
 
+// ---------------- 纸张方案的色调（ADR-068）----------------
+//
+// 三套方案 = 三份 Tone。**原色是 inactive 的**：一个通道都不动 —— 它是用户认可的基准，
+// 任何"顺手调一下"都是回归（tests/tone_test.cpp 里有逐通道断言钉着）。
+//
+// 深色/暖色则把中性表面族旋到**页面纸色所在的色相**上，两边同族 —— "页面暖、周围冷"
+// 从结构上不再可能发生。强调色与语义色各有归属，规则与理由见 tone.h。
+namespace {
+
+constexpr Tone kToneOriginal{ false, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, {} };
+
+// 深色纸：#1F1D1B（hue 30）—— 纸面本身是暖黑，chrome 取同色相但**饱和度压得很低**：
+// 深色主题的"暖"极易过量，因为文字面积小、对比强，一丁点色相在亮色上就非常显眼
+// （sat 0.22 时正文会被染成 #EFD7C1 那样的奶油色，整屏就"变成暖深色"了）。
+// 暖意只留在强调色上，中性族基本保持中性。
+constexpr Tone kToneDarkPage{ true, 29.0f, 0.08f, 1.00f, 1.00f, 0.25f,
+                              { 0.878f, 0.700f, 0.480f } };   // 柔沙 #E0B37B
+
+// 暖色纸：#F6EEDC（hue 41 / sat 0.11）—— 色相取 40 与纸面一致。明度整体 ×0.87：
+// 让米黄纸面成为全屏**最亮**的一层（原先周围比纸还亮，纸面反而显得发闷）。
+// 中间调 ×0.70：色度对比不计入明度对比，彩色底的次要文字/边框需要额外压深一档。
+// 强调色用赭石 #A96F25 —— 与米黄同族，而不是把冷蓝硬塞进暖底。
+constexpr Tone kToneWarmPage{ true, 40.0f, 0.155f, 0.87f, 0.70f, 0.25f,
+                              { 0.663f, 0.435f, 0.145f } };
+
+}  // namespace
+
+ImVec4 tone_apply(ImVec4 c) {
+    if (!g_tone.active) return c;
+    const Rgb o = lr::app::tone_apply(Rgb{ c.x, c.y, c.z }, g_tone);
+    return ImVec4(o.r, o.g, o.b, c.w);
+}
+
+ImU32 tone_apply(ImU32 c) {
+    if (!g_tone.active) return c;
+    return ImGui::ColorConvertFloat4ToU32(tone_apply(ImGui::ColorConvertU32ToFloat4(c)));
+}
+
+// 由中性底派生当前方案的调色板。半透明色（页面投影、页面描边）只换 RGB，alpha 原样 ——
+// 它们本来就是"叠在画布上的一层黑/白"，改透明度会连叠出来的效果一起变。
+Palette tone_palette(const Palette& base) {
+    if (!g_tone.active) return base;
+    Palette p;
+    p.backdrop            = tone_apply(base.backdrop);
+    p.chrome              = tone_apply(base.chrome);
+    p.chrome_border       = tone_apply(base.chrome_border);
+    p.page_border         = tone_apply(base.page_border);
+    p.placeholder         = tone_apply(base.placeholder);
+    p.placeholder_border  = tone_apply(base.placeholder_border);
+    p.placeholder_text    = tone_apply(base.placeholder_text);
+    p.failed              = tone_apply(base.failed);
+    p.failed_border       = tone_apply(base.failed_border);
+    p.chrome_text         = tone_apply(base.chrome_text);
+    p.chrome_dim          = tone_apply(base.chrome_dim);
+    p.accent              = tone_apply(base.accent);
+    p.shadow              = tone_apply(base.shadow);
+    return p;
+}
+
 // ImGui 控件的配色（圆角/间距等几何量在 ImGuiRaii::initialize 里设定，随 DPI 缩放）。
+//
+// **两个分支都必须先把整套样式重置一次**（StyleColorsLight / StyleColorsDark），再逐项覆盖。
+// 只覆盖"我们在意的那些"是不够的：ImGui 有 60 多个颜色项，未覆盖的会**沿用上一次留下的值** ——
+// 于是"先浅色后深色"的路径下，那些项会带着浅色值活到深色主题里。实测踩到的就是
+// `ImGuiCol_CheckboxSelectedBg`（勾选框选中态的底，浅色是近白 (0.95,0.97,1.00)）：
+// 深色下勾选框变成一整块亮奶油色，与周围完全割裂。
 void apply_theme_colors() {
     ImGuiStyle& st = ImGui::GetStyle();
     ImVec4* c = st.Colors;
     if (g_dark_theme) {
+        ImGui::StyleColorsDark(&st);
         c[ImGuiCol_Text]                  = ImVec4(0.85f, 0.86f, 0.88f, 1.00f);
         c[ImGuiCol_TextDisabled]          = ImVec4(0.50f, 0.53f, 0.57f, 1.00f);
         c[ImGuiCol_WindowBg]              = ImVec4(0.13f, 0.13f, 0.15f, 1.00f);
@@ -174,6 +240,9 @@ void apply_theme_colors() {
         c[ImGuiCol_Border]                = ImVec4(0.24f, 0.25f, 0.28f, 1.00f);
         c[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
         c[ImGuiCol_FrameBg]               = ImVec4(0.19f, 0.20f, 0.23f, 1.00f);
+        // 勾选框"选中态"的底：比 FrameBg 提亮一档（与悬停态同级），让强调色的勾醒目，
+        // 而不是让整块底变成强调色 —— "深底 + 彩色勾"才是这套浅/深主题一贯的样子。
+        c[ImGuiCol_CheckboxSelectedBg]    = ImVec4(0.25f, 0.26f, 0.30f, 1.00f);
         c[ImGuiCol_FrameBgHovered]        = ImVec4(0.25f, 0.26f, 0.30f, 1.00f);
         c[ImGuiCol_FrameBgActive]         = ImVec4(0.29f, 0.31f, 0.35f, 1.00f);
         c[ImGuiCol_TitleBg]               = ImVec4(0.13f, 0.13f, 0.15f, 1.00f);
@@ -229,16 +298,31 @@ void apply_theme_colors() {
         c[ImGuiCol_SliderGrabActive]      = ImVec4(0.16f, 0.41f, 0.76f, 1.00f);
         c[ImGuiCol_TabSelectedOverline]   = ImVec4(0.23f, 0.49f, 0.85f, 1.00f);
     }
+    // 纸张方案下，控件配色的**全部**条目统一过一遍色调映射 —— 逐条手写变体既难保持一致，
+    // 也必然漏改某几个（ADR-068）。原色方案下 g_tone.active 为假，这一步是空操作。
+    if (g_tone.active) {
+        for (int i = 0; i < ImGuiCol_COUNT; ++i) c[i] = tone_apply(c[i]);
+    }
 }
 
-// 依据「主题偏好 + 文档配色」决定 chrome 明暗；只在需要时真正改动。
-void sync_theme(int color_mode) {
+// 依据「界面主题 + 纸张方案」决定 chrome 的明暗与色调；只在需要时真正改动。
+//
+// 两个维度的分工（ADR-067/068）：
+//   · 明暗来自**界面主题**（用户偏好），唯一例外是「深色」纸张方案 —— 页面已经是深纸，
+//     四周留亮边反而更累眼，故强制深色 chrome（沿用 ADR-043 的判断）；
+//   · 色调来自**纸张方案**：中性表面族旋到与纸面同色相，强调色换成该方案的强调色。
+// 这样"页面暖、周围冷""页面暖、按钮冷"两个不协调从源头消失 —— 两侧走同一条映射。
+void sync_theme(int scheme) {
     const bool want_dark = (g_prefs.theme == 2) ||
                            (g_prefs.theme == 0 && system_prefers_dark_cached()) ||
-                           (color_mode == 1);  // 反色强制深色 chrome（ADR-043）
-    if (g_theme_applied && want_dark == g_dark_theme) return;
+                           (scheme == 1);   // 深色纸张方案强制深色 chrome
+    const Tone& want_tone = (scheme == 1) ? kToneDarkPage
+                          : (scheme == 2) ? kToneWarmPage
+                                          : kToneOriginal;
+    if (g_theme_applied && want_dark == g_dark_theme && tone_same(want_tone, g_tone)) return;
     g_dark_theme = want_dark;
-    g_pal = want_dark ? kPalDark : kPalLight;
+    g_tone = want_tone;
+    g_pal = tone_palette(want_dark ? kPalDark : kPalLight);
     apply_theme_colors();
     g_theme_applied = true;
 }

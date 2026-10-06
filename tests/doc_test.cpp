@@ -472,10 +472,10 @@ void run_outline_cases(const std::wstring& dir) {
     }
 }
 
-// ---- 渲染：旋转与配色（Phase 5）----
+// ---- 渲染：旋转与纸张方案（Phase 5；分层见 ADR-067）----
 //
 // real.pdf 每页 200x300 pt。断言：0°/180° 输出尺寸不变，90° 宽高互换；
-// 反色把白色背景变黑且保留 alpha；护眼把白色背景映射为暖色（R>B）。
+// 深色把白色背景映射为深暖灰且保留 alpha；暖色把白色背景映射为暖色（R>B）。
 // 这些都能在无窗口环境下由 MuPDF 直接渲染，属"可程序判定的证据"。
 void run_render_cases(const std::wstring& dir) {
     std::printf("\n-- 渲染：旋转与配色（Phase 5）--\n");
@@ -510,23 +510,140 @@ void run_render_cases(const std::wstring& dir) {
     else fail("real.pdf", "旋转 180° 尺寸 = 原尺寸", "尺寸不符");
 
     lr::PageBitmap bn, bi, be;
-    if (doc.render_page(0, 1.0f, bn, 8192, 0, lr::ColorMode::Normal) != lr::DocError::Ok ||
-        doc.render_page(0, 1.0f, bi, 8192, 0, lr::ColorMode::Invert) != lr::DocError::Ok ||
-        doc.render_page(0, 1.0f, be, 8192, 0, lr::ColorMode::EyeCare) != lr::DocError::Ok) {
+    if (doc.render_page(0, 1.0f, bn, 8192, 0, lr::PageScheme::Original) != lr::DocError::Ok ||
+        doc.render_page(0, 1.0f, bi, 8192, 0, lr::PageScheme::Dark) != lr::DocError::Ok ||
+        doc.render_page(0, 1.0f, be, 8192, 0, lr::PageScheme::Warm) != lr::DocError::Ok) {
         fail("real.pdf", "配色渲染", "render 失败");
         return;
     }
     const std::uint8_t* pn = bn.samples();
     const std::uint8_t* pi = bi.samples();
     const std::uint8_t* pe = be.samples();
-    if (pn[0] > 200) pass("real.pdf", "正常：背景为白");
-    else fail("real.pdf", "正常：背景为白", "像素不符");
-    if (pi[0] > 8 && pi[0] < 80) pass("real.pdf", "反色：背景变深灰（柔化，非纯黑）");
-    else fail("real.pdf", "反色：背景变深灰（柔化，非纯黑）", "像素不符");
-    if (pi[3] == 255 && pn[3] == 255) pass("real.pdf", "反色保留 alpha=255");
-    else fail("real.pdf", "反色保留 alpha=255", "alpha 被改");
-    if (pe[0] > pe[2]) pass("real.pdf", "护眼：背景为暖色（R>B）");
-    else fail("real.pdf", "护眼：背景为暖色（R>B）", "像素不符");
+    if (pn[0] > 200) pass("real.pdf", "原色：背景为白");
+    else fail("real.pdf", "原色：背景为白", "像素不符");
+    if (pi[0] > 8 && pi[0] < 80) pass("real.pdf", "深色：背景变深灰（柔化，非纯黑）");
+    else fail("real.pdf", "深色：背景变深灰（柔化，非纯黑）", "像素不符");
+    if (pi[3] == 255 && pn[3] == 255) pass("real.pdf", "深色保留 alpha=255");
+    else fail("real.pdf", "深色保留 alpha=255", "alpha 被改");
+    if (pe[0] > pe[2]) pass("real.pdf", "暖色：背景为暖色（R>B）");
+    else fail("real.pdf", "暖色：背景为暖色（R>B）", "像素不符");
+}
+
+// 取位图某点的 RGB（越界或无效位图返回全 0）。
+void pixel_at(const lr::PageBitmap& b, int x, int y, int out[3]) {
+    out[0] = out[1] = out[2] = 0;
+    if (!b.valid() || x < 0 || y < 0 || x >= b.width() || y >= b.height()) return;
+    const std::uint8_t* p =
+        b.samples() + static_cast<std::size_t>(y) * static_cast<std::size_t>(b.stride()) + x * 4;
+    out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+}
+
+// ---- 渲染：配色按内容分层（ADR-067）----
+//
+// 这是本 ADR 的核心断言，也是"整张位图套一个 LUT"最直接的失效证据：
+//   with_image.pdf —— 上半文字、下半纯红图（200×100 pt，占页高 1/3）。
+//     深色方案下：纸面必须变深（r<80）；**红图必须仍是红的**（r 高、b 低）。
+//     若照片被一起 LUT 变换，纯红 (255,0,0) 会映射成 (31,212,206) → b 高 → 判定失败。
+//   scan_only.pdf —— 整页就是一张白图（模拟扫描书）。
+//     深色方案下必须整页变深（r<90）；若走"照片原样叠回"，白图会以 0.88 alpha 压暗后
+//     仍停在 ~228，深色模式形同虚设。
+//   ink_black.pdf —— 中央一块纯黑（其余白纸），专门量深色 LUT 的**墨色端点**。
+//     纯黑是"最深的墨"，映射后即 LUT 的亮端；它与纸面（白底映射）的暖度必须一致。
+//     只断言纸面（r<80）看不出这个问题：原亮端 #D8D4CE 的 r-b 差是 10、纸面只有 4，
+//     正文比纸面暖 2.5 倍，深色下看着发黄。
+void run_scheme_layer_cases(const std::wstring& dir) {
+    std::printf("\n-- 渲染：配色分层（ADR-067）--\n");
+
+    const std::wstring with_img = dir + L"\\with_image.pdf";
+    if (!file_exists(with_img)) { skip("with_image.pdf", "配色分层"); }
+    else {
+        lr::Document doc;
+        if (doc.open(with_img) != lr::DocError::Ok) fail("with_image.pdf", "配色分层", "打不开");
+        else {
+            lr::PageBitmap orig, dark;
+            if (doc.render_page(0, 1.0f, orig, 8192, 0, lr::PageScheme::Original) != lr::DocError::Ok ||
+                doc.render_page(0, 1.0f, dark, 8192, 0, lr::PageScheme::Dark) != lr::DocError::Ok)
+                fail("with_image.pdf", "配色分层", "render 失败");
+            else {
+                // 图像在 PDF 坐标 (0,0)-(200,100)，设备 y 轴朝下 ⇒ 设备上 y≈250 处
+                int pc[3] = {}, pd[3] = {};
+                pixel_at(orig, 100, 250, pc);
+                pixel_at(dark, 100, 250, pd);
+                char d1[128] = {};
+                std::snprintf(d1, sizeof d1, "原色实测 rgb=(%d,%d,%d)", pc[0], pc[1], pc[2]);
+                char d2[128] = {};
+                std::snprintf(d2, sizeof d2, "深色实测 rgb=(%d,%d,%d)", pd[0], pd[1], pd[2]);
+                if (pc[0] > 240 && pc[1] < 20 && pc[2] < 20)
+                    pass("with_image.pdf", "原色：照片为纯红");
+                else fail("with_image.pdf", "原色：照片为纯红", d1);
+                if (pd[0] > 150 && pd[2] < 80)
+                    pass("with_image.pdf", "深色：照片仍是红的（未被配色变换）");
+                else fail("with_image.pdf", "深色：照片仍是红的（未被配色变换）", d2);
+                int pb[3] = {};
+                pixel_at(dark, 100, 60, pb);   // 上半页纸面（文字区之外）
+                char d3[128] = {};
+                std::snprintf(d3, sizeof d3, "深色纸面实测 rgb=(%d,%d,%d)", pb[0], pb[1], pb[2]);
+                if (pb[0] < 80)
+                    pass("with_image.pdf", "深色：纸面仍被变换为深色");
+                else fail("with_image.pdf", "深色：纸面仍被变换为深色", d3);
+            }
+        }
+    }
+
+    const std::wstring scan = dir + L"\\scan_only.pdf";
+    if (!file_exists(scan)) { skip("scan_only.pdf", "整页扫描件回退"); }
+    else {
+        lr::Document doc;
+        if (doc.open(scan) != lr::DocError::Ok) fail("scan_only.pdf", "整页扫描件回退", "打不开");
+        else {
+            lr::PageBitmap dark;
+            if (doc.render_page(0, 1.0f, dark, 8192, 0, lr::PageScheme::Dark) != lr::DocError::Ok)
+                fail("scan_only.pdf", "整页扫描件回退", "render 失败");
+            else {
+                int p[3] = {};
+                pixel_at(dark, 100, 150, p);
+                char d[128] = {};
+                std::snprintf(d, sizeof d, "页面中心实测 rgb=(%d,%d,%d)", p[0], p[1], p[2]);
+                if (p[0] < 90)
+                    pass("scan_only.pdf", "深色：整页扫描件整体变深（未留白）");
+                else fail("scan_only.pdf", "深色：整页扫描件整体变深（未留白）", d);
+            }
+        }
+    }
+
+    const std::wstring ink = dir + L"\\ink_black.pdf";
+    if (!file_exists(ink)) { skip("ink_black.pdf", "墨色与纸面暖度一致"); }
+    else {
+        lr::Document doc;
+        if (doc.open(ink) != lr::DocError::Ok) fail("ink_black.pdf", "墨色端点", "打不开");
+        else {
+            lr::PageBitmap dark;
+            if (doc.render_page(0, 1.0f, dark, 8192, 0, lr::PageScheme::Dark) != lr::DocError::Ok)
+                fail("ink_black.pdf", "墨色端点", "render 失败");
+            else {
+                int pi[3] = {}, pp[3] = {};
+                pixel_at(dark, 100, 150, pi);   // 黑块中心（PDF (40,100)-(160,200)）
+                pixel_at(dark, 100, 20, pp);    // 纸面
+                char d[160] = {};
+                std::snprintf(d, sizeof d, "墨=(%d,%d,%d) 纸=(%d,%d,%d)",
+                              pi[0], pi[1], pi[2], pp[0], pp[1], pp[2]);
+                if (pi[0] > 200 && pi[1] > 200 && pi[2] > 200)
+                    pass("ink_black.pdf", "深色：正文（纯黑）映射为浅暖灰");
+                else fail("ink_black.pdf", "深色：正文（纯黑）映射为浅暖灰", d);
+
+                const int ink_warm = pi[0] - pi[2];
+                const int paper_warm = pp[0] - pp[2];
+                const int gap = ink_warm > paper_warm ? ink_warm - paper_warm
+                                                      : paper_warm - ink_warm;
+                char d2[224] = {};
+                std::snprintf(d2, sizeof d2, "墨暖度=%d 纸暖度=%d | %s",
+                              ink_warm, paper_warm, d);
+                if (gap <= 2)
+                    pass("ink_black.pdf", "深色：正文与纸面暖度一致（LUT 两端等斜率）");
+                else fail("ink_black.pdf", "深色：正文与纸面暖度一致（LUT 两端等斜率）", d2);
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -557,6 +674,7 @@ int main(int argc, char** argv) {
     run_size_cases(dir);
     run_outline_cases(dir);
     run_render_cases(dir);
+    run_scheme_layer_cases(dir);
 
     std::printf("\n=== 结果：%d 通过 / %d 失败 / %d 跳过 ===\n", g_pass, g_fail, g_skip);
     if (g_fail > 0) {

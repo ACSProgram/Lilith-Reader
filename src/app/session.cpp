@@ -66,8 +66,11 @@ const CmdDef kCmds[kCmdCount] = {
     { "Col4",           "视图", "四页",                      false, false, kb(ImGuiKey_4),              kb(ImGuiKey_Keypad4) },
     { "ToggleSpread",   "视图", "双页对开（书籍模式）",      false, false, kb(ImGuiKey_D),              ImGuiKey_None },
     { "RotateCW",       "视图", "旋转 90°",                  false, false, kb(ImGuiKey_R),              ImGuiKey_None },
-    { "ToggleInvert",   "视图", "反色（深色）",              false, false, kb(ImGuiKey_I),              ImGuiKey_None },
-    { "ToggleSepia",    "视图", "护眼（暖色）",              false, false, kb(ImGuiKey_E),              ImGuiKey_None },
+    // id 保持 Phase 5 的历史名（"ToggleInvert"/"ToggleSepia"）：它是 ini 的**稳定标识**，
+    // 改名会让用户已自定义的 I / E 绑定找不到而退回默认值。语义已在 ADR-067 里改过，
+    // 显示名（第三列）随之更新，标识不动。
+    { "ToggleInvert",   "视图", "深色",                      false, false, kb(ImGuiKey_I),              ImGuiKey_None },
+    { "ToggleSepia",    "视图", "暖色",                      false, false, kb(ImGuiKey_E),              ImGuiKey_None },
 
     { "ToggleSidebar",  "界面", "侧栏（目录 / 书签 / 缩略图）", false, false, kb(ImGuiKey_O),           ImGuiKey_None },
     { "ToggleBookmark", "界面", "当前页书签增删",            false, false, kb(ImGuiKey_B),              ImGuiKey_None },
@@ -275,7 +278,7 @@ void push_canvas_sizes() {
 
 // 把当前旋转/配色下发给渲染层（变化即让全部纹理失效并整篇重渲）。
 void apply_view_transform() {
-    g_renderer->set_view_transform(g_rotation, static_cast<lr::ColorMode>(g_color_mode));
+    g_renderer->set_view_transform(g_rotation, static_cast<lr::PageScheme>(g_scheme));
 }
 
 // 直接设定旋转角（菜单按角度选）；与按键 R（+90 循环）共用同一套重排逻辑。
@@ -291,14 +294,14 @@ void set_rotation(int deg) {
 
 void rotate_view(int delta) { set_rotation(g_rotation + delta); }
 
-// 直接设定配色（0 正常 / 1 反色 / 2 护眼）；按键 I/E 走 toggle。
-void set_color_mode(int mode) {
-    if (g_color_mode == mode) return;
-    g_color_mode = mode;
+// 直接设定纸张方案（0 原色 / 1 深色 / 2 暖色）；按键 I/E 走 toggle。
+void set_scheme(int mode) {
+    if (g_scheme == mode) return;
+    g_scheme = mode;
     apply_view_transform();
 }
 
-void toggle_color_mode(int mode) { set_color_mode(g_color_mode == mode ? 0 : mode); }
+void toggle_scheme(int mode) { set_scheme(g_scheme == mode ? 0 : mode); }
 
 // ---------------- 阅读位置与书签 ----------------
 
@@ -312,7 +315,7 @@ void save_reading_state() {
     r.rotation = g_rotation;
     r.fit_width = g_canvas.state().fit_width;
     r.spread = g_canvas.state().spread;
-    r.color_mode = g_color_mode;
+    r.scheme = g_scheme;
     // 身份随每次落盘刷新：将来换键方案时能按位置重算，也能给管理窗口显示"上次在哪 / 还在哪"
     r.path_key = g_identity.path;
     r.page_count = g_identity.page_count;
@@ -506,7 +509,7 @@ void reset_doc_state() {
     g_scroll_drag_off = 0.0f;
     g_scroll_hover = false;
     g_rotation = 0;
-    g_color_mode = 0;
+    g_scheme = 0;
     g_show_sidebar = false;
     g_open_password = false;
     g_auth_pending = false;
@@ -531,7 +534,7 @@ void enter_reading() {
     // 恢复记忆状态（无记录则用默认：fit-width / 单列 / 不旋转 / 正常配色）
     const lr::DocRecord* rec = g_state.find(g_doc_key);
     g_rotation = rec ? rec->rotation : 0;
-    g_color_mode = rec ? rec->color_mode : 0;
+    g_scheme = rec ? rec->scheme : 0;
 
     lr::CanvasState st;  // 默认：fit_width=true, columns=1
     st.margin_px = px(kCanvasMarginPx);   // 屏幕像素 → 随 DPI
@@ -883,8 +886,8 @@ void handle_reading_commands(const ImVec2& size) {
     if (cmd_pressed(Cmd::Col4))         g_canvas.set_columns(4);
     if (cmd_pressed(Cmd::ToggleSpread)) g_canvas.set_spread(!g_canvas.state().spread);
     if (cmd_pressed(Cmd::RotateCW))     rotate_view(90);
-    if (cmd_pressed(Cmd::ToggleInvert)) toggle_color_mode(1);
-    if (cmd_pressed(Cmd::ToggleSepia))  toggle_color_mode(2);
+    if (cmd_pressed(Cmd::ToggleDark)) toggle_scheme(1);
+    if (cmd_pressed(Cmd::ToggleWarm))  toggle_scheme(2);
 
     if (cmd_pressed(Cmd::ToggleSidebar))  set_sidebar(!g_show_sidebar, 0);
     if (cmd_pressed(Cmd::ToggleBookmark)) toggle_bookmark_current();

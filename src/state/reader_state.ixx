@@ -48,7 +48,7 @@ struct DocRecord {
     int   rotation = 0;       // 0/90/180/270
     bool  fit_width = true;   // 是否 fit-width 模式
     bool  spread = false;     // 双页对开（书籍模式）
-    int   color_mode = 0;     // 0 正常 / 1 反色 / 2 护眼
+    int   scheme = 0;     // 纸张方案：0 原色 / 1 深色 / 2 暖色（lr::PageScheme）
     std::vector<Bookmark> bookmarks;
 
     // ---- 身份（ADR-062 / ADR-065）----
@@ -130,12 +130,12 @@ struct ReaderState {
 //       每条记录： u64 key | u64 path_key | i32 page_count
 //                  | u32 loc_count | loc_count × (u32 len | bytes)
 //                  | i32 page | u32 zoom(bits) | i32 columns | i32 rotation
-//                  | u32 flags(bit0 fit_width, bit1 spread) | i32 color_mode
+//                  | u32 flags(bit0 fit_width, bit1 spread) | i32 scheme
 //                  | u32 bookmark_count | 每个书签: i32 page | u32 label_len | label bytes
 //   v2：与 v3 同构，但"位置"只有一个（u32 len | bytes）→ 非空时填进 locations[0]。
 //   v1：magic 'L''R''S''1' | u32 version=1 | u32 doc_count
 //       每条记录： u64 key | i32 page | u32 zoom | i32 columns | i32 rotation
-//                  | u32 flags | i32 color_mode | u32 bookmark_count | 书签…
+//                  | u32 flags | i32 scheme | u32 bookmark_count | 书签…
 //       解码时把 key 当作 path_key 填入（v1 的键就是路径键），page_count=0、locations 为空。
 [[nodiscard]] std::vector<std::uint8_t> encode_state(const ReaderState& s);
 

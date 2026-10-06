@@ -135,6 +135,11 @@ def source_chars() -> tuple[set[str], dict[str, list[str]]]:
                 continue
             if path.resolve() == Path(__file__).resolve():
                 continue
+            # 跳过构建产物目录：里面的文件是生成物（测试日志、临时脚本、中间产物），
+            # 不属于"界面自述文字"。把它们算进字符集只会制造假失败
+            # （例如日志里的原文输出把 U+2315 这类符号带进来）。
+            if "_build" in path.parts:
+                continue
             try:
                 text = path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
