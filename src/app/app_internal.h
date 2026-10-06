@@ -254,6 +254,12 @@ void refresh_dpi_scale();   // 读取窗口所在显示器 DPI；变化时重算
 
 // ---- 用户偏好（落盘 exe 同目录 LilithReader.ini）----
 // 只有真正需要跨会话记忆的量放这里；阅读位置/书签仍归 reader_state.bin（ADR-034）。
+
+// 「智能匹配」三态（ADR-062）：文件内容指纹命中但路径变了时的处置方式。
+// 关 = 只认路径（旧行为）；询问 = 弹确认框（默认沿用，可选"从头开始"）；自动 = 静默沿用。
+inline constexpr int kSmartMatchOff  = 0;
+inline constexpr int kSmartMatchAsk  = 1;
+inline constexpr int kSmartMatchAuto = 2;
 struct UiPrefs {
     float ui_scale = 1.0f;             // [ui] UiScale      0.80~1.50
     int   theme = 0;                   // [ui] Theme        0 跟随系统 / 1 浅色 / 2 深色
@@ -261,6 +267,7 @@ struct UiPrefs {
     bool  motion = true;               // [ui] Motion       页面淡入 / 滚动指示条渐隐
     float gap_percent = kCanvasGapRatio * 100.0f;  // [ui] GapPercent   页面间距（列宽百分比）0~6
     int   cache_mb = 512;              // [cache] BudgetMB  128~2048
+    int   smart_match = kSmartMatchAsk;// [reading] SmartMatch  0 关 / 1 询问 / 2 自动（ADR-062）
 };
 inline UiPrefs g_prefs;
 inline bool g_apply_scale_pending = false;  // 界面缩放改动：样式留到下一帧首应用
@@ -303,9 +310,10 @@ struct UiDoc {
 };
 inline UiDoc g_doc;
 
-// ---- 阅读状态持久化（ADR-034）----
-inline lr::ReaderState g_state;     // exe 同目录 reader_state.bin 的全部记录
-inline std::uint64_t   g_doc_key = 0;  // 当前文档键（0 = 无效，不参与存取）
+// ---- 阅读状态持久化（ADR-034；身份分层 ADR-062）----
+inline lr::ReaderState  g_state;      // exe 同目录 reader_state.bin 的全部记录
+inline lr::DocIdentity  g_identity;   // 当前文档身份（内容指纹 / 路径键 / 页数 / 路径）
+inline std::uint64_t    g_doc_key = 0;  // 当前文档在库里的主键（0 = 无效，不参与存取）
 
 // ---- 侧栏（目录 / 书签 / 缩略图）----
 inline bool g_show_sidebar = false;
@@ -395,6 +403,15 @@ void close_document();
 void poll_document();               // 帧首接收后台打开/认证结果
 void submit_password();
 void update_title();
+
+// ---- 阅读数据的身份解析与维护（ADR-062）----
+// 文档打开成功时调用：算出身份（工作线程给的指纹 + 路径键），分层定位记录并落定主键。
+void resolve_document_identity(std::uint64_t content_fp);
+// 「从头开始」：清掉当前文档的阅读位置与书签，跳回第 1 页（视图参数保留）。
+void reset_current_progress();
+// 删除一条阅读数据；若它是当前文档，同时解除本次会话的绑定（不再写入）。
+void clear_reading_data(std::uint64_t key);
+void clear_all_reading_data();
 
 void push_canvas_sizes();           // 逐页尺寸（含旋转折算）下发画布
 void apply_view_transform();        // 旋转/配色下发渲染层
@@ -492,6 +509,22 @@ int  find_bind_conflict(int cmd, int slot); // 冲突命令下标；无冲突 -1
 
 inline bool g_show_debug = false;
 inline bool g_show_settings = false;
+
+// ---- 通用确认弹窗（ADR-062）----
+// 一处弹窗、多处复用：① 智能匹配的"要不要沿用"询问；② 阅读数据删除 / 清空的二次确认。
+// 两个按钮都是动作：主按钮 = 推荐动作，次按钮 = 另一动作或取消。
+enum class ConfirmKind : int { None, Relocate, ClearOne, ClearAll };
+
+inline ConfirmKind   g_confirm_kind = ConfirmKind::None;
+inline bool          g_confirm_open = false;
+inline std::string   g_confirm_title;      // 标题
+inline std::string   g_confirm_body;       // 正文（可含换行，按窗口宽度折行）
+inline std::string   g_confirm_ok;         // 主按钮文案
+inline std::string   g_confirm_alt;        // 次按钮文案
+inline std::uint64_t g_confirm_target = 0; // ClearOne：要删的那条记录的主键
+
+// ---- 阅读数据管理窗口（ADR-062）：列出全部记录，可删单条 / 清空全部 ----
+inline bool g_show_reading_data = false;
 // 打开设置时要求选中的分栏（0 界面 / 1 阅读 / 2 性能 / 3 按键）；-1 = 保持上次。
 // 由 OpenSettings（Ctrl+,）与 OpenKeys（F1）设置，绘制后立即复位。
 inline int g_settings_open_tab = -1;
@@ -531,7 +564,12 @@ void draw_canvas_context_menu();
 void draw_debug_overlay();
 void draw_jump_popup();
 void draw_password_popup();
+void draw_confirm_popup();          // 通用确认弹窗（智能匹配询问 / 删除二次确认，ADR-062）
+void draw_reading_data_window();    // 阅读数据管理窗口（ADR-062）
 void draw_settings_window();
+// 打开确认弹窗（由 session 在需要用户拍板时调用）。kind 决定按钮动作的归属。
+void request_confirm(ConfirmKind kind, std::string title, std::string body,
+                     std::string ok_label, std::string alt_label, std::uint64_t target = 0);
 void update_toolbar_visibility();
 bool top_bar_should_show();
 float update_top_bar_height(float dt);   // 顶栏高度的滑入/滑出插值

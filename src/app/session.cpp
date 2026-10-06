@@ -277,7 +277,79 @@ void save_reading_state() {
     r.fit_width = g_canvas.state().fit_width;
     r.spread = g_canvas.state().spread;
     r.color_mode = g_color_mode;
+    // 身份随每次落盘刷新：将来换键方案时能按 last_path 重算，也能给管理窗口显示"上次在哪"
+    r.path_key = g_identity.path;
+    r.page_count = g_identity.page_count;
+    r.last_path_u8 = g_identity.path_u8;
     (void)lr::save_state(g_state_path, g_state);  // 书签在增删时已写入 g_state，这里不覆盖
+}
+
+// ---- 身份解析与阅读数据维护（ADR-062）----
+//
+// 打开成功时才解析：内容指纹由**工作线程**在打开前算好随 DocState 带回来（UI 线程不读
+// 文件内容，ADR-009），页数也只在打开后才知道（页数不同 = 不是同一版，不能继承书签）。
+void resolve_document_identity(std::uint64_t content_fp) {
+    g_identity = lr::DocIdentity{};
+    g_identity.content = content_fp;
+    g_identity.path = lr::document_key(g_doc.path_w);   // 元数据调用，微秒级（ADR-009 取舍）
+    g_identity.page_count = g_doc.info.page_count;
+    g_identity.path_u8 = lr::wide_to_utf8(g_doc.path_w);
+
+    const bool smart = g_prefs.smart_match != kSmartMatchOff;
+    const lr::DocMatch m = lr::locate(g_state, g_identity, smart);
+    if (m.index < 0) {
+        g_doc_key = lr::primary_key(g_identity);   // 新文档：主键 = 指纹（取不到则路径键）
+        return;
+    }
+
+    // 命中：**先沿用**（绝不因为询问流程丢进度），再按设置决定要不要问一句。
+    const lr::DocRecord& hit = g_state.docs[static_cast<std::size_t>(m.index)].second;
+    const std::string old_path = hit.last_path_u8;
+    const int old_page = hit.page;
+    const int old_marks = static_cast<int>(hit.bookmarks.size());
+    g_doc_key = lr::adopt(g_state, static_cast<std::size_t>(m.index), g_identity);
+
+    if (m.relocated && g_prefs.smart_match == kSmartMatchAsk) {
+        char body[640];
+        std::snprintf(body, sizeof body,
+                      "这份文档与库中已有的一份阅读数据内容相同。\n"
+                      "原位置：%s\n"
+                      "已记录：第 %d 页，%d 个书签",
+                      old_path.empty() ? "(未知位置)" : old_path.c_str(),
+                      old_page + 1, old_marks);
+        request_confirm(ConfirmKind::Relocate, "沿用这份阅读数据？", body,
+                        "沿用进度", "从头开始", 0);
+    }
+}
+
+// 「从头开始」：只清"读到哪"与书签；视图参数（缩放/列数/配色）是通用偏好，保留。
+void reset_current_progress() {
+    if (g_doc_key == 0) return;
+    lr::DocRecord* r = nullptr;
+    for (auto& kv : g_state.docs)
+        if (kv.first == g_doc_key) { r = &kv.second; break; }
+    if (r == nullptr) return;
+    r->page = 0;
+    r->bookmarks.clear();
+    (void)lr::save_state(g_state_path, g_state);
+    if (g_doc.kind == UiDoc::Kind::Reading) {
+        g_restore_pending = false;      // 首帧待恢复的位置作废
+        request_jump_scroll(0, 0.0f);
+    }
+}
+
+void clear_reading_data(std::uint64_t key) {
+    if (key == 0) return;
+    g_state.erase(key);
+    // 删的正是当前在读的那本：解除本次会话的绑定（不再写入），下次打开按新文档处理。
+    if (key == g_doc_key) g_doc_key = 0;
+    (void)lr::save_state(g_state_path, g_state);
+}
+
+void clear_all_reading_data() {
+    g_state.docs.clear();
+    g_doc_key = 0;
+    (void)lr::save_state(g_state_path, g_state);
 }
 
 bool current_page_has_bookmark() {
@@ -334,6 +406,7 @@ void reset_doc_state() {
     g_scroll_dir = 0;
     g_prev_scroll_y = 0.0f;
     g_doc_key = 0;
+    g_identity = lr::DocIdentity{};
     g_outline.clear();
     g_raw_sizes.clear();
     g_page_fade.clear();
@@ -431,7 +504,11 @@ void request_open_document(std::wstring path) {
     g_outline.clear();
     g_show_sidebar = false;
     g_auth_pending = false;  // 新开文档：清掉上一次可能残留的认证在途标记
-    g_doc_key = lr::document_key(path);  // 0 = 取不到属性（不存在等）
+    // 身份要等打开成功（指纹由工作线程算、页数只有打开后才知道）才解析，见 resolve_document_identity
+    g_doc_key = 0;
+    g_identity = lr::DocIdentity{};
+    g_confirm_open = false;          // 上一次可能还挂着一个"是否沿用"的询问
+    g_confirm_kind = ConfirmKind::None;
 
     // 本地即时判定：不存在 / 不在支持清单内（不必浪费一次线程往返）
     if (!lr::file_exists(path)) {
@@ -477,6 +554,7 @@ void poll_document() {
         g_auth_pending = false;
         g_open_password = false;
         std::memset(g_password_buf, 0, sizeof g_password_buf);  // 解锁成功：明文密码不再需要（ADR-039）
+        resolve_document_identity(snap.file_fingerprint);  // 先定位记录，再恢复阅读位置
         enter_reading();
         break;
     case lr::DocPhase::Failed:

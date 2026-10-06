@@ -1093,6 +1093,162 @@ void draw_top_bar(float bar_h) {
     ImGui::EndChild();
 }
 
+// ---------------- 通用确认弹窗（ADR-062）----------------
+//
+// 浮动窗口的默认尺寸与位置：期望值按视口上限钳制后居中，小屏/低分辨率下也不超出屏幕。
+ImVec2 clamp_to_viewport(const ImGuiViewport* vp, const ImVec2& want) {
+    return ImVec2(std::min(want.x, vp->Size.x * 0.92f),
+                  std::min(want.y, vp->Size.y * 0.90f));
+}
+ImVec2 centered_on_viewport(const ImGuiViewport* vp, const ImVec2& size) {
+    return ImVec2(vp->Pos.x + (vp->Size.x - size.x) * 0.5f,
+                  vp->Pos.y + (vp->Size.y - size.y) * 0.5f);
+}
+
+// 一处弹窗、多处复用：① 智能匹配的"要不要沿用这份阅读数据"询问（主=沿用 / 次=从头开始）；
+// ② 阅读数据删除 / 清空的二次确认（主=删除 / 次=取消）。与跳页、密码弹窗同一套开合动效
+// （ADR-059）：逻辑关闭只把目标降到 0，等动画收敛后再真正销毁 popup。
+ToggleAnim g_confirm_anim;
+
+void request_confirm(ConfirmKind kind, std::string title, std::string body,
+                     std::string ok_label, std::string alt_label, std::uint64_t target) {
+    // 已有确认在挂起时**不覆盖**：先到的那个才是用户该先处理的。
+    if (g_confirm_open) return;
+    g_confirm_kind = kind;
+    g_confirm_title = std::move(title);
+    g_confirm_body = std::move(body);
+    g_confirm_ok = std::move(ok_label);
+    g_confirm_alt = std::move(alt_label);
+    g_confirm_target = target;
+    g_confirm_open = true;
+}
+
+void draw_confirm_popup() {
+    const bool alive = g_confirm_anim.step(ImGui::GetIO().DeltaTime, g_confirm_open, g_prefs.motion);
+    const bool is_open = ImGui::IsPopupOpen("确认");
+    if (!is_open && !g_confirm_open) return;   // 无弹窗、也无打开请求：不参与
+    if (!is_open) ImGui::OpenPopup("确认");
+    popup_anim_apply(g_confirm_anim);
+    if (ImGui::BeginPopupModal("确认", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted(g_confirm_title.c_str());
+        ImGui::Spacing();
+        ImGui::PushTextWrapPos(px(380.0f));   // 路径可能很长：按窗口宽度折行，不把弹窗撑爆
+        ImGui::TextUnformatted(g_confirm_body.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        ImGui::BeginDisabled(!g_confirm_open);   // 淡出中不再响应，避免重复触发
+        const bool ok = ImGui::Button(g_confirm_ok.c_str());
+        ImGui::SameLine();
+        const bool alt = ImGui::Button(g_confirm_alt.c_str());
+        ImGui::EndDisabled();
+        if (ok || alt) {
+            const ConfirmKind kind = g_confirm_kind;
+            const std::uint64_t target = g_confirm_target;
+            g_confirm_open = false;             // 逻辑关：动画收敛后再 CloseCurrentPopup
+            g_confirm_kind = ConfirmKind::None;
+            if (ok) {
+                // 主按钮：确认动作。Relocate 无需动作 —— 命中时已经沿用（adopt 过）了。
+                if (kind == ConfirmKind::ClearOne) clear_reading_data(target);
+                else if (kind == ConfirmKind::ClearAll) clear_all_reading_data();
+            } else if (kind == ConfirmKind::Relocate) {
+                reset_current_progress();       // 次按钮 = 从头开始
+            }
+        }
+        if (!alive) { ImGui::CloseCurrentPopup(); g_confirm_target = 0; }
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleVar();
+}
+
+// ---------------- 阅读数据管理窗口（ADR-062）----------------
+//
+// reader_state.bin 里每份文档一条（阅读位置 / 视图参数 / 书签）。以前这份数据只能"攒着"：
+// 文件删了、换电脑了、不想留痕迹了都没处清理。这里给出清单式入口：单条删除 + 全部清空，
+// 删除/清空都过一遍确认弹窗（复用上面的通用弹窗）。
+namespace {
+
+// 路径 → 文件名（UTF-8 进出）。记录里没有路径时退回"未知文档"。
+std::string record_display_name(const std::string& path_u8) {
+    if (path_u8.empty()) return "(未知文档)";
+    const std::wstring w = lr::utf8_to_wide(path_u8);
+    const std::string name = lr::wide_to_utf8(lr::file_name_of(w));
+    return name.empty() ? "(未知文档)" : name;
+}
+
+}  // namespace
+
+void draw_reading_data_window() {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const ImVec2 size = clamp_to_viewport(vp, ImVec2(px(520.0f), px(420.0f)));
+    ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(centered_on_viewport(vp, size), ImGuiCond_FirstUseEver);
+
+    bool keep = true;
+    if (ImGui::Begin("阅读数据##reading_data", &keep,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+        const float footer_h = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y * 2.0f;
+        const ImVec4 dim = ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim);
+
+        ImGui::BeginChild("##rd_list", ImVec2(0, -footer_h), false, ImGuiWindowFlags_NoNav);
+        if (g_state.docs.empty()) {
+            ImGui::TextDisabled("还没有记录任何阅读数据。");
+            ImGui::TextDisabled("读到哪、书签和视图参数会在关闭文档时自动记下。");
+        }
+        const float btn_w = ImGui::CalcTextSize("×").x + ImGui::GetStyle().FramePadding.x * 4.0f;
+        const float right = ImGui::GetContentRegionMax().x - btn_w;
+        for (std::size_t i = 0; i < g_state.docs.size(); ++i) {
+            const std::uint64_t key = g_state.docs[i].first;
+            const lr::DocRecord& r = g_state.docs[i].second;
+            ImGui::PushID(static_cast<int>(i));
+
+            const std::string name = record_display_name(r.last_path_u8);
+            ImGui::TextUnformatted(name.c_str());
+            ImGui::SameLine(right);
+            if (ImGui::Button("×", ImVec2(btn_w, 0))) {
+                char body[640];
+                std::snprintf(body, sizeof body,
+                              "《%s》\n%s\n\n将删除它的阅读位置与书签，文档本身不受影响。",
+                              name.c_str(),
+                              r.last_path_u8.empty() ? "(位置未知)" : r.last_path_u8.c_str());
+                request_confirm(ConfirmKind::ClearOne, "删除这条阅读数据？", body,
+                                "删除", "取消", key);
+            }
+            char line[256];
+            if (r.page_count > 0)
+                std::snprintf(line, sizeof line, "第 %d / %d 页 · %d 个书签",
+                              r.page + 1, r.page_count, static_cast<int>(r.bookmarks.size()));
+            else
+                std::snprintf(line, sizeof line, "第 %d 页 · %d 个书签",
+                              r.page + 1, static_cast<int>(r.bookmarks.size()));
+            ImGui::TextColored(dim, "%s", line);
+            if (!r.last_path_u8.empty()) {
+                ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x);
+                ImGui::TextColored(dim, "%s", r.last_path_u8.c_str());
+                ImGui::PopTextWrapPos();
+            }
+            ImGui::Spacing();
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+
+        ImGui::Separator();
+        ImGui::BeginDisabled(g_state.docs.empty());
+        if (ImGui::Button("清空全部")) {
+            char body[128];
+            std::snprintf(body, sizeof body,
+                          "将删除全部 %d 条阅读数据（阅读位置与书签）。\n文档本身不受影响。",
+                          static_cast<int>(g_state.docs.size()));
+            request_confirm(ConfirmKind::ClearAll, "清空全部阅读数据？", body, "清空", "取消", 0);
+        }
+        ImGui::EndDisabled();
+        const float close_w = ImGui::CalcTextSize("关闭").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        ImGui::SameLine(ImGui::GetWindowWidth() - close_w - ImGui::GetStyle().WindowPadding.x);
+        if (ImGui::Button("关闭")) g_show_reading_data = false;
+    }
+    ImGui::End();
+    if (!keep) g_show_reading_data = false;
+}
+
 // ---- 设置窗口（分栏：界面 / 阅读 / 性能 / 按键） ----
 
 void reset_prefs_to_default() {
@@ -1102,17 +1258,6 @@ void reset_prefs_to_default() {
     g_renderer->set_cache_budget(static_cast<std::size_t>(g_prefs.cache_mb) * 1024ull * 1024ull);
     apply_gap_pref();
     save_prefs();
-}
-
-// 浮动窗口（设置/调试）的默认尺寸与位置：期望值按视口上限钳制后居中，
-// 小屏/低分辨率下也不会超出屏幕。
-ImVec2 clamp_to_viewport(const ImGuiViewport* vp, const ImVec2& want) {
-    return ImVec2(std::min(want.x, vp->Size.x * 0.92f),
-                  std::min(want.y, vp->Size.y * 0.90f));
-}
-ImVec2 centered_on_viewport(const ImGuiViewport* vp, const ImVec2& size) {
-    return ImVec2(vp->Pos.x + (vp->Size.x - size.x) * 0.5f,
-                  vp->Pos.y + (vp->Size.y - size.y) * 0.5f);
 }
 
 // ---- 设置项表格（左列标签 + 右列控件）----
@@ -1186,6 +1331,17 @@ void draw_settings_reading_tab() {
         int cm = g_color_mode;
         if (ImGui::Combo("##color", &cm, colors, IM_ARRAYSIZE(colors))) set_color_mode(cm);
         settings_note("快捷键见「按键」分栏");
+
+        settings_row("智能匹配");
+        const char* smart[] = { "关（只认路径）", "询问", "自动沿用" };
+        if (ImGui::Combo("##smart", &g_prefs.smart_match, smart, IM_ARRAYSIZE(smart)))
+            save_prefs();
+        ImGui::Spacing();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim),
+                           "%s", "按内容指纹识别同一份文档：移动、复制、重新解压后仍能接着读");
+        settings_row("阅读数据");
+        if (ImGui::Button("管理…", ImVec2(px(90.0f), 0))) g_show_reading_data = true;
+        settings_note("查看并删除已记录的阅读位置与书签");
         settings_rows_end();
     }
 }
@@ -1389,7 +1545,7 @@ namespace {
 // 有则**不派发全局命令**：一来避免 Esc 之类"既关弹窗又触发命令"（Esc 现已是可绑定键），
 // 二来对话框期间应用级快捷键本就不该抢输入。
 bool any_dialog_open() {
-    if (g_show_settings || g_open_jump || g_open_password) return true;
+    if (g_show_settings || g_open_jump || g_open_password || g_show_reading_data) return true;
     return ImGui::IsPopupOpen(nullptr,
                               ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
 }
@@ -1492,6 +1648,8 @@ void draw_shell() {
     if (g_show_debug) draw_debug_overlay();
     draw_jump_popup();
     draw_password_popup();
+    draw_confirm_popup();                                   // 智能匹配询问 / 删除二次确认
+    if (g_show_reading_data) draw_reading_data_window();
     draw_settings_window();
     update_key_capture();   // 在设置窗口绘制之后推进按键捕获（跳过"点按钮"那一帧的鼠标点击）
 
@@ -1509,6 +1667,13 @@ void draw_shell() {
             g_open_jump = false;
         } else if (g_show_settings) {
             g_show_settings = false;
+        } else if (g_show_reading_data) {
+            g_show_reading_data = false;
+        } else if (g_confirm_open) {
+            // 确认弹窗上按 Esc = 次按钮（"取消"）；智能匹配的次按钮是"从头开始"，
+            // 那不是 Esc 该替用户做的决定，故这里只按"沿用"（已经沿用过了）关掉弹窗。
+            g_confirm_open = false;
+            g_confirm_kind = ConfirmKind::None;
         }
     }
 }

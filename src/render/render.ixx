@@ -74,6 +74,10 @@ struct DocState {
     DocumentInfo  info{};
     std::string   detail_u8;   // 失败时的原始错误信息（UTF-8）
     std::uint64_t id = 0;      // 请求序号，UI 用它丢弃过期结果
+    // 打开时刻的**稀疏采样内容指纹**（`lr::file_fingerprint`，ADR-062）：跨路径稳定的
+    // "同一份文件"判据，UI 侧用它定位阅读记录。由工作线程在打开前算好（UI 线程不读
+    // 文件内容，ADR-009）；取不到时为 0，调用方退回路径键。
+    std::uint64_t file_fingerprint = 0;
 };
 
 // 一次渲染请求：把某页渲染到目标倍率（倍率 1.0 = 72dpi）

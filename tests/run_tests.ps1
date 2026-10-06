@@ -150,7 +150,8 @@ Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\reader_state.ifc", "/Fo$out\r
     (Join-Path $src "state\reader_state.ixx"))) "编译 reader_state.ixx"
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\reader_state.ifc",
     "/Fo$out\reader_state.obj", (Join-Path $src "state\reader_state.cpp"))) "编译 reader_state.cpp"
-Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\reader_state.ifc",
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\utils.ifc",
+    "/reference", "$out\reader_state.ifc",
     "/Fo$out\reader_state_test.obj", (Join-Path $tests "reader_state_test.cpp"))) "编译 reader_state_test.cpp"
 
 # 依赖库清单取自 unofficial-libmupdf 的 INTERFACE_LINK_LIBRARIES（不能改成"链上 lib\*.lib"：

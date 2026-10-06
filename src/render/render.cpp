@@ -39,6 +39,7 @@ module lilithreader.render;
 
 import lilithreader.document;
 import lilithreader.page_cache;
+import lilithreader.utils;   // file_fingerprint（ADR-062）
 
 namespace lr {
 namespace {
@@ -157,6 +158,10 @@ struct Renderer::Impl {
     // 两段式退役队列（见文件头）
     std::vector<void*>  retired_pending;
     std::vector<void*>  retired_ready;
+
+    // 内容指纹（ADR-062）：**工作线程**在打开前算好（≤320KB 采样读），UI 线程不读文件内容。
+    // 加密文档打开会失败在 NeedsPassword，指纹要留给随后 authenticate 成功的那次发布，故存一份。
+    std::uint64_t fp_ = 0;
 
     Document     doc_engine;  // 仅工作线程访问
     std::jthread worker;
@@ -332,6 +337,8 @@ struct Renderer::Impl {
 
         DocState s;
         s.id = c.id;
+        fp_ = lr::file_fingerprint(c.path);   // 工作线程：不占 UI 时间（ADR-009）
+        s.file_fingerprint = fp_;
         const DocError err = doc_engine.open(c.path);
         if (err == DocError::Ok) {
             DocumentInfo info;
@@ -373,12 +380,14 @@ struct Renderer::Impl {
         last_wants.clear();
         info_ = DocumentInfo{};
         outline_.clear();
+        fp_ = 0;
         doc = s;
     }
 
     void do_auth(const Command& c) {
         DocState s;
         s.id = c.id;
+        s.file_fingerprint = fp_;   // 解锁成功时沿用打开时算的指纹（密码错误也不重算）
         const DocError err = doc_engine.authenticate(c.password);
         if (err == DocError::Ok) {
             DocumentInfo info;

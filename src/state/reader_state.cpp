@@ -1,4 +1,4 @@
-// reader_state.cpp — lilithreader.reader_state 的实现单元（Phase 5）
+// reader_state.cpp — lilithreader.reader_state 的实现单元（Phase 5，ADR-062 增身份分层）
 //
 // 两部分：
 //   1. 纯序列化（encode_state / decode_state）——不碰磁盘，可单测；
@@ -46,7 +46,7 @@ void put_u32(std::vector<std::uint8_t>& b, std::uint32_t v) {
     b.push_back(static_cast<std::uint8_t>((v >> 24) & 0xFF));
 }
 void put_u64(std::vector<std::uint8_t>& b, std::uint64_t v) {
-    for (int i = 0; i < 8; ++i) b.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF));
+    for (int i = 0; i < 8; ++i) b.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
 }
 
 // 带边界检查的读取器：任何越界即置 bad，后续读取全部返回 0。
@@ -78,9 +78,9 @@ struct Reader {
     }
     std::int32_t i32() { return static_cast<std::int32_t>(u32()); }
     float f32() { return std::bit_cast<float>(u32()); }
-    // 拷贝 n 字节到 string（已按上限钳制）
-    std::string str(std::uint32_t len) {
-        if (!need(len)) return {};
+    // 拷贝 n 字节到 string；n 超过 max 视为损坏（返回空并置 bad）
+    std::string str(std::uint32_t len, std::uint32_t max) {
+        if (len > max || !need(len)) { bad = true; return {}; }
         std::string s(reinterpret_cast<const char*>(p + off), len);
         off += len;
         return s;
@@ -106,6 +106,80 @@ std::vector<std::uint8_t> read_file(const std::wstring& path) noexcept {
     CloseHandle(h);
     if (!ok || read != out.size()) { out.clear(); return out; }
     return out;
+}
+
+// 字段钳制：损坏/越界值不让它进入内存（rotation 归一到 0/90/180/270）
+void clamp_record(DocRecord& r) noexcept {
+    r.columns = r.columns < 1 ? 1 : (r.columns > 4 ? 4 : r.columns);
+    r.rotation %= 360;
+    if (r.rotation < 0) r.rotation += 360;
+    r.rotation = (r.rotation / 90) * 90;
+    r.color_mode = r.color_mode < 0 ? 0 : (r.color_mode > 2 ? 2 : r.color_mode);
+    if (!(r.zoom > 0.0f) || r.zoom > 100.0f) r.zoom = 1.0f;
+    if (r.page < 0) r.page = 0;
+    if (r.page_count < 0) r.page_count = 0;
+}
+
+// 书签表（两版共用）
+bool read_bookmarks(Reader& rd, DocRecord& r) noexcept {
+    const std::uint32_t bm = rd.u32();
+    if (rd.bad || bm > kMaxBookmarksPerDoc) return false;
+    r.bookmarks.reserve(bm);
+    for (std::uint32_t j = 0; j < bm; ++j) {
+        Bookmark k;
+        k.page = rd.i32();
+        const std::uint32_t len = rd.u32();
+        k.label = rd.str(len, kMaxLabelBytes);
+        if (rd.bad) return false;
+        if (k.page < 0) k.page = 0;
+        r.bookmarks.push_back(std::move(k));
+    }
+    return !rd.bad;
+}
+
+// 记录体（v2：key 之后是身份三件套，再是阅读状态）
+bool read_record_v2(Reader& rd, std::uint64_t key, ReaderState& tmp) noexcept {
+    DocRecord r;
+    r.path_key = rd.u64();
+    r.page_count = rd.i32();
+    const std::uint32_t plen = rd.u32();
+    r.last_path_u8 = rd.str(plen, kMaxPathBytes);
+    if (rd.bad) return false;
+
+    r.page = rd.i32();
+    r.zoom = rd.f32();
+    r.columns = rd.i32();
+    r.rotation = rd.i32();
+    const std::uint32_t flags = rd.u32();
+    r.color_mode = rd.i32();
+    r.fit_width = (flags & 1u) != 0;
+    r.spread = (flags & 2u) != 0;
+    if (rd.bad) return false;
+
+    if (!read_bookmarks(rd, r)) return false;
+    clamp_record(r);
+    if (key != 0) tmp.docs.emplace_back(key, std::move(r));
+    return true;
+}
+
+// 记录体（v1：只有阅读状态，key 本身即路径键 → 填进 path_key）
+bool read_record_v1(Reader& rd, std::uint64_t key, ReaderState& tmp) noexcept {
+    DocRecord r;
+    r.page = rd.i32();
+    r.zoom = rd.f32();
+    r.columns = rd.i32();
+    r.rotation = rd.i32();
+    const std::uint32_t flags = rd.u32();
+    r.color_mode = rd.i32();
+    r.fit_width = (flags & 1u) != 0;
+    r.spread = (flags & 2u) != 0;
+    if (rd.bad) return false;
+
+    if (!read_bookmarks(rd, r)) return false;
+    clamp_record(r);
+    r.path_key = key;   // v1 的键就是"路径+大小+修改时间"哈希，迁移成兜底键
+    if (key != 0) tmp.docs.emplace_back(key, std::move(r));
+    return true;
 }
 
 }  // namespace
@@ -161,18 +235,79 @@ std::uint64_t document_key(const std::wstring& path) noexcept {
     return h == 0 ? 1 : h;
 }
 
+// ---- 身份分层（ADR-062）----
+
+std::uint64_t primary_key(const DocIdentity& id) noexcept {
+    if (id.content != 0) return id.content;
+    return id.path;   // 都取不到时返回 0 = 不参与存取
+}
+
+DocMatch locate(const ReaderState& s, const DocIdentity& id, bool smart) noexcept {
+    DocMatch m;
+    const std::size_t n = s.docs.size();
+
+    // 页数已知且与记录不符 → 不是同一版（书签会错位），不接受这条记录
+    const auto usable = [&](const DocRecord& r) noexcept {
+        return id.page_count <= 0 || r.page_count <= 0 || r.page_count == id.page_count;
+    };
+
+    // 1) 内容指纹：文件被移动 / 复制 / 重新解压后仍能命中
+    if (smart && id.content != 0) {
+        for (std::size_t i = 0; i < n; ++i) {
+            if (s.docs[i].first != id.content) continue;
+            const DocRecord& r = s.docs[i].second;
+            if (!usable(r)) continue;
+            m.index = static_cast<int>(i);
+            m.relocated = !r.last_path_u8.empty() && r.last_path_u8 != id.path_u8;
+            return m;
+        }
+    }
+
+    // 2) 路径键：同一位置直接沿用（v1 记录也经这一层迁移）
+    if (id.path != 0) {
+        for (std::size_t i = 0; i < n; ++i) {
+            const DocRecord& r = s.docs[i].second;
+            if (s.docs[i].first != id.path && r.path_key != id.path) continue;
+            if (!usable(r)) continue;
+            m.index = static_cast<int>(i);
+            m.relocated = false;   // 路径键含路径，能命中就说明位置没变
+            return m;
+        }
+    }
+    return m;
+}
+
+std::uint64_t adopt(ReaderState& s, std::size_t idx, const DocIdentity& id) noexcept {
+    if (idx >= s.docs.size()) return 0;
+    DocRecord& r = s.docs[idx].second;
+    r.path_key = id.path;
+    r.page_count = id.page_count;
+    r.last_path_u8 = id.path_u8;
+    const std::uint64_t key = primary_key(id);
+    if (key != 0) s.docs[idx].first = key;   // 改挂到内容指纹下：以后换位置也能直接命中
+    return s.docs[idx].first;
+}
+
 // ---- 序列化 ----
 
 std::vector<std::uint8_t> encode_state(const ReaderState& s) {
     std::vector<std::uint8_t> b;
-    b.reserve(64 + s.docs.size() * 48);
-    b.push_back('L'); b.push_back('R'); b.push_back('S'); b.push_back('1');
+    b.reserve(64 + s.docs.size() * 64);
+    b.push_back('L'); b.push_back('R'); b.push_back('S'); b.push_back('2');
     put_u32(b, kStateVersion);
     put_u32(b, static_cast<std::uint32_t>(s.docs.size()));
 
     for (const auto& kv : s.docs) {
         const DocRecord& r = kv.second;
         put_u64(b, kv.first);
+        put_u64(b, r.path_key);
+        put_u32(b, static_cast<std::uint32_t>(r.page_count));
+        // 路径按上限截断（超长路径不进文件，宁可丢"上次在哪"也不让文件膨胀）
+        std::uint32_t plen = static_cast<std::uint32_t>(r.last_path_u8.size());
+        if (plen > kMaxPathBytes) plen = kMaxPathBytes;
+        put_u32(b, plen);
+        b.insert(b.end(), r.last_path_u8.begin(), r.last_path_u8.begin() + plen);
+
         put_u32(b, static_cast<std::uint32_t>(r.page));
         put_u32(b, std::bit_cast<std::uint32_t>(r.zoom));
         put_u32(b, static_cast<std::uint32_t>(r.columns));
@@ -204,12 +339,16 @@ bool decode_state(const std::uint8_t* data, std::size_t size, ReaderState& out) 
     if (data == nullptr || size < 12) return false;
     Reader rd{ data, size, 0, false };
 
-    // magic
-    if (rd.p[0] != 'L' || rd.p[1] != 'R' || rd.p[2] != 'S' || rd.p[3] != '1') return false;
+    // magic 决定版本：LRS1 → v1（旧格式，key 即路径键），LRS2 → v2
+    if (rd.p[0] != 'L' || rd.p[1] != 'R' || rd.p[2] != 'S') return false;
+    int version = 0;
+    if (rd.p[3] == '1')      version = 1;
+    else if (rd.p[3] == '2') version = 2;
+    else return false;
     rd.off = 4;
 
-    const std::uint32_t version = rd.u32();
-    if (rd.bad || version != kStateVersion) return false;
+    const std::uint32_t file_version = rd.u32();
+    if (rd.bad || file_version != static_cast<std::uint32_t>(version)) return false;
 
     const std::uint32_t count = rd.u32();
     if (rd.bad || count > kMaxDocs) return false;
@@ -218,39 +357,9 @@ bool decode_state(const std::uint8_t* data, std::size_t size, ReaderState& out) 
     tmp.docs.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::uint64_t key = rd.u64();
-        DocRecord r;
-        r.page = rd.i32();
-        r.zoom = rd.f32();
-        r.columns = rd.i32();
-        r.rotation = rd.i32();
-        const std::uint32_t flags = rd.u32();
-        r.color_mode = rd.i32();
-        r.fit_width = (flags & 1u) != 0;
-        r.spread = (flags & 2u) != 0;
-
-        const std::uint32_t bm = rd.u32();
-        if (rd.bad || bm > kMaxBookmarksPerDoc) return false;
-        r.bookmarks.reserve(bm);
-        for (std::uint32_t j = 0; j < bm; ++j) {
-            Bookmark k;
-            k.page = rd.i32();
-            const std::uint32_t len = rd.u32();
-            if (rd.bad || len > kMaxLabelBytes) return false;
-            k.label = rd.str(len);
-            if (rd.bad) return false;
-            r.bookmarks.push_back(std::move(k));
-        }
-        if (rd.bad) return false;
-
-        // 字段钳制：损坏/越界值不让它进入内存（rotation 归一到 0/90/180/270）
-        r.columns = r.columns < 1 ? 1 : (r.columns > 4 ? 4 : r.columns);
-        r.rotation %= 360;
-        if (r.rotation < 0) r.rotation += 360;
-        r.rotation = (r.rotation / 90) * 90;
-        r.color_mode = r.color_mode < 0 ? 0 : (r.color_mode > 2 ? 2 : r.color_mode);
-        if (!(r.zoom > 0.0f) || r.zoom > 100.0f) r.zoom = 1.0f;
-
-        if (key != 0) tmp.docs.emplace_back(key, std::move(r));
+        const bool ok = (version == 2) ? read_record_v2(rd, key, tmp)
+                                       : read_record_v1(rd, key, tmp);
+        if (!ok) return false;
     }
     if (rd.bad) return false;
 

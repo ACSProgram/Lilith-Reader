@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+import lilithreader.utils;           // file_fingerprint（ADR-062）
 import lilithreader.reader_state;
 
 namespace {
@@ -58,6 +59,17 @@ std::vector<std::uint8_t> header(const char* magic, std::uint32_t version, std::
     put_u32(b, version);
     put_u32(b, count);
     return b;
+}
+
+// 写临时文件（供指纹测试构造"同一份内容 / 差一个字节"的样本）
+bool write_file(const std::wstring& p, const std::string& data) {
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD w = 0;
+    const BOOL ok = WriteFile(h, data.data(), static_cast<DWORD>(data.size()), &w, nullptr);
+    CloseHandle(h);
+    return ok && w == data.size();
 }
 
 // ---- 1. 序列化往返 ----
@@ -151,17 +163,29 @@ void test_bad_input() {
     std::vector<std::uint8_t> bad_ver = header("LRS1", lr::kStateVersion + 1, 0);
     check(!lr::decode_state(bad_ver.data(), bad_ver.size(), out), "版本不符拒绝");
 
+    // magic 与版本必须"配对"：LRS2 配 v1 也是损坏（版本与 magic 不符）
+    std::vector<std::uint8_t> mixed = header("LRS2", lr::kStateVersionV1, 0);
+    check(!lr::decode_state(mixed.data(), mixed.size(), out), "magic/版本不配对拒绝");
+
     // 条数超上限
-    std::vector<std::uint8_t> too_many = header("LRS1", lr::kStateVersion, lr::kMaxDocs + 1);
+    std::vector<std::uint8_t> too_many = header("LRS1", lr::kStateVersionV1, lr::kMaxDocs + 1);
     check(!lr::decode_state(too_many.data(), too_many.size(), out), "条数超上限拒绝");
 
     // 记录被截断（声明 1 条但没有记录体）
-    std::vector<std::uint8_t> truncated = header("LRS1", lr::kStateVersion, 1);
+    std::vector<std::uint8_t> truncated = header("LRS1", lr::kStateVersionV1, 1);
     put_u64(truncated, 0xABCDEF);  // 只有 key，后面字段缺失
     check(!lr::decode_state(truncated.data(), truncated.size(), out), "记录截断拒绝");
 
+    // v2 路径长度超上限
+    std::vector<std::uint8_t> pl = header("LRS2", lr::kStateVersion, 1);
+    put_u64(pl, 1);
+    put_u64(pl, 0);
+    put_u32(pl, 0);
+    put_u32(pl, lr::kMaxPathBytes + 1);   // 声明的路径长度超限
+    check(!lr::decode_state(pl.data(), pl.size(), out), "路径长度超上限拒绝");
+
     // 书签数超上限
-    std::vector<std::uint8_t> bm_over = header("LRS1", lr::kStateVersion, 1);
+    std::vector<std::uint8_t> bm_over = header("LRS1", lr::kStateVersionV1, 1);
     put_u64(bm_over, 1);           // key
     put_u32(bm_over, 0);           // page
     put_u32(bm_over, 0x3F800000);  // zoom = 1.0f
@@ -176,7 +200,7 @@ void test_bad_input() {
 // ---- 4. 字段钳制（损坏值不得进入内存） ----
 void test_field_clamping() {
     std::printf("\n[4] 字段钳制\n");
-    std::vector<std::uint8_t> b = header("LRS1", lr::kStateVersion, 1);
+    std::vector<std::uint8_t> b = header("LRS1", lr::kStateVersionV1, 1);
     put_u64(b, 0x55);
     put_u32(b, 5);              // page
     put_u32(b, 0);              // zoom bits = 0.0f（非法）
@@ -213,15 +237,152 @@ void test_document_key() {
     check_eq_u64(k1, k2, "同一路径键稳定");
 }
 
+// ---- 6. v2 身份字段往返（ADR-062）----
+void test_identity_round_trip() {
+    std::printf("\n[6] 身份字段往返（v2）\n");
+    lr::ReaderState s;
+    lr::DocRecord& a = s.upsert(0xAAA1ull);
+    a.page = 7; a.page_count = 300; a.path_key = 0xBBB1ull;
+    a.last_path_u8 = "\xD0\xA1\xE8\xAF\xB4/a.pdf";   // "小读/a.pdf"（UTF-8）
+    a.bookmarks.push_back(lr::Bookmark{ 2, "x" });
+
+    const std::vector<std::uint8_t> bytes = lr::encode_state(s);
+    check(bytes.size() > 4 && bytes[0] == 'L' && bytes[1] == 'R' &&
+          bytes[2] == 'S' && bytes[3] == '2', "magic = LRS2");
+
+    lr::ReaderState out;
+    check(lr::decode_state(bytes.data(), bytes.size(), out), "v2 解码成功");
+    const lr::DocRecord* r = out.find(0xAAA1ull);
+    check(r != nullptr, "记录存在");
+    if (r) {
+        check(r->page == 7, "阅读位置往返");
+        check(r->path_key == 0xBBB1ull, "path_key 往返");
+        check(r->page_count == 300, "page_count 往返");
+        check(r->last_path_u8 == a.last_path_u8, "last_path 往返（UTF-8 原样）");
+    }
+}
+
+// ---- 7. v1 记录迁移 ----
+void test_v1_migration() {
+    std::printf("\n[7] v1 记录迁移\n");
+    std::vector<std::uint8_t> b = header("LRS1", lr::kStateVersionV1, 1);
+    put_u64(b, 0x1234);           // key（v1 的键就是"路径+大小+修改时间"哈希）
+    put_u32(b, 11);               // page
+    put_u32(b, 0x3F800000);       // zoom = 1.0f
+    put_u32(b, 1);                // columns
+    put_u32(b, 0);                // rotation
+    put_u32(b, 0);                // flags
+    put_u32(b, 0);                // color_mode
+    put_u32(b, 0);                // 书签数
+
+    lr::ReaderState out;
+    check(lr::decode_state(b.data(), b.size(), out), "v1 可解码");
+    const lr::DocRecord* r = out.find(0x1234);
+    check(r != nullptr, "v1 记录存在");
+    if (r) {
+        check(r->page == 11, "阅读位置保留");
+        check(r->path_key == 0x1234, "旧 key → path_key（迁移）");
+        check(r->page_count == 0, "page_count = 0（未知）");
+        check(r->last_path_u8.empty(), "last_path 为空（位置未知）");
+    }
+}
+
+// ---- 8. 身份分层定位（locate / adopt / primary_key）----
+void test_locate_adopt() {
+    std::printf("\n[8] 身份分层定位\n");
+    lr::ReaderState s;
+    // 一条"已迁移"的记录：主键 = 内容指纹，记着旧路径
+    lr::DocRecord& a = s.upsert(0xC0FFEEull);
+    a.page = 55; a.page_count = 200; a.last_path_u8 = "D:/old/book.pdf"; a.path_key = 0x999;
+
+    lr::DocIdentity id;   // 同一份内容，换到新路径打开
+    id.content = 0xC0FFEEull; id.path = 0x777; id.page_count = 200;
+    id.path_u8 = "E:/new/book.pdf";
+
+    const lr::DocMatch hit = lr::locate(s, id, true);
+    check(hit.index == 0, "内容指纹命中");
+    check(hit.relocated, "路径变了 → relocated");
+
+    const std::uint64_t key = lr::adopt(s, 0, id);
+    check(key == 0xC0FFEEull, "adopt 后主键 = 内容指纹");
+    check(s.docs[0].second.last_path_u8 == "E:/new/book.pdf", "last_path 刷新为新路径");
+    check(s.docs[0].second.path_key == 0x777, "path_key 刷新");
+    check(s.docs[0].second.page_count == 200, "page_count 刷新");
+
+    const lr::DocMatch again = lr::locate(s, id, true);
+    check(again.index == 0 && !again.relocated, "同路径再打开不算 relocated");
+
+    lr::DocIdentity moved = id;   // 再换一个位置：靠指纹仍能命中
+    moved.path = 0x1234; moved.path_u8 = "F:/x/y.pdf";
+    check(lr::locate(s, moved, false).index == -1, "关掉智能匹配 → 新位置不命中");
+    check(lr::locate(s, moved, true).index == 0, "开启智能匹配 → 新位置命中");
+
+    lr::DocIdentity bad = id;     // 页数对不上：不是同一版，不继承（书签会错位）
+    bad.page_count = 999;
+    check(lr::locate(s, bad, true).index == -1, "页数不符不继承");
+
+    lr::DocIdentity only_path;    // 主键：指纹优先，取不到退回路径键
+    only_path.path = 0xABC;
+    check_eq_u64(lr::primary_key(only_path), 0xABC, "无指纹时主键 = 路径键");
+    check_eq_u64(lr::primary_key(lr::DocIdentity{}), 0, "两者都无 → 0");
+}
+
+// ---- 9. 内容指纹（utils::file_fingerprint）----
+void test_fingerprint() {
+    std::printf("\n[9] 内容指纹\n");
+    check_eq_u64(lr::file_fingerprint(L""), 0, "空路径 → 0");
+    check_eq_u64(lr::file_fingerprint(L"Z:\\no\\such\\file.pdf"), 0, "不存在 → 0");
+
+    wchar_t tmp[MAX_PATH] = {};
+    if (GetTempPathW(MAX_PATH, tmp) == 0) { std::printf("  [SKIP] 取不到临时目录\n"); return; }
+    const std::wstring dir = std::wstring(tmp) + L"lilith_fp_test";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring a = dir + L"\\a.bin";
+    const std::wstring b = dir + L"\\b.bin";
+    const std::wstring copy = dir + L"\\copy_of_a.bin";
+
+    // 400KB > 采样窗口（320KB）：保证"只改中段/尾段一个字节"也会被采到
+    const std::size_t n = 400u * 1024u;
+    std::string data(n, '\0');
+    for (std::size_t i = 0; i < n; ++i) data[i] = static_cast<char>('A' + static_cast<int>(i % 7));
+    std::string mid = data;   mid[n / 2] = 'Z';
+    std::string tail = data;  tail[n - 1] = 'Z';
+
+    check(write_file(a, data) && write_file(b, mid), "样本写入成功");
+    const std::uint64_t fa = lr::file_fingerprint(a);
+    check(fa != 0, "指纹非 0");
+    check_eq_u64(fa, lr::file_fingerprint(a), "同一文件稳定");
+    check(fa != lr::file_fingerprint(b), "中段改一字节 → 指纹不同");
+
+    check(write_file(a, tail), "尾段样本写入成功");
+    check(lr::file_fingerprint(a) != fa, "尾段改一字节 → 指纹不同");
+    check(write_file(a, data), "还原样本");
+
+    if (CopyFileW(a.c_str(), copy.c_str(), FALSE)) {
+        check_eq_u64(lr::file_fingerprint(copy), lr::file_fingerprint(a),
+                     "复制到新路径 → 指纹相同（跨路径识别的根基）");
+        DeleteFileW(copy.c_str());
+    } else {
+        check(false, "复制到新路径 → 指纹相同（复制失败）");
+    }
+    DeleteFileW(a.c_str());
+    DeleteFileW(b.c_str());
+    RemoveDirectoryW(dir.c_str());
+}
+
 }  // namespace
 
 int main() {
-    std::printf("Lilith Reader 阅读状态测试（Phase 5）\n");
+    std::printf("Lilith Reader 阅读状态测试（Phase 5 + ADR-062 身份分层）\n");
     test_round_trip();
     test_container_semantics();
     test_bad_input();
     test_field_clamping();
     test_document_key();
+    test_identity_round_trip();
+    test_v1_migration();
+    test_locate_adopt();
+    test_fingerprint();
 
     std::printf("\n合计：通过 %d，失败 %d\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

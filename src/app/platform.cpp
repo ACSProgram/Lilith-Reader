@@ -452,6 +452,9 @@ void load_prefs() {
         lr::read_ini_int_ex(g_ini_path, L"cache", L"BudgetMB", cache_mb_default),
         static_cast<int>(lr::kCacheBudgetMin / (1024ull * 1024ull)),
         static_cast<int>(lr::kCacheBudgetMax / (1024ull * 1024ull)));
+    g_prefs.smart_match = std::clamp(
+        lr::read_ini_int_ex(g_ini_path, L"reading", L"SmartMatch", kSmartMatchAsk),
+        kSmartMatchOff, kSmartMatchAuto);
     g_user_scale = g_prefs.ui_scale;
 }
 
@@ -462,6 +465,7 @@ void save_prefs() {
     lr::write_ini_int(g_ini_path, L"ui", L"Motion", g_prefs.motion ? 1 : 0);
     lr::write_ini_float(g_ini_path, L"ui", L"GapPercent", g_prefs.gap_percent);
     lr::write_ini_int(g_ini_path, L"cache", L"BudgetMB", g_prefs.cache_mb);
+    lr::write_ini_int(g_ini_path, L"reading", L"SmartMatch", g_prefs.smart_match);
 }
 
 // ---------------- 按键绑定持久化（[keys] 节，ADR-054） ----------------

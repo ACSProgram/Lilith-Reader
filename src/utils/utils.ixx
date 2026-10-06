@@ -4,10 +4,13 @@
 
 module;
 #include <windows.h>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <string_view>
+#include <vector>
 
 export module lilithreader.utils;
 
@@ -53,6 +56,68 @@ inline bool is_supported(const std::wstring& path) {
     for (const std::wstring_view e : kSupportedExtensions)
         if (ext == e) return true;
     return false;
+}
+
+// ---- 稀疏采样文件指纹（ADR-062）----
+//
+// 用途：判断"两个路径上的文件是不是同一份内容"，让阅读状态（读到哪/书签）在文件被
+// 复制、移动、重命名、重新解压之后仍能沿用 —— 路径会变，内容不变。
+//
+// 为什么是"稀疏采样"而不是全文件哈希：全量读一遍对几百 MB 的 PDF 是与渲染抢 I/O 的重活，
+// 而这里只需要"区分不同文档"这一档强度。取**头 128KB + 中间 64KB + 尾 128KB**（合计
+// ≤ 320KB）再叠上文件大小：PDF 的头（版本/元数据）与尾（xref/对象表）恰好是最能区分
+// 两份文档的区域，中段补一刀防止"头尾相同、正文不同"的构造性碰撞。
+// 开销与文件大小**无关**，可在工作线程里廉价计算（UI 线程不读文件内容，ADR-009）。
+//
+// 返回 0 = 不可用（打不开/读不全/空文件），调用方退回路径键即可。
+inline constexpr std::size_t kFingerprintHeadBytes = 128u * 1024u;
+inline constexpr std::size_t kFingerprintMidBytes  = 64u  * 1024u;
+inline constexpr std::size_t kFingerprintTailBytes = 128u * 1024u;
+
+inline std::uint64_t file_fingerprint(const std::wstring& path) noexcept {
+    if (path.empty()) return 0;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    LARGE_INTEGER fsz{};
+    if (!GetFileSizeEx(h, &fsz) || fsz.QuadPart <= 0) { CloseHandle(h); return 0; }
+    const std::uint64_t size = static_cast<std::uint64_t>(fsz.QuadPart);
+
+    // 与 reader_state 的文档键同一套 FNV-1a 64：项目里只有一种哈希，不必引入依赖。
+    constexpr std::uint64_t kFnvOffset = 14695981039346656037ull;
+    constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+    std::uint64_t fp = kFnvOffset;
+    const auto mix = [&fp](const unsigned char* p, std::size_t n) {
+        for (std::size_t i = 0; i < n; ++i) { fp ^= static_cast<std::uint64_t>(p[i]); fp *= kFnvPrime; }
+    };
+    mix(reinterpret_cast<const unsigned char*>(&size), sizeof size);
+
+    // 三段（小文件会互相重叠、等价于整篇参与，确定性不受影响）
+    std::uint64_t offs[3] = { 0, size / 2, 0 };
+    std::size_t   lens[3] = { 0, 0, 0 };
+    const std::size_t cap = (std::size_t)(size < kFingerprintHeadBytes ? size : kFingerprintHeadBytes);
+    lens[0] = cap;
+    const std::size_t mid_cap = (std::size_t)(size - offs[1] < kFingerprintMidBytes
+                                                  ? size - offs[1] : kFingerprintMidBytes);
+    lens[1] = mid_cap;
+    const std::size_t tail_cap = (std::size_t)(size < kFingerprintTailBytes ? size : kFingerprintTailBytes);
+    lens[2] = tail_cap;
+    offs[2] = size - tail_cap;
+
+    std::vector<unsigned char> buf(kFingerprintHeadBytes);
+    for (int i = 0; i < 3; ++i) {
+        if (lens[i] == 0) continue;
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(offs[i]);
+        if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) { CloseHandle(h); return 0; }
+        DWORD got = 0;
+        if (!ReadFile(h, buf.data(), static_cast<DWORD>(lens[i]), &got, nullptr) ||
+            got != static_cast<DWORD>(lens[i])) { CloseHandle(h); return 0; }
+        mix(buf.data(), lens[i]);
+    }
+    CloseHandle(h);
+    return fp == 0 ? 1 : fp;   // 0 保留为"不可用"
 }
 
 inline std::wstring to_absolute(const std::wstring& path) {
