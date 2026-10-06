@@ -83,6 +83,18 @@ jobs:
           Write-Host "vcpkg: $vcpkg"
           Write-Host "PlatformToolset: $toolset"
 
+      - name: Enable user-wide vcpkg MSBuild integration
+        run: |
+          # 经典 vcpkg 集成（向 ClCompile/Link 注入 include/lib 路径）只在 MSBuild
+          # 能找到 %LOCALAPPDATA%\vcpkg\vcpkg.user.props 时生效，该文件由
+          # `vcpkg integrate install` 生成。全新 runner 上没有它，且 VS 18 的
+          # C++ targets 已不再自动导入 bundled vcpkg 的经典集成（旧钩子只认这个
+          # 用户级文件）。缺了这一步，下面的 /p:Vcpkg* 属性没有任何 targets 消费，
+          # 构建直接 C1083（mupdf/fitz.h、ft2build.h 找不到）——本地能编过是因为
+          # 开发机跑过 integrate install，属于机器级状态，不在仓库里。
+          & '${{ steps.tools.outputs.VCPKG }}' integrate install
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg integrate install failed with exit code $LASTEXITCODE" }
+
       - name: Cache vcpkg binaries
         uses: actions/cache@v4
         with:
