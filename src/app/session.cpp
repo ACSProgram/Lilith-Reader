@@ -26,6 +26,195 @@ void update_title() {
     SetWindowTextW(g_hwnd, title.c_str());
 }
 
+// ---------------- 命令与按键绑定（ADR-054） ----------------
+
+namespace {
+
+// 构造键组合：ImGuiKey | ImGuiMod_*（与 ImGui::GetKeyChordName 同一编码）。
+constexpr ImGuiKeyChord kb(ImGuiKey k, int mods = 0) {
+    return static_cast<ImGuiKeyChord>(static_cast<int>(k) | mods);
+}
+
+}  // namespace
+
+// 命令表：默认键、是否连发、是否全局可用。**改显示文案不得改 id**（id 是 ini 键名）。
+// · 数字/算术类给两个槽（主键盘 + 小键盘）：落实 ADR-027"两套都判"，不再写别名。
+// · 全屏给 F11 + Esc 两个槽：Esc 不再承担"关闭文档/退出"（误触代价过大，关闭走菜单），
+//   改作可绑定键，默认与 F11 同为全屏（ADR-054）。
+const CmdDef kCmds[kCmdCount] = {
+    // id             group   name                        repeat global  def0                        def1
+    { "NextRow",        "导航", "下一行 / 下一页",           false, false, kb(ImGuiKey_RightArrow),     ImGuiKey_None },
+    { "PrevRow",        "导航", "上一行 / 上一页",           false, false, kb(ImGuiKey_LeftArrow),      ImGuiKey_None },
+    { "ScrollDown",     "导航", "向下滚动",                  true,  false, kb(ImGuiKey_DownArrow),      ImGuiKey_None },
+    { "ScrollUp",       "导航", "向上滚动",                  true,  false, kb(ImGuiKey_UpArrow),        ImGuiKey_None },
+    { "PageDown",       "导航", "向下翻屏",                  true,  false, kb(ImGuiKey_PageDown),       ImGuiKey_None },
+    { "PageUp",         "导航", "向上翻屏",                  true,  false, kb(ImGuiKey_PageUp),         ImGuiKey_None },
+    { "FirstPage",      "导航", "首页",                      false, false, kb(ImGuiKey_Home),           ImGuiKey_None },
+    { "LastPage",       "导航", "末页",                      false, false, kb(ImGuiKey_End),            ImGuiKey_None },
+    { "JumpPage",       "导航", "跳转页码",                  false, false, kb(ImGuiKey_G),              ImGuiKey_None },
+
+    { "ZoomIn",         "缩放", "放大",                      true,  false, kb(ImGuiKey_Equal),          kb(ImGuiKey_KeypadAdd) },
+    { "ZoomOut",        "缩放", "缩小",                      true,  false, kb(ImGuiKey_Minus),          kb(ImGuiKey_KeypadSubtract) },
+    { "FitWidth",       "缩放", "适合宽度",                  false, false, kb(ImGuiKey_F),              ImGuiKey_None },
+
+    { "Col1",           "视图", "单页",                      false, false, kb(ImGuiKey_1),              kb(ImGuiKey_Keypad1) },
+    { "Col2",           "视图", "双页",                      false, false, kb(ImGuiKey_2),              kb(ImGuiKey_Keypad2) },
+    { "Col3",           "视图", "三页",                      false, false, kb(ImGuiKey_3),              kb(ImGuiKey_Keypad3) },
+    { "Col4",           "视图", "四页",                      false, false, kb(ImGuiKey_4),              kb(ImGuiKey_Keypad4) },
+    { "ToggleSpread",   "视图", "双页对开（书籍模式）",      false, false, kb(ImGuiKey_D),              ImGuiKey_None },
+    { "RotateCW",       "视图", "旋转 90°",                  false, false, kb(ImGuiKey_R),              ImGuiKey_None },
+    { "ToggleInvert",   "视图", "反色（深色）",              false, false, kb(ImGuiKey_I),              ImGuiKey_None },
+    { "ToggleSepia",    "视图", "护眼（暖色）",              false, false, kb(ImGuiKey_E),              ImGuiKey_None },
+
+    { "ToggleSidebar",  "界面", "侧栏（目录 / 书签 / 缩略图）", false, false, kb(ImGuiKey_O),           ImGuiKey_None },
+    { "ToggleBookmark", "界面", "当前页书签增删",            false, false, kb(ImGuiKey_B),              ImGuiKey_None },
+    { "OpenSettings",   "界面", "设置",                      false, true,  kb(ImGuiKey_Comma, ImGuiMod_Ctrl), ImGuiKey_None },
+    { "OpenKeys",       "界面", "按键设置",                  false, true,  kb(ImGuiKey_F1),             ImGuiKey_None },
+    { "ToggleDebug",    "界面", "调试浮层",                  false, true,  kb(ImGuiKey_F3),             ImGuiKey_None },
+    { "ToggleFullscreen","界面","全屏",                      false, true,  kb(ImGuiKey_F11),            kb(ImGuiKey_Escape) },
+    { "OpenFile",       "界面", "打开文档…",                 false, true,  kb(ImGuiKey_O, ImGuiMod_Ctrl), ImGuiKey_None },
+};
+
+void reset_binds_to_default() {
+    for (int i = 0; i < kCmdCount; ++i) {
+        g_binds[i][0] = kCmds[i].def0;
+        g_binds[i][1] = kCmds[i].def1;
+    }
+}
+
+namespace {
+
+// 单个键组合是否在本帧按下：修饰键**严格匹配**（没绑 Ctrl 时按住 Ctrl 不触发），
+// 与 ImGui::IsKeyChordPressed 同一语义，但这里自己判以便控制"连发"。
+bool chord_pressed(ImGuiKeyChord c, bool repeat) {
+    if (c == ImGuiKey_None) return false;
+    const ImGuiKey mods = static_cast<ImGuiKey>(c & ImGuiMod_Mask_);
+    if (ImGui::GetIO().KeyMods != mods) return false;
+    const ImGuiKey key = static_cast<ImGuiKey>(c & ~ImGuiMod_Mask_);
+    if (key == ImGuiKey_None) return false;
+    return ImGui::IsKeyPressed(key, repeat);
+}
+
+}  // namespace
+
+bool cmd_pressed(Cmd c) {
+    if (g_capture_cmd < kCmdCount) return false;   // 捕获中：不派发任何命令
+    const int i = static_cast<int>(c);
+    const bool rep = kCmds[i].repeat;
+    return chord_pressed(g_binds[i][0], rep) || chord_pressed(g_binds[i][1], rep);
+}
+
+// 修饰键/鼠标/手柄不参与键盘绑定（捕获与解析都过滤）。
+bool is_bindable_key(ImGuiKey k) {
+    if (k < ImGuiKey_NamedKey_BEGIN || k >= ImGuiKey_NamedKey_END) return false;
+    switch (k) {
+    case ImGuiKey_LeftCtrl: case ImGuiKey_LeftShift: case ImGuiKey_LeftAlt: case ImGuiKey_LeftSuper:
+    case ImGuiKey_RightCtrl: case ImGuiKey_RightShift: case ImGuiKey_RightAlt: case ImGuiKey_RightSuper:
+    case ImGuiKey_ReservedForModCtrl: case ImGuiKey_ReservedForModShift:
+    case ImGuiKey_ReservedForModAlt: case ImGuiKey_ReservedForModSuper:
+        return false;
+    default:
+        break;
+    }
+    if (k >= ImGuiKey_MouseLeft && k <= ImGuiKey_MouseWheelY) return false;
+    if (k >= ImGuiKey_GamepadStart && k <= ImGuiKey_GamepadRStickDown) return false;
+    return true;
+}
+
+// ini 存储用：纯 ASCII 的 "Ctrl+Shift+RightArrow"。键名取 ImGui::GetKeyName 原文，
+// 保证 load 时能按名反查（不受显示美化影响）。
+std::string chord_to_string(ImGuiKeyChord c) {
+    if (c == ImGuiKey_None) return {};
+    std::string s;
+    if (c & ImGuiMod_Ctrl)  s += "Ctrl+";
+    if (c & ImGuiMod_Shift) s += "Shift+";
+    if (c & ImGuiMod_Alt)   s += "Alt+";
+    s += ImGui::GetKeyName(static_cast<ImGuiKey>(c & ~ImGuiMod_Mask_));
+    return s;
+}
+
+// 显示用：把 ImGui 的 US 键名换成更直观的符号（"Ctrl+Equal" → "Ctrl+="）。
+std::string chord_label(ImGuiKeyChord c) {
+    if (c == ImGuiKey_None) return {};
+    const std::string s = chord_to_string(c);
+    static const struct { const char* from; const char* to; } kMap[] = {
+        { "Equal", "=" }, { "Minus", "-" }, { "Comma", "," }, { "Period", "." },
+        { "Slash", "/" }, { "Semicolon", ";" }, { "Apostrophe", "'" },
+        { "LeftBracket", "[" }, { "RightBracket", "]" }, { "Backslash", "\\" },
+        { "GraveAccent", "`" }, { "Escape", "Esc" }, { "Space", "空格" }, { "Enter", "回车" },
+        { "RightArrow", "→" }, { "LeftArrow", "←" }, { "UpArrow", "↑" }, { "DownArrow", "↓" },
+        { "PageUp", "PgUp" }, { "PageDown", "PgDn" },
+        { "KeypadAdd", "小键盘 +" }, { "KeypadSubtract", "小键盘 -" },
+    };
+    for (const auto& m : kMap) {
+        const std::string suffix = std::string("+") + m.from;
+        if (s.size() >= suffix.size() &&
+            s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0)
+            return s.substr(0, s.size() - std::strlen(m.from)) + m.to;
+    }
+    return s;
+}
+
+ImGuiKeyChord chord_from_string(const std::string& s) {
+    if (s.empty()) return ImGuiKey_None;
+    int mods = 0;
+    std::string key_name;
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t p = s.find('+', start);
+        const std::string tok = (p == std::string::npos) ? s.substr(start) : s.substr(start, p - start);
+        if (p == std::string::npos) { key_name = tok; break; }
+        if (tok == "Ctrl")       mods |= ImGuiMod_Ctrl;
+        else if (tok == "Shift") mods |= ImGuiMod_Shift;
+        else if (tok == "Alt")   mods |= ImGuiMod_Alt;
+        else { key_name = tok; break; }   // 意外前缀：把剩下的整体当键名，交给反查判定
+        start = p + 1;
+    }
+    if (key_name.empty()) return ImGuiKey_None;
+    // 按名反查：遍历具名键（量级 140，仅解析 ini 时调用，可接受）
+    for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; ++k) {
+        const char* n = ImGui::GetKeyName(static_cast<ImGuiKey>(k));
+        if (n != nullptr && key_name == n)
+            return static_cast<ImGuiKeyChord>(k | mods);
+    }
+    return ImGuiKey_None;   // 未知键名（改过 ImGui 版本等）：安全忽略，保留默认
+}
+
+int find_bind_conflict(int cmd, int slot) {
+    const ImGuiKeyChord c = g_binds[cmd][slot];
+    if (c == ImGuiKey_None) return -1;
+    for (int i = 0; i < kCmdCount; ++i) {
+        if (i == cmd) continue;   // 同一命令的两个槽不算冲突
+        for (int s = 0; s < kBindSlots; ++s)
+            if (g_binds[i][s] == c) return i;
+    }
+    return -1;
+}
+
+void update_key_capture() {
+    if (g_capture_cmd >= kCmdCount) return;
+    // 鼠标点别处 / 右键 → 取消（不写入）。跳过进入捕获的那一次点击所在帧。
+    if (g_capture_frame >= 0 && ImGui::GetFrameCount() > g_capture_frame &&
+        (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+         ImGui::IsMouseClicked(ImGuiMouseButton_Right))) {
+        g_capture_cmd = kCmdCount;
+        return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; ++k) {
+        const ImGuiKey key = static_cast<ImGuiKey>(k);
+        if (!is_bindable_key(key) || !ImGui::IsKeyPressed(key, false)) continue;
+        ImGuiKeyChord c = static_cast<ImGuiKeyChord>(k);
+        if (io.KeyCtrl)  c |= ImGuiMod_Ctrl;
+        if (io.KeyShift) c |= ImGuiMod_Shift;
+        if (io.KeyAlt)   c |= ImGuiMod_Alt;
+        g_binds[g_capture_cmd][g_capture_slot] = c;
+        g_capture_cmd = kCmdCount;
+        save_binds();
+        return;
+    }
+}
+
 // ---------------- 视图变换 / 页尺寸 ----------------
 
 // 把（可能已旋转的）页尺寸交给画布：90/270 交换宽高。
@@ -155,6 +344,7 @@ void reset_doc_state() {
     g_zoom_anim = false;
     g_zoom_end_fit = false;
     g_top_bar_h = -1.0f;
+    g_sidebar_w = 0.0f;
     g_scroll_drag = false;
     g_scroll_drag_off = 0.0f;
     g_scroll_hover = false;
@@ -221,6 +411,7 @@ void enter_reading() {
     g_zoom_anim = false;
     g_zoom_end_fit = false;
     g_top_bar_h = px(kTopBarH);
+    g_sidebar_w = 0.0f;               // 开文档不播侧栏动画（侧栏本就没开）
     g_scroll_drag = false;
     g_scroll_hover = false;
 
@@ -464,25 +655,6 @@ void scroll_by_rows(int dir) {
     start_scroll_glide(from, g_canvas.state().scroll_y, g_canvas.current_page(), 0.0f);
 }
 
-namespace {
-
-// 列数快捷键：主键盘 1~4 与小键盘 1~4；未按返回 0。
-// 两者在 ImGui 里是**不同的键**（主键盘 ImGuiKey_1..9、小键盘 ImGuiKey_Keypad1..9），
-// 必须分别判断 —— 否则"小键盘按了没反应"（第四轮反馈点名了这一点，ADR-027）。
-int pressed_column_key() {
-    if (ImGui::IsKeyPressed(ImGuiKey_1, false) ||
-        ImGui::IsKeyPressed(ImGuiKey_Keypad1, false)) return 1;
-    if (ImGui::IsKeyPressed(ImGuiKey_2, false) ||
-        ImGui::IsKeyPressed(ImGuiKey_Keypad2, false)) return 2;
-    if (ImGui::IsKeyPressed(ImGuiKey_3, false) ||
-        ImGui::IsKeyPressed(ImGuiKey_Keypad3, false)) return 3;
-    if (ImGui::IsKeyPressed(ImGuiKey_4, false) ||
-        ImGui::IsKeyPressed(ImGuiKey_Keypad4, false)) return 4;
-    return 0;
-}
-
-}  // namespace
-
 // 键盘快捷键**刻意不以 ImGui 窗口焦点为门**（ADR-026）：
 //   1. 窗口结构是「无边框 shell 根窗口 + ##canvas 子窗口」，两者都带
 //      ImGuiWindowFlags_NoNav（= NoNavInputs | NoNavFocus）。NoNavFocus 使 ImGui
@@ -493,10 +665,11 @@ int pressed_column_key() {
 //      焦点决定；跳页弹窗/调试浮层出现时焦点会移走，同样会让快捷键莫名失效。
 // 故此处只以「无文本输入（io.WantTextInput）」为门；阅读态与弹窗由调用方保证。
 // 鼠标（滚轮/拖拽）仍需悬停在画布上，与键盘分开判断。
+//
+// 按键判定自 ADR-054 起统一走命令表（cmd_pressed）：绑哪个键、是否连发、几个槽
+// 全部由 kCmds / g_binds 决定，本函数只负责"命令被按下时做什么"。
 void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered) {
     ImGuiIO& io = ImGui::GetIO();
-    const float cx = size.x * 0.5f;
-    const float cy = size.y * 0.5f;
 
     // 滚轮：Ctrl 缩放（以鼠标为不动点），否则滚动。
     // 两者都进动效层（ADR-047）：滚动进待定量、缩放进插值；关闭动效时即等价于直接改画布。
@@ -519,41 +692,57 @@ void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered)
     }
 
     if (io.WantTextInput) return;  // 有文本输入在跑：键盘归它
+    handle_reading_commands(size);
+}
 
+// 阅读态命令派发。全部走"动效入口"（ADR-047），与菜单/按钮同一批语义。
+void handle_reading_commands(const ImVec2& size) {
+    const float cx = size.x * 0.5f;
+    const float cy = size.y * 0.5f;
     const float vh = size.y;
-    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true))  request_scroll(px(kKeyScrollPx));
-    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true))    request_scroll(-px(kKeyScrollPx));
-    if (ImGui::IsKeyPressed(ImGuiKey_PageDown, true))   request_scroll(vh * 0.9f);
-    if (ImGui::IsKeyPressed(ImGuiKey_PageUp, true))     request_scroll(-vh * 0.9f);
-    if (ImGui::IsKeyPressed(ImGuiKey_Home, false))      request_jump_scroll(0, 0.0f);
-    if (ImGui::IsKeyPressed(ImGuiKey_End, false))
-        request_jump_scroll(g_canvas.page_count() - 1, 0.0f);
-    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) scroll_by_rows(+1);
-    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true))  scroll_by_rows(-1);
 
-    const int cols = pressed_column_key();
-    if (cols != 0) g_canvas.set_columns(cols);
+    if (cmd_pressed(Cmd::ScrollDown)) request_scroll(px(kKeyScrollPx));
+    if (cmd_pressed(Cmd::ScrollUp))   request_scroll(-px(kKeyScrollPx));
+    if (cmd_pressed(Cmd::PageDown))   request_scroll(vh * 0.9f);
+    if (cmd_pressed(Cmd::PageUp))     request_scroll(-vh * 0.9f);
+    if (cmd_pressed(Cmd::FirstPage))  request_jump_scroll(0, 0.0f);
+    if (cmd_pressed(Cmd::LastPage))   request_jump_scroll(g_canvas.page_count() - 1, 0.0f);
+    if (cmd_pressed(Cmd::NextRow))    scroll_by_rows(+1);
+    if (cmd_pressed(Cmd::PrevRow))    scroll_by_rows(-1);
+    if (cmd_pressed(Cmd::JumpPage))   open_jump_popup();
 
-    if (ImGui::IsKeyPressed(ImGuiKey_F, false)) fit_to_width_animated();
-    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_0, false)) fit_to_width_animated();
-    if (ImGui::IsKeyPressed(ImGuiKey_Equal, true) ||
-        ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, true))
-        zoom_by_animated(kZoomStep, cx, cy);
-    if (ImGui::IsKeyPressed(ImGuiKey_Minus, true) ||
-        ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, true))
-        zoom_by_animated(1.0f / kZoomStep, cx, cy);
+    if (cmd_pressed(Cmd::ZoomIn))     zoom_by_animated(kZoomStep, cx, cy);
+    if (cmd_pressed(Cmd::ZoomOut))    zoom_by_animated(1.0f / kZoomStep, cx, cy);
+    if (cmd_pressed(Cmd::FitWidth))   fit_to_width_animated();
 
-    if (ImGui::IsKeyPressed(ImGuiKey_G, false)) open_jump_popup();
-    // F11/F1/Ctrl+O/Ctrl+, 等全局快捷键统一在 draw_shell 处理（任何状态下都可用）
+    if (cmd_pressed(Cmd::Col1))         g_canvas.set_columns(1);
+    if (cmd_pressed(Cmd::Col2))         g_canvas.set_columns(2);
+    if (cmd_pressed(Cmd::Col3))         g_canvas.set_columns(3);
+    if (cmd_pressed(Cmd::Col4))         g_canvas.set_columns(4);
+    if (cmd_pressed(Cmd::ToggleSpread)) g_canvas.set_spread(!g_canvas.state().spread);
+    if (cmd_pressed(Cmd::RotateCW))     rotate_view(90);
+    if (cmd_pressed(Cmd::ToggleInvert)) toggle_color_mode(1);
+    if (cmd_pressed(Cmd::ToggleSepia))  toggle_color_mode(2);
 
-    if (ImGui::IsKeyPressed(ImGuiKey_R, false)) rotate_view(90);           // 旋转 +90°
-    if (ImGui::IsKeyPressed(ImGuiKey_D, false))                            // 双页对开（书籍模式）
-        g_canvas.set_spread(!g_canvas.state().spread);
-    if (ImGui::IsKeyPressed(ImGuiKey_I, false)) toggle_color_mode(1);      // 反色
-    if (ImGui::IsKeyPressed(ImGuiKey_E, false)) toggle_color_mode(2);      // 护眼
-    if (ImGui::IsKeyPressed(ImGuiKey_O, false))                            // 侧栏（目录/书签/缩略图）
-        set_sidebar(!g_show_sidebar, 0);
-    if (ImGui::IsKeyPressed(ImGuiKey_B, false)) toggle_bookmark_current(); // 当前页书签增删
+    if (cmd_pressed(Cmd::ToggleSidebar))  set_sidebar(!g_show_sidebar, 0);
+    if (cmd_pressed(Cmd::ToggleBookmark)) toggle_bookmark_current();
+}
+
+// 全局命令：任何状态都可用。由 draw_shell 在「无弹窗/无文本输入/未在捕获按键」时调用
+// （见 ui.cpp 的 any_dialog_open）。有弹窗时不派发，避免 Esc 之类"先关弹窗又触发命令"。
+void handle_global_commands() {
+    if (cmd_pressed(Cmd::ToggleDebug))      g_show_debug ^= 1;
+    if (cmd_pressed(Cmd::ToggleFullscreen)) g_request_fullscreen_toggle = true;  // 帧间执行（ADR-060）
+    if (cmd_pressed(Cmd::OpenFile))         g_request_open_dialog = true;
+    if (cmd_pressed(Cmd::OpenSettings))     g_show_settings = true;
+    if (cmd_pressed(Cmd::OpenKeys))         { g_show_settings = true; g_settings_open_tab = 3; }
+
+    // 画布右键菜单的键盘等价入口（Shift+F10 / 菜单键）：标准 Windows 习惯、
+    // 属"无鼠标兜底"而非可自定义命令，故仍写死。
+    if (g_doc.kind == UiDoc::Kind::Reading &&
+        ((ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)) ||
+         ImGui::IsKeyPressed(ImGuiKey_Menu, false)))
+        g_open_canvas_ctx = true;
 }
 
 // ---------------- 缩放防抖与渲染请求 ----------------

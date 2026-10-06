@@ -144,6 +144,31 @@ inline void write_ini_float(const std::wstring& ini, const wchar_t* section,
     WritePrivateProfileStringW(section, key, buf, ini.c_str());
 }
 
+// 通用 ini 字符串读取（指定节）。缺键/被截断返回 fallback。按键绑定 [keys] 用。
+inline std::wstring read_ini_string_ex(const std::wstring& ini, const wchar_t* section,
+                                       const wchar_t* key, const wchar_t* fallback) {
+    wchar_t buf[512]{};
+    const DWORD n = GetPrivateProfileStringW(section, key, fallback, buf, 512, ini.c_str());
+    if (n == 0 || n >= 511) return std::wstring(fallback != nullptr ? fallback : L"");
+    return std::wstring(buf, n);
+}
+
+inline void write_ini_string(const std::wstring& ini, const wchar_t* section,
+                             const wchar_t* key, const wchar_t* value) {
+    WritePrivateProfileStringW(section, key, value, ini.c_str());
+}
+
+// UTF-8 → UTF-16（按键绑定值在 ini 里是 UTF-8 文本，读取时需转回宽字符）。
+inline std::wstring utf8_to_wide(std::string_view s) {
+    if (s.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                                      nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+    return w;
+}
+
 inline WindowState load_window_state(const std::wstring& ini_path) {
     constexpr int kAbsent = INT_MAX;
     WindowState s;

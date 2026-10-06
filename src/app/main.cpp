@@ -72,7 +72,20 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return 1;
     switch (msg) {
     case WM_SIZE:
-        g_gfx.resize(LOWORD(lp), HIWORD(lp));
+        if (wp == SIZE_MINIMIZED) {
+            // 最小化：客户区为 0，既不能重建 swapchain，也不能继续渲染 —— 置标记让主循环
+            // 整帧跳过（否则 0 尺寸视口下 ImGui 什么都画不出，整帧只剩清屏色，在收起动画里闪一下）。
+            g_minimized = true;
+            return 0;
+        }
+        g_minimized = false;
+        // 只记录待处理尺寸，**不**在消息里直接重建 swapchain：WM_SIZE 会在
+        // SetWindowPos / SetWindowPlacement 过程中同步到达（可能在 ImGui 一帧中途），
+        // 当场 ResizeBuffers 会让"按旧尺寸排布的本帧绘制数据"被画进新尺寸后备缓冲，
+        // 呈现为一帧拉伸/闪烁。改由帧首统一应用（见 main 循环）。
+        g_resize_pending = true;
+        g_resize_w = LOWORD(lp);
+        g_resize_h = HIWORD(lp);
         return 0;
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
@@ -180,6 +193,7 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
         static_cast<std::size_t>(g_prefs.cache_mb) * 1024ull * 1024ull);
 
     g_ui.initialize(g_hwnd);
+    load_binds();  // 按键绑定（[keys] 节）：需在 ImGui 上下文建立后（按名反查键码）
     DragAcceptFiles(g_hwnd, TRUE);
 
     // 让阅读窗口脱离输入法（ADR-028）：输入法启用时 Windows 会把字母/数字键的
@@ -201,6 +215,25 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
             if (msg.message == WM_QUIT) goto quit;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+        // 最小化期间整帧不渲染（见 WM_SIZE）：既省 CPU/GPU，也避免"0 尺寸视口 → 整帧清屏色"
+        // 在最小化的收起动画里闪一下。消息照常泵，恢复时下一条 WM_SIZE 会清掉标记。
+        if (g_minimized) {
+            Sleep(10);
+            continue;
+        }
+        // 帧首的"帧间窗口操作"：全屏切换会改窗口几何并（同步）触发 WM_SIZE，
+        // 必须排在尺寸应用**之前**。放在帧首而不是命令派发处，是为了让"几何变更 →
+        // swapchain 重建 → ImGui 视口"三者在同一帧内一致：否则本帧会用旧尺寸的绘制数据
+        // 去填充新几何的窗口，被 DWM 拉伸成可见的闪烁（ADR-058）。
+        if (g_request_fullscreen_toggle) {
+            g_request_fullscreen_toggle = false;
+            toggle_fullscreen();
+        }
+        // 应用待处理的窗口尺寸：与 ImGui 视口尺寸同帧一致，且多次 WM_SIZE 合并为一次重建。
+        if (g_resize_pending) {
+            g_resize_pending = false;
+            g_gfx.resize(g_resize_w, g_resize_h);
         }
         g_ui.new_frame();
         draw_shell();

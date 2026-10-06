@@ -29,6 +29,7 @@
 // 标准库头**必须全部排在下面的 import 之前**：MSVC 下在 import 声明之后再文本包含 STL
 // 头，会让 STL 被"文本包含"与"std 模块"两条路各展开一次，报 C2572（重定义默认参数）。
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -95,12 +96,53 @@ inline constexpr float  kIconGlyphOffsetY = 4.0f;
 inline constexpr float  kScrollSmoothRate = 22.0f;  // 滚轮 / 方向键 / 整屏滚动
 inline constexpr float  kZoomSmoothRate   = 26.0f;  // 缩放插值
 inline constexpr float  kTopBarAnimRate   = 20.0f;  // 顶栏自动隐藏的滑入/滑出
+inline constexpr float  kSidebarAnimRate  = 18.0f;  // 侧栏的滑入/滑出
+inline constexpr float  kWindowScaleFrom  = 0.96f;  // 设置窗口出现/消失时的起始缩放（0.96 → 1.0）
+inline constexpr float  kPopupSlidePx     = 10.0f;  // 弹出对话框出现/消失时的滑落距离（px，100% 缩放值）
 inline constexpr float  kMotionEpsPx      = 0.5f;   // 动画收敛阈值（像素/倍率），到阈值即吸附到目标
 
 // 一阶趋近（帧率无关的指数趋近）：无过冲、必然收敛，不需要维护速度状态。
 inline float approach(float cur, float target, float rate, float dt) {
     return target + (cur - target) * std::exp(-rate * dt);
 }
+
+// ---- 一次性开合动画：定时补间 + 三次缓出（ADR-061）----
+// 与上面那类"连续输入驱动"的动效（滚动/缩放，一阶滞后）**刻意不同**：开合是**单向、有明确
+// 终点**的一次性过渡，用定时补间更"利落" —— 时长确定、末端干脆；一阶滞后收敛到 99% 之后
+// 还要再走一个时间常数，观感上"软绵绵"（人工反馈"再利落一点"）。
+inline constexpr float  kOpenCloseDur = 0.16f;   // 开合过渡时长（秒）
+
+// 三次缓出：起步快、末端缓，读起来是"干脆地停住"。
+inline float ease_out_cubic(float x) {
+    const float u = 1.0f - x;
+    return 1.0f - u * u * u;
+}
+
+// 一次性开合动画的进度。value ∈ [0,1]：0 = 完全收起（可销毁），1 = 静止展开。
+struct ToggleAnim {
+    float value = 0.0f;        // 当前（已缓出）进度
+    float from = 0.0f;         // 本次过渡的起点
+    float elapsed = 0.0f;
+    bool  active = false;
+    bool  target_open = false;
+
+    // 推进一帧；返回 true = 本帧仍需绘制（value > 0）。
+    bool step(float dt, bool want_open, bool motion) {
+        const float target = want_open ? 1.0f : 0.0f;
+        if (!motion) { value = target; active = false; target_open = want_open; return value > 0.0f; }
+        if (active && target_open != want_open) { from = value; elapsed = 0.0f; }  // 中途反向：从当前值重起
+        if (!active) {
+            if (value == target) return value > 0.0f;   // 已静止在目标
+            from = value; elapsed = 0.0f; active = true;
+        }
+        target_open = want_open;
+        elapsed += dt;
+        float x = elapsed / kOpenCloseDur;
+        if (x >= 1.0f) { x = 1.0f; active = false; }
+        value = from + (target - from) * ease_out_cubic(x);
+        return value > 0.0f;
+    }
+};
 
 // ---- 图标字形（Segoe MDL2 Assets，PUA 码位；缺失时按钮退化为文字标签）----
 // **只列当前实际用到的字形**：多列一个就多一份图集体积与一处启动校验点。
@@ -179,6 +221,7 @@ struct Graphics {
     IDXGISwapChain* swap_chain = nullptr;
     ID3D11RenderTargetView* rtv = nullptr;
     DXGI_SWAP_CHAIN_DESC sc_desc{};
+    UINT cur_w = 0, cur_h = 0;   // 当前后备缓冲尺寸：尺寸未变时跳过重建（避免无谓闪烁）
 
     bool initialize(HWND hwnd);
     bool create_rtv();
@@ -187,6 +230,14 @@ struct Graphics {
     void shutdown();
 };
 inline Graphics g_gfx;
+
+// 待处理的客户区尺寸（WM_SIZE 只记录、不立即重建 swapchain）。
+// 为什么延到帧首：WM_SIZE 常在 SetWindowPos / SetWindowPlacement 过程中**同步**到达，
+// 而这类调用可能发生在 ImGui 一帧中途（命令派发时）。若当场 ResizeBuffers，本帧的绘制数据
+// 仍是按旧尺寸排布的，却被画进新尺寸的后备缓冲 → 呈现为一帧拉伸/闪烁；全屏切换时尤其明显。
+// 改为帧首统一应用后：每帧至多重建一次、与 ImGui 视口尺寸严格一致，且多次 WM_SIZE 自动合并。
+inline bool g_resize_pending = false;
+inline UINT g_resize_w = 0, g_resize_h = 0;
 
 // ---- ImGui 引导（RAII） ----
 struct ImGuiRaii {
@@ -311,6 +362,16 @@ inline float  g_zoom_anchor_x = 0.0f;    // 缩放不动点（画布内屏幕坐
 inline float  g_zoom_anchor_y = 0.0f;
 inline bool   g_zoom_end_fit = false;    // 动画结束后回到 fit-width（"适合宽度"的收尾）
 inline float  g_top_bar_h = -1.0f;       // 顶栏当前动画高度（px，0~px(kTopBarH)）；<0 = 未初始化
+// 侧栏滑入/滑出（ADR-055）：当前动画宽度（px），0 = 完全收起。与顶栏同一手法（一阶滞后）。
+// 侧栏面板**按整宽排布、整体左移**，由 ##shell 的裁剪实现"滑出左侧"，内容不随动画重排。
+inline float  g_sidebar_w = 0.0f;
+// 设置窗口的打开/关闭进度（ADR-056/061）：value 0 = 完全关闭（不绘制），1 = 静止态。
+// 同时驱动**透明度**与**缩放**（以窗口中心为不动点，kWindowScaleFrom ↔ 1.0）；关闭时边缩边淡。
+inline ToggleAnim g_settings_anim;
+// 设置窗口的"静止态"左上角（默认居中；用户拖动后每帧实测更新）。
+// 开合动画以它为基准做缩放，因此关闭时不会把窗口拉回屏幕中央。
+inline ImVec2 g_settings_rest_pos{};
+inline bool   g_settings_rest_valid = false;
 
 // ---- 自绘滚动条（画布右侧，可拖拽，ADR-050）----
 // 三者都由 ui.cpp 的滚动条交互维护：拖拽期间必须抑制画布平移（否则"拖滚动条"变成"拖页面"）。
@@ -351,6 +412,8 @@ void set_sidebar(bool on, int tab);
 void open_jump_popup();
 void scroll_by_rows(int dir);
 void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered);
+void handle_reading_commands(const ImVec2& size);   // 阅读态命令派发（命令表驱动，ADR-054）
+void handle_global_commands();                      // 全局命令派发（任何状态可用）
 void update_want_scale();           // 缩放防抖
 void emit_wants();                  // 可见页 + 方向感知预加载 → 渲染请求
 
@@ -365,12 +428,73 @@ void step_view_motion(float dt);                           // 每帧消耗待定
 [[nodiscard]] float view_zoom_target();                    // 目标倍率（动效中 = 动画目标）
 
 // ============================================================================
+// 命令与按键绑定（session.cpp 定义表与派发；ui.cpp 渲染"按键"设置分栏）
+// ============================================================================
+//
+// 为什么要有这张表：早期按键判定散落在 session.cpp 的 handle_canvas_input 与
+// draw_shell 里（一处一个 IsKeyPressed），既**无法自定义**、也**无法在界面上列出**。
+// 这里把每条命令的默认键、是否连发、是否全局可用集中成一张表：输入侧统一走
+// cmd_pressed()，界面侧直接遍历同一张表渲染"按键设置"，两处不会漂移。
+//
+// 一条命令最多两个键（主键 + 备键）：数字/算术类快捷键"主键盘与小键盘两套都判"
+// （ADR-027）由"两个槽"直接表达，不再写别名；"Esc 兼作全屏"这类诉求也由备键承接。
+
+enum class Cmd : int {
+    // 导航
+    NextRow, PrevRow, ScrollDown, ScrollUp, PageDown, PageUp, FirstPage, LastPage, JumpPage,
+    // 缩放
+    ZoomIn, ZoomOut, FitWidth,
+    // 视图
+    Col1, Col2, Col3, Col4, ToggleSpread, RotateCW, ToggleInvert, ToggleSepia,
+    // 界面
+    ToggleSidebar, ToggleBookmark, OpenSettings, OpenKeys, ToggleDebug, ToggleFullscreen, OpenFile,
+    Count,
+};
+
+inline constexpr int kCmdCount = static_cast<int>(Cmd::Count);
+inline constexpr int kBindSlots = 2;   // 每条命令的按键槽数（主键 / 备键）
+
+struct CmdDef {
+    const char*   id;      // ini 键名：**稳定标识**，改显示文案不得改它
+    const char*   group;   // 分组（按键界面按此分段）
+    const char*   name;    // 显示名
+    bool          repeat;  // 按住是否连发（滚动/缩放类为 true）
+    bool          global;  // 是否任何状态都可用（不受"阅读态/画布输入"约束）
+    ImGuiKeyChord def0;    // 默认主键（ImGuiKey | ImGuiMod_*）
+    ImGuiKeyChord def1;    // 默认备键（ImGuiKey_None = 无）
+};
+
+extern const CmdDef kCmds[kCmdCount];
+
+// 当前绑定。空槽 = ImGuiKey_None。由 load_binds 从 ini 覆盖，改动即时落盘。
+inline ImGuiKeyChord g_binds[kCmdCount][kBindSlots] = {};
+
+// 按键捕获：在"按键"设置分栏点中某槽后进入；捕获期间**不派发任何命令**，
+// 否则按下的那个键会立刻触发它原本绑定的命令。
+inline int g_capture_cmd = kCmdCount;   // kCmdCount = 当前未捕获
+inline int g_capture_slot = 0;
+inline int g_capture_frame = -1;        // 进入捕获的帧号：跳过"点按钮"那一次鼠标点击
+
+void reset_binds_to_default();
+void load_binds();                      // 需在 ImGui 上下文建立后调用（GetKeyName）
+void save_binds();
+bool cmd_pressed(Cmd c);                // 任一槽按下即 true（含修饰键严格匹配）
+bool is_bindable_key(ImGuiKey k);       // 排除修饰键/鼠标/手柄
+std::string chord_label(ImGuiKeyChord c);   // 显示用（"Ctrl+O"）
+std::string chord_to_string(ImGuiKeyChord c);   // ini 存储用（纯 ASCII）
+ImGuiKeyChord chord_from_string(const std::string& s);
+void update_key_capture();              // 每帧推进捕获（在设置窗口绘制之后调用）
+int  find_bind_conflict(int cmd, int slot); // 冲突命令下标；无冲突 -1
+
+// ============================================================================
 // 绘制层（ui.cpp）
 // ============================================================================
 
 inline bool g_show_debug = false;
 inline bool g_show_settings = false;
-inline bool g_show_help = false;
+// 打开设置时要求选中的分栏（0 界面 / 1 阅读 / 2 性能 / 3 按键）；-1 = 保持上次。
+// 由 OpenSettings（Ctrl+,）与 OpenKeys（F1）设置，绘制后立即复位。
+inline int g_settings_open_tab = -1;
 // 「键盘打开画布右键菜单」（Shift+F10 / 菜单键）：由 draw_shell 置位，
 // draw_canvas_context_menu 在画布窗口作用域内消费（与右键同一 ID 空间）。
 inline bool g_open_canvas_ctx = false;
@@ -386,6 +510,14 @@ inline double g_last_scroll_time = -1.0;
 
 // 「打开文档…」对话框：真正的 GetOpenFileNameW 放在帧与帧之间执行（自带模态消息循环）。
 inline bool    g_request_open_dialog = false;
+// 全屏切换请求（ADR-060）：**延到帧与帧之间**执行。若在 ImGui 一帧中途改窗口几何，
+// 本帧的绘制数据仍是按旧尺寸排布的，会被 DWM 拉伸到新窗口矩形上 —— 这就是"退出全屏闪一下/
+// 最大化时往左上缩一下再归位"的来源。放到帧首后，几何变更与随后的 new_frame/render 同帧一致。
+inline bool    g_request_fullscreen_toggle = false;
+// 窗口已最小化（WM_SIZE 的 SIZE_MINIMIZED）：期间**整帧不渲染**。
+// 最小化时客户区为 0，ImGui 在 0 尺寸视口下什么都画不出，整帧只剩清屏色 ——
+// 在"收起动画"里就会闪一下（人工反馈）。顺带也省掉最小化期间的 CPU/GPU。
+inline bool    g_minimized = false;
 inline wchar_t g_open_path_buf[32768] = {};
 
 // 三段外壳的绘制：**高度/位置由 draw_shell 显式给出**，不依赖 ImGui 的"相邻项自动间距"
@@ -394,16 +526,16 @@ void draw_shell();
 void draw_top_bar(float bar_h);
 void draw_status_bar();
 void draw_canvas_area(float height);
-void draw_sidebar(float height);
+void draw_sidebar(float height, float width);   // width 为动画宽度（px），内容仍按整宽排布
 void draw_canvas_context_menu();
 void draw_debug_overlay();
 void draw_jump_popup();
 void draw_password_popup();
 void draw_settings_window();
-void draw_help_window();
 void update_toolbar_visibility();
 bool top_bar_should_show();
 float update_top_bar_height(float dt);   // 顶栏高度的滑入/滑出插值
+float update_sidebar_width(float dt);    // 侧栏宽度的滑入/滑出插值（ADR-055）
 
 // ============================================================================
 // 入口层（main.cpp）

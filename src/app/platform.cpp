@@ -266,7 +266,10 @@ bool Graphics::initialize(HWND hwnd) {
             levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
             &sc_desc, &swap_chain, &device, &got, &context)))
         return false;
-    return create_rtv();
+    if (!create_rtv()) return false;
+    RECT rc{};
+    if (GetClientRect(hwnd, &rc)) { cur_w = rc.right - rc.left; cur_h = rc.bottom - rc.top; }
+    return true;
 }
 
 bool Graphics::create_rtv() {
@@ -279,9 +282,13 @@ bool Graphics::create_rtv() {
 
 void Graphics::resize(UINT w, UINT h) {
     if (!swap_chain || w == 0 || h == 0) return;
+    if (rtv && w == cur_w && h == cur_h) return;  // 尺寸未变：不重建（重建会丢后备缓冲内容）
     if (rtv) { rtv->Release(); rtv = nullptr; }
-    if (SUCCEEDED(swap_chain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0)))
+    if (SUCCEEDED(swap_chain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0))) {
         create_rtv();
+        cur_w = w;
+        cur_h = h;
+    }
 }
 
 void Graphics::render_frame() {
@@ -457,6 +464,38 @@ void save_prefs() {
     lr::write_ini_int(g_ini_path, L"cache", L"BudgetMB", g_prefs.cache_mb);
 }
 
+// ---------------- 按键绑定持久化（[keys] 节，ADR-054） ----------------
+//
+// 值形如 "Ctrl+O|F11"：两个槽（主键 / 备键），空槽留空。整条缺失 → 保留默认。
+// 键名一律用 ImGui::GetKeyName 的原文（纯 ASCII），故这里只有宽窄转换、不涉及编码歧义；
+// 显示用的美化名（"Ctrl+="）只用于界面，不落盘。
+
+void load_binds() {
+    reset_binds_to_default();
+    for (int i = 0; i < kCmdCount; ++i) {
+        const std::wstring wkey = lr::utf8_to_wide(kCmds[i].id);
+        const std::wstring wval = lr::read_ini_string_ex(g_ini_path, L"keys", wkey.c_str(), L"");
+        if (wval.empty()) continue;   // 无记录：保留默认
+        const std::string v = lr::wide_to_utf8(wval);
+        const std::size_t bar = v.find('|');
+        const std::string a = (bar == std::string::npos) ? v : v.substr(0, bar);
+        const std::string b = (bar == std::string::npos) ? std::string() : v.substr(bar + 1);
+        g_binds[i][0] = chord_from_string(a);
+        g_binds[i][1] = chord_from_string(b);
+    }
+}
+
+void save_binds() {
+    for (int i = 0; i < kCmdCount; ++i) {
+        std::string v = chord_to_string(g_binds[i][0]);
+        v += '|';
+        v += chord_to_string(g_binds[i][1]);
+        const std::wstring wkey = lr::utf8_to_wide(kCmds[i].id);
+        const std::wstring wval = lr::utf8_to_wide(v);
+        lr::write_ini_string(g_ini_path, L"keys", wkey.c_str(), wval.c_str());
+    }
+}
+
 // ---------------- 输入法关联 ----------------
 
 // 阅读窗口平时脱离输入法（让字母/数字快捷键生效）；文本输入激活时临时关联回来，
@@ -475,20 +514,26 @@ void toggle_fullscreen() {
     if (!g_fullscreen) {
         GetWindowPlacement(g_hwnd, &g_prev_placement);
         MONITORINFO mi{ sizeof(mi) };
-        if (GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
-            SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-            SetWindowPos(g_hwnd, HWND_TOP,
-                         mi.rcMonitor.left, mi.rcMonitor.top,
-                         mi.rcMonitor.right - mi.rcMonitor.left,
-                         mi.rcMonitor.bottom - mi.rcMonitor.top,
-                         SWP_FRAMECHANGED | SWP_NOZORDER);
-            g_fullscreen = true;
-        }
+        if (!GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
+        SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(g_hwnd, nullptr,
+                     mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
+        g_fullscreen = true;
     } else {
+        // 退出全屏：**先提交新样式（FRAMECHANGED），再落位**。
+        // 反过来（原实现：先 SetWindowPlacement 再补 FRAMECHANGED）会出问题：
+        //   SetWindowPlacement 用的是尚未生效的 WS_POPUP（无边框）度量来摆放窗口，
+        //   随后的 FRAMECHANGED 重算非客户区、把窗口再挪一次 —— 肉眼即"变了又归位"。
+        // 这里先让样式在**全屏矩形上**生效（NOMOVE|NOSIZE，几何不动、无可见中间态），
+        // 再用 SetWindowPlacement 一次落位：几何只变一次，且工作区坐标换算交给系统
+        // （rcNormalPosition 是工作区坐标，手工 SetWindowPos 在多显示器下会偏）。
         SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
-        SetWindowPlacement(g_hwnd, &g_prev_placement);
         SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        SetWindowPlacement(g_hwnd, &g_prev_placement);
         g_fullscreen = false;
     }
 }
