@@ -414,6 +414,13 @@ def main():
     log("== 6. 加密 PDF（需要 PyMuPDF） ==")
     make_encrypted(out_dir, log)
 
+    # 压力样本（Phase 7，ADR-079）：规模与幅面的极端值。
+    # 1000+ 页：压页表规模、逐页尺寸探测与检索扫描；
+    # A0 幅面：841×1189mm = 2384×3370pt，压"超大页 tile 渲染"路径（超过 tile_size_px 才分块）。
+    log("== 7. 压力样本（Phase 7） ==")
+    write("stress_1200p.pdf", minimal_pdf(pages=1200))
+    write("poster_a0.pdf", minimal_pdf(pages=1, mediabox="0 0 2384 3370"))
+
     with open(os.path.join(out_dir, "_manifest.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     print(f"\n样本目录：{out_dir}")

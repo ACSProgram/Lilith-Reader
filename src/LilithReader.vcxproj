@@ -125,7 +125,12 @@
     <ClCompile Include="app\platform.cpp" />
     <ClCompile Include="app\session.cpp" />
     <ClCompile Include="app\ui.cpp" />
+    <!-- Phase 7 稳定性：进程级崩溃防线（set_terminate / SEH / MiniDump） -->
+    <ClCompile Include="app\crash.cpp" />
     <ClCompile Include="utils\utils.ixx" />
+    <!-- Phase 7 稳定性：轻量日志（自实现，不引入 spdlog，ADR-077） -->
+    <ClCompile Include="log\log.ixx" />
+    <ClCompile Include="log\log.cpp" />
     <ClCompile Include="document\document.ixx" />
     <ClCompile Include="document\document.cpp" />
     <!-- Phase 3：自研画布（纯布局，可单测）与渲染调度层 -->

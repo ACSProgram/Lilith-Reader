@@ -45,6 +45,7 @@ import lilithreader.document;
 import lilithreader.canvas;
 import lilithreader.render;
 import lilithreader.reader_state;
+import lilithreader.log;      // Phase 7：轻量日志（自实现，不引入 spdlog，ADR-077）
 
 #include "imgui.h"
 #include "tone.h"      // 纸张方案 → chrome 色调（纯函数，自身不依赖 ImGui/Win32）
@@ -257,12 +258,21 @@ struct Graphics {
     ID3D11RenderTargetView* rtv = nullptr;
     DXGI_SWAP_CHAIN_DESC sc_desc{};
     UINT cur_w = 0, cur_h = 0;   // 当前后备缓冲尺寸：尺寸未变时跳过重建（避免无谓闪烁）
+    // 显示设备已丢失（Present 返回 DXGI_ERROR_DEVICE_REMOVED/RESET）：此后不再呈现。
+    // 只置标记、不做设备重建 —— 半途重建 device/swapchain 还必须让 ImGui 后端重新初始化并
+    // 重建字体纹理，失败面比收益大。置标记后由界面如实告知用户，日志里保留 HRESULT 供追溯。
+    bool device_lost = false;
+
+    // D3D 资源是**独占所有**：拷贝会得到两个"所有者"，析构时双重释放。
+    Graphics() = default;
+    Graphics(const Graphics&) = delete;
+    Graphics& operator=(const Graphics&) = delete;
 
     bool initialize(HWND hwnd);
     bool create_rtv();
     void resize(UINT w, UINT h);
     void render_frame();
-    void shutdown();
+    void shutdown();   // 幂等：可重复调用
 };
 inline Graphics g_gfx;
 
@@ -702,9 +712,10 @@ inline bool g_show_debug = false;
 inline bool g_show_settings = false;
 
 // ---- 通用确认弹窗（ADR-062）----
-// 一处弹窗、多处复用：① 智能匹配的"要不要沿用"询问；② 阅读数据删除 / 清空的二次确认。
+// 一处弹窗、多处复用：① 智能匹配的"要不要沿用"询问；② 阅读数据删除 / 清空的二次确认；
+// ③ 上次异常退出的提示（Phase 7，主按钮打开崩溃报告目录）。
 // 两个按钮都是动作：主按钮 = 推荐动作，次按钮 = 另一动作或取消。
-enum class ConfirmKind : int { None, Relocate, ClearOne, ClearAll, PruneUnknown };
+enum class ConfirmKind : int { None, Relocate, ClearOne, ClearAll, PruneUnknown, CrashNotice };
 
 inline ConfirmKind   g_confirm_kind = ConfirmKind::None;
 inline bool          g_confirm_open = false;
@@ -748,6 +759,9 @@ inline bool    g_request_fullscreen_toggle = false;
 // 在"收起动画"里就会闪一下（人工反馈）。顺带也省掉最小化期间的 CPU/GPU。
 inline bool    g_minimized = false;
 inline wchar_t g_open_path_buf[32768] = {};
+
+// 上次异常退出的摘要（入口处由 crash::take_last_crash 填入，交给确认弹窗展示后清空）。
+inline std::string g_last_crash_summary;
 
 // 三段外壳的绘制：**高度/位置由 draw_shell 显式给出**，不依赖 ImGui 的"相邻项自动间距"
 // （那正是状态栏被挤出窗口底部的根因，见 draw_shell 注释）。

@@ -15,6 +15,9 @@
 
 #include "app_internal.h"
 
+#include "imgui_raii.h"   // Phase 7：ImGui 栈的 RAII 包装（Push/Pop · Begin/End 自动配对）
+#include "crash.h"        // 上次异常退出的提示里要打开 crash 目录（Phase 7）
+
 namespace lr::app {
 
 // ---------------- 本文件专用常量 ----------------
@@ -68,12 +71,20 @@ CenterArea center_area() {
 
 void centered_text(const CenterArea& a, const char* text, float dy, const ImVec4& col,
                    float font_base = 0.0f) {
-    if (font_base > 0.0f) ImGui::PushFont(nullptr, font_base);
-    const ImVec2 ts = ImGui::CalcTextSize(text);
-    ImGui::SetCursorScreenPos(ImVec2(a.origin.x + (a.avail.x - ts.x) * 0.5f,
-                                     a.origin.y + (a.avail.y - ts.y) * 0.5f + dy * ui_scale()));
-    ImGui::TextColored(col, "%s", text);
-    if (font_base > 0.0f) ImGui::PopFont();
+    const auto body = [&] {
+        const ImVec2 ts = ImGui::CalcTextSize(text);
+        ImGui::SetCursorScreenPos(ImVec2(a.origin.x + (a.avail.x - ts.x) * 0.5f,
+                                         a.origin.y + (a.avail.y - ts.y) * 0.5f + dy * ui_scale()));
+        ImGui::TextColored(col, "%s", text);
+    };
+    // font_base == 0 表示"用当前字体"：此时**不推也不弹**。用作用域对象表达这种条件性，
+    // 比 "if (x) Push; ...; if (x) Pop" 更稳：中间无论怎么退出，配对都成立。
+    if (font_base > 0.0f) {
+        const ig::Font f(nullptr, font_base);
+        body();
+    } else {
+        body();
+    }
 }
 
 void draw_drop_guide() {
@@ -309,11 +320,13 @@ void draw_page_overlays(ImDrawList* dl, const ImVec2& origin, int page) {
 
 // 画布区：高度由 draw_shell 显式给出（不依赖 ImGui 的相邻项间距，见 draw_shell 注释）
 void draw_canvas_area(float height) {
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::BeginChild("##canvas", ImVec2(0, height), false,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
-                      ImGuiWindowFlags_NoNav);
-    ImGui::PopStyleVar();
+    // 零内边距**只覆盖"创建子窗口"这一瞬**：dismiss() 之后立刻恢复默认。
+    // 不 dismiss（让它活到函数尾）会让子窗口内后续弹出的右键菜单也变成零内边距 —— 观感会变。
+    ig::StyleVar canvas_pad(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ig::Child canvas("##canvas", ImVec2(0, height), false,
+                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                     ImGuiWindowFlags_NoNav);
+    canvas_pad.dismiss();
 
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const ImVec2 size = ImGui::GetContentRegionAvail();
@@ -402,7 +415,9 @@ void draw_canvas_area(float height) {
     const int last = g_canvas.visible_last();
     const ImVec2 clip_max(origin.x + size.x, origin.y + size.y);
     if (g_page_fade.size() < static_cast<std::size_t>(n)) g_page_fade.resize(n);
-    dl->PushClipRect(origin, clip_max, true);
+    // 裁剪用作用域对象：dismiss() 落在原 PopClipRect 的位置，语义与原代码逐字一致，
+    // 且循环中若发生任何异常展开，裁剪栈也一定会被收回。
+    ig::ClipRect page_clip(dl, origin, clip_max, true);
     for (int i = first; i <= last && i < n; ++i) {
         const lr::PageRect r = g_canvas.page_rect(i);
         const ImVec2 pmin(origin.x + r.x, origin.y + r.y);
@@ -457,23 +472,22 @@ void draw_canvas_area(float height) {
         // 纹理还没到位时选区照样看得见，语义上更一致（选区属于"页"而不是"纹理"）。
         draw_page_overlays(dl, origin, i);
     }
-    dl->PopClipRect();
+    page_clip.dismiss();
 
     // 滚动条用**交互后**的几何重算一次：拖动刚改过 scroll_y，滑块位置必须同帧跟上
     draw_scroll_bar(dl, scroll_bar_geom(origin, size));
     draw_canvas_context_menu();  // 命中区是画布，命令集中在上下文菜单里
-
-    ImGui::EndChild();
 }
 
 void draw_status_bar() {
     const float bar_h = px(kStatusBarH);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(kChromePadX), px(2)));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(px(7), 0));
-    ImGui::BeginChild("##status", ImVec2(0, bar_h), false,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
-                      ImGuiWindowFlags_NoNav);
-    ImGui::PopStyleVar(2);
+    // 内边距与项距只覆盖"创建状态栏子窗口"这一瞬（原 PopStyleVar(2) 的位置即 dismiss 处）。
+    ig::StyleVar2 status_pad(ImGuiStyleVar_WindowPadding, ImVec2(px(kChromePadX), px(2)),
+                             ImGuiStyleVar_ItemSpacing, ImVec2(px(7), 0));
+    ig::Child status("##status", ImVec2(0, bar_h), false,
+                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                     ImGuiWindowFlags_NoNav);
+    status_pad.dismiss();
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos();
@@ -534,8 +548,7 @@ void draw_status_bar() {
         ImGui::SetCursorPos(ImVec2(ws.x - rw - px(kChromePadX), ty));
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim), "%s", right.c_str());
     }
-
-    ImGui::EndChild();
+    // 状态栏子窗口的 EndChild 由 ig::Child 的析构完成（异常时也一定会配对）。
 }
 
 // ---------------- 调试浮层 ----------------
@@ -543,12 +556,14 @@ void draw_status_bar() {
 void draw_debug_overlay() {
     const ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(px(12), px(12)), ImGuiCond_Always);
-    if (ImGui::Begin("##debug", nullptr, ImGuiWindowFlags_NoDecoration |
-                     ImGuiWindowFlags_AlwaysAutoResize |
-                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNav |
-                     ImGuiWindowFlags_NoSavedSettings |
-                     ImGuiWindowFlags_NoFocusOnAppearing)) {
-        if (io.Framerate > 0.0f)
+    // Begin/End 是**无条件配对**（返回值只表示"是否可见"）：用 ig::Window 后，
+    // 中间那几十行读数里任何一次提前退出/异常都不会漏掉 End()。
+    const ig::Window debug_win("##debug", nullptr, ImGuiWindowFlags_NoDecoration |
+                                                   ImGuiWindowFlags_AlwaysAutoResize |
+                                                   ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNav |
+                                                   ImGuiWindowFlags_NoSavedSettings |
+                                                   ImGuiWindowFlags_NoFocusOnAppearing);
+    if (debug_win) {        if (io.Framerate > 0.0f)
             ImGui::Text("%.1f FPS / %.2f ms", io.Framerate, 1000.0f / io.Framerate);
         else
             ImGui::TextUnformatted("-- FPS");
@@ -626,7 +641,6 @@ void draw_debug_overlay() {
         if (g_doc.kind == UiDoc::Kind::Failed && !g_doc.detail_u8.empty())
             ImGui::TextDisabled("last_error: %.120s", g_doc.detail_u8.c_str());
     }
-    ImGui::End();
 }
 
 // ---------------- 弹窗开合动效（ADR-059）----------------
@@ -650,7 +664,12 @@ ToggleAnim g_pwd_anim;
 // 把整窗输入全部挡住（实测现象："点完按钮整页卡死，什么都不能操作"，ADR-064）。
 // 留 1/255 的透明度肉眼不可见，却让收敛帧仍是一个"真实帧"，关闭逻辑得以执行。
 constexpr float kPopupMinAlpha = 1.0f / 255.0f;
-void popup_anim_apply(const ToggleAnim& a) {
+
+// 返回一个**作用域对象**，由调用方持有：它代表"这个弹窗的透明度样式"。
+// 原来是 popup_anim_apply() 内部 Push、调用方在函数尾 Pop —— 跨函数的手工配对最容易漏
+// （少一处 Pop 就是整帧配色错位，而且看不出是谁漏的）。改成"返回对象"后，配对回到同一个
+// 作用域里，异常展开时也一定会收回。
+[[nodiscard]] ig::StyleVar popup_anim_style(const ToggleAnim& a) {
     const float alpha = a.value < kPopupMinAlpha ? kPopupMinAlpha : a.value;
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(
@@ -658,7 +677,7 @@ void popup_anim_apply(const ToggleAnim& a) {
                vp->Pos.y + vp->Size.y * 0.5f + (1.0f - a.value) * px(kPopupSlidePx)),
         ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowBgAlpha(alpha);
-    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    return ig::StyleVar(ImGuiStyleVar_Alpha, alpha);
 }
 
 // ---------------- 弹窗：跳页 ----------------
@@ -670,19 +689,19 @@ void draw_jump_popup() {
     if (!is_open) ImGui::OpenPopup("跳转页码");
     // **始终**套用动画样式：收敛那一帧 value 已是 0，必须仍为全透明再销毁，
     // 否则会以默认不透明度多画一帧 —— 即"关闭时闪一下"。
-    popup_anim_apply(g_jump_anim);
-    if (ImGui::BeginPopupModal("跳转页码", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    const ig::StyleVar anim_style = popup_anim_style(g_jump_anim);
+    if (const ig::PopupModal modal = ig::PopupModal("跳转页码", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         const int total = std::max(1, g_canvas.page_count());
         ImGui::Text("页码 (1 - %d)", total);
         ImGui::SetNextItemWidth(px(140));
         if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
-        ImGui::BeginDisabled(!g_open_jump);   // 淡出中不再响应，避免重复触发
+        const ig::Disabled anim_lock(!g_open_jump);   // 淡出中不再响应，避免重复触发
         const bool enter = ImGui::InputInt("##page", &g_jump_page, 0, 0,
                                            ImGuiInputTextFlags_EnterReturnsTrue);
         const bool do_jump = enter || ImGui::Button("跳转");
         ImGui::SameLine();
         const bool cancel = ImGui::Button("取消");
-        ImGui::EndDisabled();
+        anim_lock.dismiss();
         if (do_jump) {
             int p = g_jump_page - 1;
             if (p < 0) p = 0;
@@ -693,29 +712,25 @@ void draw_jump_popup() {
             g_open_jump = false;
         }
         if (!alive) ImGui::CloseCurrentPopup();   // 动画收敛：本帧已全透明，安全销毁
-        ImGui::EndPopup();
     }
-    ImGui::PopStyleVar();
 }
 
 // ---------------- 侧栏：目录 / 书签 / 缩略图 ----------------
 
 void draw_outline_tab() {
     if (g_outline.empty()) { ImGui::TextDisabled("本文档没有目录"); return; }
-    ImGui::BeginChild("##outline_list", ImVec2(0, 0), false);
+    const ig::Child list("##outline_list", ImVec2(0, 0), false);
     const int cur = g_canvas.current_page();
     for (int i = 0; i < static_cast<int>(g_outline.size()); ++i) {
         const lr::OutlineItem& it = g_outline[i];
         const char* label = it.title.empty() ? "(无标题)" : it.title.c_str();
-        ImGui::PushID(i);
+        const ig::Id item_id(i);
         if (it.depth > 0) ImGui::Indent(px(14.0f) * static_cast<float>(it.depth));
         const bool selected = (it.page >= 0 && it.page == cur);
         if (ImGui::Selectable(label, selected) && it.page >= 0)
             request_jump_scroll(it.page, 0.0f);
         if (it.depth > 0) ImGui::Unindent(px(14.0f) * static_cast<float>(it.depth));
-        ImGui::PopID();
     }
-    ImGui::EndChild();
 }
 
 void draw_bookmarks_tab() {
@@ -730,7 +745,7 @@ void draw_bookmarks_tab() {
         ImGui::TextDisabled("（按 B 在当前页增删）");
         return;
     }
-    ImGui::BeginChild("##bm_list", ImVec2(0, 0), false);
+    const ig::Child bm_list("##bm_list", ImVec2(0, 0), false);
     // × 按钮与 Selectable 同排：Selectable 默认铺满整行，其命中区会盖住后面的按钮，
     // 导致按钮点不到。给 Selectable 显式留出按钮 + 间距的宽度，两者命中区不再重叠。
     const ImGuiStyle& style = ImGui::GetStyle();
@@ -740,16 +755,14 @@ void draw_bookmarks_tab() {
     int del = -1;
     for (int i = 0; i < static_cast<int>(r->bookmarks.size()); ++i) {
         const lr::Bookmark& b = r->bookmarks[i];
-        ImGui::PushID(i);
+        const ig::Id item_id(i);
         char label[64];
         std::snprintf(label, sizeof label, "第 %d 页", b.page + 1);
         if (ImGui::Selectable(label, b.page == cur, 0, ImVec2(sel_w, 0)))
             request_jump_scroll(b.page, 0.0f);
         ImGui::SameLine();
         if (ImGui::SmallButton("×")) del = i;
-        ImGui::PopID();
     }
-    ImGui::EndChild();
     if (del >= 0) remove_bookmark_at(del);  // 循环外删除，避免迭代器失效
 }
 
@@ -766,10 +779,10 @@ void draw_thumbnails_tab() {
     for (int i = lo; i <= hi; ++i) want.push_back(i);
     g_renderer->set_thumbs_wanted(std::move(want), kThumbTargetPx);
 
-    ImGui::BeginChild("##thumb_list", ImVec2(0, 0), false);
+    const ig::Child thumb_list("##thumb_list", ImVec2(0, 0), false);
     for (int i = lo; i <= hi; ++i) {
         const lr::PageSlot s = g_renderer->thumb_slot(i);
-        ImGui::PushID(i);
+        const ig::Id item_id(i);
         char label[32];
         std::snprintf(label, sizeof label, "第 %d 页", i + 1);
         if (ImGui::Selectable(label, i == cur)) request_jump_scroll(i, 0.0f);
@@ -782,9 +795,7 @@ void draw_thumbnails_tab() {
             ImGui::TextDisabled(s.status == lr::PageStatus::Failed ? "（缩略图失败）" : "载入中…");
         }
         ImGui::Separator();
-        ImGui::PopID();
     }
-    ImGui::EndChild();
 }
 
 // 侧栏：高度与画布同高（由 draw_shell 统一给出，避免"三段 + 间距"溢出客户区）。
@@ -799,11 +810,11 @@ void draw_thumbnails_tab() {
 void draw_sidebar(float height, float width) {
     const float full_w = px(kSidebarWidthPx);
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() - (full_w - width));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(8), px(8)));
-    ImGui::BeginChild("##sidebar", ImVec2(full_w, height), false,
+    ig::StyleVar sidebar_pad(ImGuiStyleVar_WindowPadding, ImVec2(px(8), px(8)));
+    ig::Child sidebar("##sidebar", ImVec2(full_w, height), false,
                       ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoScrollbar |
                       ImGuiWindowFlags_NoScrollWithMouse);
-    ImGui::PopStyleVar();
+    sidebar_pad.dismiss();
     // 分栏标题栏不贴着窗口上沿：那里是"顶栏自动唤出带"，紧贴着放会让点标题的手感
     // 变成"在顶栏边缘试探"（实测反馈）。留一点上边距，命中目标就明确了。
     ImGui::Dummy(ImVec2(0.0f, px(6.0f)));
@@ -815,14 +826,13 @@ void draw_sidebar(float height, float width) {
     auto tab_flags = [want_tab](int i) {
         return (i == want_tab) ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
     };
-    if (ImGui::BeginTabBar("##sidebar_tabs")) {
-        if (ImGui::BeginTabItem("目录", nullptr, tab_flags(0))) { g_sidebar_tab = 0; draw_outline_tab(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("书签", nullptr, tab_flags(1))) { g_sidebar_tab = 1; draw_bookmarks_tab(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("缩略图", nullptr, tab_flags(2))) { g_sidebar_tab = 2; draw_thumbnails_tab(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("搜索", nullptr, tab_flags(3))) { g_sidebar_tab = 3; draw_search_tab(); ImGui::EndTabItem(); }
-        ImGui::EndTabBar();
+    // 分栏是**条件配对**（BeginTabItem 为真才有 EndTabItem），恰好由 if 的作用域表达。
+    if (const ig::TabBar tabs = ig::TabBar("##sidebar_tabs")) {
+        if (const ig::TabItem t = ig::TabItem("目录", nullptr, tab_flags(0))) { g_sidebar_tab = 0; draw_outline_tab(); }
+        if (const ig::TabItem t = ig::TabItem("书签", nullptr, tab_flags(1))) { g_sidebar_tab = 1; draw_bookmarks_tab(); }
+        if (const ig::TabItem t = ig::TabItem("缩略图", nullptr, tab_flags(2))) { g_sidebar_tab = 2; draw_thumbnails_tab(); }
+        if (const ig::TabItem t = ig::TabItem("搜索", nullptr, tab_flags(3))) { g_sidebar_tab = 3; draw_search_tab(); }
     }
-    ImGui::EndChild();
 }
 
 // 侧栏「搜索」分栏（Phase 8）：输入框 + 进度/统计 + 结果列表。
@@ -845,9 +855,10 @@ void draw_search_tab() {
     const bool click = ImGui::Button("搜索", ImVec2(bw, 0.0f));
     ImGui::SameLine();
     const bool can_cancel = search_has_query() || g_search_active || g_search_pending || !g_search_hits.empty();
-    ImGui::BeginDisabled(!can_cancel);
-    const bool cancel = ImGui::Button("取消", ImVec2(bw, 0.0f));
-    ImGui::EndDisabled();
+    const bool cancel = [&] {
+        const ig::Disabled d(!can_cancel);
+        return ImGui::Button("取消", ImVec2(bw, 0.0f));
+    }();
     if (enter || click) {
         search_start();
         g_search_focus = true;   // 保持焦点，方便连续改词
@@ -876,11 +887,12 @@ void draw_search_tab() {
     }
 
     const bool has_hits = (n > 0);
-    ImGui::BeginDisabled(!has_hits);
-    if (ImGui::Button("上一处")) search_step_hit(-1);
-    ImGui::SameLine();
-    if (ImGui::Button("下一处")) search_step_hit(+1);
-    ImGui::EndDisabled();
+    {
+        const ig::Disabled d(!has_hits);
+        if (ImGui::Button("上一处")) search_step_hit(-1);
+        ImGui::SameLine();
+        if (ImGui::Button("下一处")) search_step_hit(+1);
+    }
     if (has_hits) {
         ImGui::SameLine();
         ImGui::TextDisabled("%d / %d", g_search_cur + 1, n);
@@ -893,27 +905,27 @@ void draw_search_tab() {
     // 代表值来估算滚动范围，给成一行会让滚动条偏短。
     const float list_h = ImGui::GetContentRegionAvail().y;
     if (list_h <= 1.0f) return;
-    ImGui::BeginChild("##search_list", ImVec2(0, list_h), false);
+    const ig::Child result_list("##search_list", ImVec2(0, list_h), false);
     ImGuiListClipper clipper;
     clipper.Begin(n, ImGui::GetTextLineHeightWithSpacing() * 2.0f);
     while (clipper.Step()) {
         for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
             const lr::SearchHit& h = g_search_hits[static_cast<std::size_t>(i)];
-            ImGui::PushID(i);
+            const ig::Id hit_id(i);
             char label[64];
             std::snprintf(label, sizeof label, "第 %d 页", h.page + 1);
             if (ImGui::Selectable(label, i == g_search_cur)) search_goto(i);
             if (!h.snippet.empty()) {
                 ImGui::Indent(px(8));
-                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim));
-                ImGui::TextWrapped("%s", h.snippet.c_str());
-                ImGui::PopStyleColor();
+                {
+                    const ig::StyleColor snippet_dim(
+                        ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim));
+                    ImGui::TextWrapped("%s", h.snippet.c_str());
+                }
                 ImGui::Unindent(px(8));
             }
-            ImGui::PopID();
         }
     }
-    ImGui::EndChild();
 }
 
 // ---------------- 弹窗：密码 ----------------
@@ -924,8 +936,8 @@ void draw_password_popup() {
     if (!is_open && !g_open_password) return;   // 无弹窗、也无打开请求：不参与
     if (!is_open) ImGui::OpenPopup("需要密码");
     // **始终**套用动画样式：收敛那一帧 value 已是 0，必须仍为全透明再销毁（否则闪一下）。
-    popup_anim_apply(g_pwd_anim);
-    if (ImGui::BeginPopupModal("需要密码", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    const ig::StyleVar anim_style = popup_anim_style(g_pwd_anim);
+    if (const ig::PopupModal modal = ig::PopupModal("需要密码", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Text("此文档已加密，请输入密码：");
         ImGui::TextDisabled("%s", g_doc.name_u8.c_str());
         ImGui::SetNextItemWidth(px(260));
@@ -933,21 +945,24 @@ void draw_password_popup() {
         // 认证在途时禁用交互并提示"验证中…"，弹窗保持打开（不再关→开跳变）；
         // 淡出中（!g_open_password）同样禁用，避免重复提交/重复关闭文档。
         const bool locked = g_auth_pending || !g_open_password;
-        ImGui::BeginDisabled(locked);
-        const bool enter = ImGui::InputText("##pwd", g_password_buf, sizeof g_password_buf,
-                                            ImGuiInputTextFlags_Password |
-                                            ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::EndDisabled();
+        const bool enter = [&] {
+            const ig::Disabled d(locked);
+            return ImGui::InputText("##pwd", g_password_buf, sizeof g_password_buf,
+                                    ImGuiInputTextFlags_Password |
+                                    ImGuiInputTextFlags_EnterReturnsTrue);
+        }();
         if (g_auth_pending)
             ImGui::TextDisabled("验证中…");
         else if (!g_password_error.empty())
             ImGui::TextColored(tone_apply(ImVec4(0.9f, 0.35f, 0.35f, 1.0f)), "%s",
                                g_password_error.c_str());
-        ImGui::BeginDisabled(locked);
-        const bool ok = enter || ImGui::Button("解锁");
-        ImGui::SameLine();
-        const bool cancel = ImGui::Button("取消");
-        ImGui::EndDisabled();
+        bool ok = false, cancel = false;
+        {
+            const ig::Disabled d(locked);
+            ok = enter || ImGui::Button("解锁");
+            ImGui::SameLine();
+            cancel = ImGui::Button("取消");
+        }
         if (ok) {
             submit_password();   // 成功后由会话层置 g_open_password=false，动画再收尾
         } else if (cancel) {
@@ -955,9 +970,7 @@ void draw_password_popup() {
             close_document();          // 取消即关闭该文档，回到引导页
         }
         if (!alive) ImGui::CloseCurrentPopup();   // 动画收敛：本帧已全透明，安全销毁
-        ImGui::EndPopup();
     }
-    ImGui::PopStyleVar();
 }
 
 // ---------------- 界面外壳（顶栏 / 菜单 / 设置 / 帮助） ----------------
@@ -995,37 +1008,39 @@ bool menu_item_cmd(const char* icon, const char* label, Cmd shortcut_cmd,
 // 扁平按钮配色（顶栏/工具条，ADR-045）：
 // 默认**无底色**——否则一排按钮就是一排灰块，工具栏显脏；悬停/按下才浮现柔和底色。
 // active（如"侧栏已开/设置已开"）用低透明强调色底表示状态，而不是加粗边框。
-void push_flat_button(bool active) {
+//
+// 返回作用域对象：调用方持有它即可，不必记得配对 PopStyleColor(3)。
+[[nodiscard]] ig::StyleColor3 flat_button_style(bool active) {
     // 强调色也过一遍纸张方案的色调（ADR-068）：否则暖色方案下会出现"页面暖、按钮冷"。
     const ImVec4 accent = tone_apply(g_dark_theme ? ImVec4(0.42f, 0.65f, 0.94f, 1.0f)
                                                   : ImVec4(0.23f, 0.49f, 0.85f, 1.0f));
     const ImVec4 ink    = g_dark_theme ? ImVec4(1, 1, 1, 1) : ImVec4(0, 0, 0, 1);
-    ImGui::PushStyleColor(ImGuiCol_Button,
-        active ? ImVec4(accent.x, accent.y, accent.z, 0.18f) : ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+    return ig::StyleColor3(
+        ImGuiCol_Button,
+        active ? ImVec4(accent.x, accent.y, accent.z, 0.18f) : ImVec4(0, 0, 0, 0),
+        ImGuiCol_ButtonHovered,
         active ? ImVec4(accent.x, accent.y, accent.z, 0.28f)
-               : ImVec4(ink.x, ink.y, ink.z, g_dark_theme ? 0.12f : 0.06f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+               : ImVec4(ink.x, ink.y, ink.z, g_dark_theme ? 0.12f : 0.06f),
+        ImGuiCol_ButtonActive,
         active ? ImVec4(accent.x, accent.y, accent.z, 0.36f)
                : ImVec4(ink.x, ink.y, ink.z, g_dark_theme ? 0.18f : 0.10f));
 }
-inline void pop_flat_button() { ImGui::PopStyleColor(3); }
 
 // 图标按钮（顶栏用）。图标字体缺失时显示 text；active 表示"已开启"。
 bool tool_button(const char* id, const char* icon, const char* text, const char* tip,
                  bool active = false, bool enabled = true) {
-    ImGui::PushID(id);
+    const ig::Id button_id(id);
     const bool use_icon = (g_icons_ok && icon && icon[0]);
     const char* label = use_icon ? icon : text;
     const float h = ImGui::GetFrameHeight();
-    push_flat_button(active);
-    if (!enabled) ImGui::BeginDisabled();
-    const bool clicked = ImGui::Button(label, ImVec2(use_icon ? h : 0.0f, h));
-    if (!enabled) ImGui::EndDisabled();
-    pop_flat_button();
+    bool clicked = false;
+    {
+        const ig::StyleColor3 flat = flat_button_style(active);
+        const ig::Disabled dis(!enabled);   // BeginDisabled(false) 与 EndDisabled 也是严格配对
+        clicked = ImGui::Button(label, ImVec2(use_icon ? h : 0.0f, h));
+    }
     if (tip && tip[0] && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
         ImGui::SetTooltip("%s", tip);
-    ImGui::PopID();
     return clicked;
 }
 
@@ -1033,11 +1048,10 @@ bool tool_button(const char* id, const char* icon, const char* text, const char*
 // 注意：Selectable/MenuItem 的高度 = 文字高（**不吃 FramePadding**），项高完全由
 // ItemSpacing.y 决定 —— 悬停高亮向外扩半个间距，恰好铺满整个间距，故放大间距即放大项高，
 // 且相邻项的高亮连续、无点击死区。
-void push_popup_style() {
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(kPopupPadXY), px(kPopupPadXY)));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(px(8.0f), px(kMenuItemGapY)));
+[[nodiscard]] ig::StyleVar2 popup_style() {
+    return ig::StyleVar2(ImGuiStyleVar_WindowPadding, ImVec2(px(kPopupPadXY), px(kPopupPadXY)),
+                         ImGuiStyleVar_ItemSpacing, ImVec2(px(8.0f), px(kMenuItemGapY)));
 }
-inline void pop_popup_style() { ImGui::PopStyleVar(2); }
 
 int  zoom_percent() { return static_cast<int>(std::lround(g_canvas.effective_zoom() * 100.0f)); }
 // 顶栏/菜单里的缩放按钮与档位：都走动效入口（ADR-047），锚点取视口中心
@@ -1098,7 +1112,7 @@ void draw_view_menu_contents() {
         const std::string sc = chord_label(g_binds[static_cast<int>(Cmd::ToggleSidebar)][0]);
         ImGui::MenuItem(with_icon(kIcList, "侧栏").c_str(), sc.c_str(), &g_show_sidebar, rd);
     }
-    if (ImGui::BeginMenu(with_icon(kIcGrid, "列数").c_str(), rd)) {
+    if (const ig::Menu cols = ig::Menu(with_icon(kIcGrid, "列数").c_str(), rd)) {
         static const char* kNames[] = { "单页", "双页", "三页", "四页" };
         static const Cmd kCols[] = { Cmd::Col1, Cmd::Col2, Cmd::Col3, Cmd::Col4 };
         for (int c = 1; c <= 4; ++c) {
@@ -1106,13 +1120,12 @@ void draw_view_menu_contents() {
             const std::string sc = chord_label(g_binds[static_cast<int>(kCols[c - 1])][0]);
             if (ImGui::MenuItem(kNames[c - 1], sc.c_str(), on)) g_canvas.set_columns(c);
         }
-        ImGui::EndMenu();
     }
     const bool spread = g_canvas.state().spread;
     if (menu_item_cmd(kIcBook, "双页对开", Cmd::ToggleSpread, spread, rd,
                       "双页对开（书籍模式）：封面单独成页，其余两页并列"))
         g_canvas.set_spread(!spread);
-    if (ImGui::BeginMenu(with_icon(kIcRotate, "旋转").c_str(), rd)) {
+    if (const ig::Menu rot = ig::Menu(with_icon(kIcRotate, "旋转").c_str(), rd)) {
         const int degs[] = { 0, 90, 180, 270 };
         for (const int d : degs) {
             char lab[16];
@@ -1123,11 +1136,9 @@ void draw_view_menu_contents() {
             if (ImGui::MenuItem(lab, sc.empty() ? nullptr : sc.c_str(), g_rotation == d))
                 set_rotation(d);
         }
-        ImGui::EndMenu();
     }
-    if (ImGui::BeginMenu(with_icon(kIcPalette, "外观").c_str(), rd)) {
+    if (const ig::Menu ap = ig::Menu(with_icon(kIcPalette, "外观").c_str(), rd)) {
         draw_appearance_menu_contents(rd);
-        ImGui::EndMenu();
     }
     ImGui::Separator();
     if (menu_item_cmd(kIcFullscreen, "全屏", Cmd::ToggleFullscreen, g_fullscreen))
@@ -1158,14 +1169,14 @@ void draw_main_menu_contents() {
     if (menu_item(kIcClose, "关闭文档", nullptr, false, has_doc)) close_document();
     ImGui::Separator();
     // 视图菜单里包含全局外观设置；无文档时仍可打开它，纸张项会单独置灰。
-    if (ImGui::BeginMenu(with_icon(kIcDoc, "视图").c_str())) {
-        draw_view_menu_contents(); ImGui::EndMenu();
+    if (const ig::Menu v = ig::Menu(with_icon(kIcDoc, "视图").c_str())) {
+        draw_view_menu_contents();
     }
-    if (ImGui::BeginMenu(with_icon(kIcNext, "导航").c_str(), rd)) {
-        draw_nav_menu_contents(); ImGui::EndMenu();
+    if (const ig::Menu n = ig::Menu(with_icon(kIcNext, "导航").c_str(), rd)) {
+        draw_nav_menu_contents();
     }
-    if (ImGui::BeginMenu(with_icon(kIcExpand, "缩放").c_str(), rd)) {
-        draw_zoom_menu_contents(); ImGui::EndMenu();
+    if (const ig::Menu z = ig::Menu(with_icon(kIcExpand, "缩放").c_str(), rd)) {
+        draw_zoom_menu_contents();
     }
     ImGui::Separator();
     if (menu_item_cmd(kIcSearch, "查找…", Cmd::OpenSearch, false, rd)) {
@@ -1186,8 +1197,10 @@ void draw_canvas_context_menu() {
     if (g_doc.kind != UiDoc::Kind::Reading) return;
     // 键盘入口（Shift+F10 / 菜单键）与右键**同一 ID**：在本窗口作用域内显式打开。
     if (g_open_canvas_ctx) { g_open_canvas_ctx = false; ImGui::OpenPopup("##canvas_ctx"); }
-    push_popup_style();
-    if (ImGui::BeginPopupContextWindow("##canvas_ctx", ImGuiPopupFlags_MouseButtonRight)) {
+    // 弹出菜单的内边距/项距：作用域对象持有，函数尾自动收回（含异常展开）。
+    const ig::StyleVar2 menu_style = popup_style();
+    if (const ig::PopupContextWindow ctx =
+            ig::PopupContextWindow("##canvas_ctx", ImGuiPopupFlags_MouseButtonRight)) {
         // ---- 文本 / 图片 / 链接（Phase 8）----
         // 置灰规则：没有选区 → 「复制」不可用；右键位置不在页面上 → 「复制图片」不可用；
         // 该位置没有链接 → 链接两项不可用。宁可置灰也不隐藏：菜单长度稳定，用户能找到功能。
@@ -1214,11 +1227,11 @@ void draw_canvas_context_menu() {
         if (menu_item_cmd(kIcNext, "下一页", Cmd::NextRow, false, true, "下一页（对开时按整行推进）"))
             scroll_by_rows(+1);
         ImGui::Separator();
-        if (ImGui::BeginMenu(with_icon(kIcExpand, "缩放").c_str())) {
-            draw_zoom_menu_contents(); ImGui::EndMenu();
+        if (const ig::Menu z = ig::Menu(with_icon(kIcExpand, "缩放").c_str())) {
+            draw_zoom_menu_contents();
         }
-        if (ImGui::BeginMenu(with_icon(kIcDoc, "视图").c_str())) {
-            draw_view_menu_contents(); ImGui::EndMenu();
+        if (const ig::Menu v = ig::Menu(with_icon(kIcDoc, "视图").c_str())) {
+            draw_view_menu_contents();
         }
         ImGui::Separator();
         if (menu_item_cmd(kIcSearch, "跳转页码…", Cmd::JumpPage)) open_jump_popup();
@@ -1234,9 +1247,7 @@ void draw_canvas_context_menu() {
             g_show_settings = true;
             g_settings_open_tab = 3;
         }
-        ImGui::EndPopup();
     }
-    pop_popup_style();
 }
 
 // ---- 顶栏自动隐藏 ----
@@ -1321,12 +1332,13 @@ float update_sidebar_width(float dt) {
 // bar_h 由 draw_shell 传入（可小于整条高度：自动隐藏的滑出动效）。
 void draw_top_bar(float bar_h) {
     const float full_h = px(kTopBarH);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(kChromePadX), 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(px(kChromeGapX), 0));
-    ImGui::BeginChild("##topbar", ImVec2(0, bar_h), false,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
-                      ImGuiWindowFlags_NoNav);
-    ImGui::PopStyleVar(2);
+    // 内边距只覆盖"创建顶栏子窗口"这一瞬（dismiss 落在原 PopStyleVar(2) 的位置）。
+    ig::StyleVar2 topbar_pad(ImGuiStyleVar_WindowPadding, ImVec2(px(kChromePadX), 0),
+                             ImGuiStyleVar_ItemSpacing, ImVec2(px(kChromeGapX), 0));
+    const ig::Child topbar("##topbar", ImVec2(0, bar_h), false,
+                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                           ImGuiWindowFlags_NoNav);
+    topbar_pad.dismiss();
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos();
@@ -1348,10 +1360,16 @@ void draw_top_bar(float bar_h) {
     bool pinned = false;   // 顶栏自己的弹出菜单是否开着（见 g_toolbar_pinned）
     if (tool_button("##mainmenu", kIcMenu, "菜单", nullptr))
         ImGui::OpenPopup("##mainmenu_pop");
-    push_popup_style();
-    const bool main_open = ImGui::BeginPopup("##mainmenu_pop");
-    if (main_open) { draw_main_menu_contents(); ImGui::EndPopup(); }
-    pop_popup_style();
+    // 菜单样式与菜单的 Begin/End 收在同一个作用域里（lambda）：样式严格包住菜单本身，
+    // 不会因为"忘了 Pop"而把菜单内边距泄漏给后面的绘制。
+    const bool main_open = [&] {
+        const ig::StyleVar2 pop = popup_style();
+        if (const ig::Popup menu = ig::Popup("##mainmenu_pop")) {
+            draw_main_menu_contents();
+            return true;
+        }
+        return false;
+    }();
     if (main_open) pinned = true;
 
     if (rd) {
@@ -1387,14 +1405,19 @@ void draw_top_bar(float bar_h) {
         if (tool_button("##zout", kIcZoomOut, "-", "缩小"))
             zoom_at_center(1.0f / kZoomStep);
         ImGui::SameLine();
-        push_flat_button(false);
-        if (ImGui::Button(ztxt.c_str(), ImVec2(zw, h))) ImGui::OpenPopup("##zoompop");
-        pop_flat_button();
+        {
+            const ig::StyleColor3 flat = flat_button_style(false);
+            if (ImGui::Button(ztxt.c_str(), ImVec2(zw, h))) ImGui::OpenPopup("##zoompop");
+        }
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) ImGui::SetTooltip("缩放");
-        push_popup_style();
-        const bool zoom_open = ImGui::BeginPopup("##zoompop");
-        if (zoom_open) { draw_zoom_menu_contents(); ImGui::EndPopup(); }
-        pop_popup_style();
+        const bool zoom_open = [&] {
+            const ig::StyleVar2 pop = popup_style();
+            if (const ig::Popup menu = ig::Popup("##zoompop")) {
+                draw_zoom_menu_contents();
+                return true;
+            }
+            return false;
+        }();
         if (zoom_open) pinned = true;
         ImGui::SameLine();
         if (tool_button("##zin", kIcZoomIn, "+", "放大"))
@@ -1411,8 +1434,8 @@ void draw_top_bar(float bar_h) {
     if (tool_button("##settings", kIcSettings, "设置", tip_settings.c_str(), g_show_settings))
         g_show_settings = true;
 
+    // 顶栏子窗口的 EndChild 由 ig::Child 的析构完成。
     g_toolbar_pinned = pinned;   // 供下一帧的 update_toolbar_visibility / top_bar_should_show 读
-    ImGui::EndChild();
 }
 
 // ---------------- 通用确认弹窗（ADR-062）----------------
@@ -1458,28 +1481,30 @@ void draw_confirm_popup() {
     const bool is_open = ImGui::IsPopupOpen(kConfirmId);
     if (!is_open && !g_confirm_open) return;   // 无弹窗、也无打开请求：不参与
     if (!is_open) ImGui::OpenPopup(kConfirmId);
-    popup_anim_apply(g_confirm_anim);
+    const ig::StyleVar anim_style = popup_anim_style(g_confirm_anim);
 
-    if (ImGui::BeginPopupModal(kConfirmId, nullptr,
-                               ImGuiWindowFlags_AlwaysAutoResize |
-                               ImGuiWindowFlags_NoTitleBar |
-                               ImGuiWindowFlags_NoMove)) {
+    if (const ig::PopupModal modal = ig::PopupModal(kConfirmId, nullptr,
+                                                   ImGuiWindowFlags_AlwaysAutoResize |
+                                                   ImGuiWindowFlags_NoTitleBar |
+                                                   ImGuiWindowFlags_NoMove)) {
         const ImVec4 dim = ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim);
         const float wrap = px(420.0f);
 
         // 标题（强调色）
-        ImGui::PushTextWrapPos(wrap);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(g_pal.accent));
-        ImGui::TextUnformatted(g_confirm_title.c_str());
-        ImGui::PopStyleColor();
-        ImGui::PopTextWrapPos();
+        {
+            const ig::TextWrapPos wrap_pos(wrap);
+            const ig::StyleColor title_accent(
+                ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(g_pal.accent));
+            ImGui::TextUnformatted(g_confirm_title.c_str());
+        }
         ImGui::Spacing();
 
         // 说明
         if (!g_confirm_body.empty()) {
-            ImGui::PushTextWrapPos(wrap);
-            ImGui::TextUnformatted(g_confirm_body.c_str());
-            ImGui::PopTextWrapPos();
+            {
+                const ig::TextWrapPos wrap_pos(wrap);
+                ImGui::TextUnformatted(g_confirm_body.c_str());
+            }
             ImGui::Spacing();
         }
 
@@ -1489,9 +1514,8 @@ void draw_confirm_popup() {
             for (const auto& kv : g_confirm_rows) {
                 ImGui::TextColored(dim, "%s", kv.first.c_str());
                 ImGui::SameLine(label_w);
-                ImGui::PushTextWrapPos(wrap);
+                const ig::TextWrapPos wrap_pos(wrap);
                 ImGui::TextUnformatted(kv.second.c_str());
-                ImGui::PopTextWrapPos();
             }
             ImGui::Spacing();
         }
@@ -1499,21 +1523,23 @@ void draw_confirm_popup() {
         ImGui::Separator();
         ImGui::Spacing();
 
-        ImGui::BeginDisabled(!g_confirm_open);   // 淡出中不再响应，避免重复触发
-        const ImGuiStyle& st = ImGui::GetStyle();
-        const float ok_w  = ImGui::CalcTextSize(g_confirm_ok.c_str()).x + st.FramePadding.x * 2.0f;
-        const float alt_w = ImGui::CalcTextSize(g_confirm_alt.c_str()).x + st.FramePadding.x * 2.0f;
-        const float min_w = px(88.0f);
-        const float bw_ok = ok_w > min_w ? ok_w : min_w;
-        const float bw_alt = alt_w > min_w ? alt_w : min_w;
-        // 右对齐：末按钮右缘距窗口右内边 = 标准内边距（首帧窗口尚未按内容定宽，故夹到左边距）
-        const float row_w = bw_ok + bw_alt + st.ItemSpacing.x;
-        const float x = ImGui::GetWindowWidth() - st.WindowPadding.x - row_w;
-        ImGui::SetCursorPosX(x > st.WindowPadding.x ? x : st.WindowPadding.x);
-        const bool alt = ImGui::Button(g_confirm_alt.c_str(), ImVec2(bw_alt, 0));
-        ImGui::SameLine();
-        const bool ok = ImGui::Button(g_confirm_ok.c_str(), ImVec2(bw_ok, 0));
-        ImGui::EndDisabled();
+        bool alt = false, ok = false;
+        {
+            const ig::Disabled d(!g_confirm_open);   // 淡出中不再响应，避免重复触发
+            const ImGuiStyle& st = ImGui::GetStyle();
+            const float ok_w  = ImGui::CalcTextSize(g_confirm_ok.c_str()).x + st.FramePadding.x * 2.0f;
+            const float alt_w = ImGui::CalcTextSize(g_confirm_alt.c_str()).x + st.FramePadding.x * 2.0f;
+            const float min_w = px(88.0f);
+            const float bw_ok = ok_w > min_w ? ok_w : min_w;
+            const float bw_alt = alt_w > min_w ? alt_w : min_w;
+            // 右对齐：末按钮右缘距窗口右内边 = 标准内边距（首帧窗口尚未按内容定宽，故夹到左边距）
+            const float row_w = bw_ok + bw_alt + st.ItemSpacing.x;
+            const float x = ImGui::GetWindowWidth() - st.WindowPadding.x - row_w;
+            ImGui::SetCursorPosX(x > st.WindowPadding.x ? x : st.WindowPadding.x);
+            alt = ImGui::Button(g_confirm_alt.c_str(), ImVec2(bw_alt, 0));
+            ImGui::SameLine();
+            ok = ImGui::Button(g_confirm_ok.c_str(), ImVec2(bw_ok, 0));
+        }
 
         if (ok || alt) {
             const ConfirmKind kind = g_confirm_kind;
@@ -1525,14 +1551,19 @@ void draw_confirm_popup() {
                 if (kind == ConfirmKind::ClearOne)           clear_reading_data(target);
                 else if (kind == ConfirmKind::ClearAll)      clear_all_reading_data();
                 else if (kind == ConfirmKind::PruneUnknown)  clear_unknown_reading_data();
+                else if (kind == ConfirmKind::CrashNotice) {
+                    // 打开崩溃报告目录：交给系统资源管理器，不改动应用自身状态。
+                    const std::wstring dir = crash::report_dir();
+                    if (!dir.empty())
+                        ::ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr,
+                                        SW_SHOWNORMAL);
+                }
             } else if (kind == ConfirmKind::Relocate) {
                 detach_current_progress();      // 次按钮 = 另起一份
             }
         }
         if (!alive) { ImGui::CloseCurrentPopup(); g_confirm_target = 0; g_confirm_rows.clear(); }
-        ImGui::EndPopup();
     }
-    ImGui::PopStyleVar();
 }
 
 // ---------------- 设置 · 阅读数据分栏（ADR-062/063/065）----------------
@@ -1607,14 +1638,13 @@ ImVec4 danger_ink() {
     return tone_apply(g_dark_theme ? ImVec4(0.95f, 0.47f, 0.45f, 1.0f)
                                    : ImVec4(0.76f, 0.22f, 0.19f, 1.0f));
 }
-void push_danger_button(bool hovered) {
+[[nodiscard]] ig::StyleColor4 danger_button_style(bool hovered) {
     const ImVec4 red = danger_ink();
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(red.x, red.y, red.z, 0.14f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(red.x, red.y, red.z, 0.26f));
-    ImGui::PushStyleColor(ImGuiCol_Text, hovered ? red : col_dim());
+    return ig::StyleColor4(ImGuiCol_Button, ImVec4(0, 0, 0, 0),
+                           ImGuiCol_ButtonHovered, ImVec4(red.x, red.y, red.z, 0.14f),
+                           ImGuiCol_ButtonActive, ImVec4(red.x, red.y, red.z, 0.26f),
+                           ImGuiCol_Text, hovered ? red : col_dim());
 }
-inline void pop_danger_button() { ImGui::PopStyleColor(4); }
 
 // 行尾的删除按钮：默认无底色，悬停才浮出危险色。
 // 刻意不用 ImGui 的默认按钮——那在浅色主题下就是一块灰方块（人工反馈"按钮很丑"）。
@@ -1623,10 +1653,12 @@ bool danger_icon_button(float x, float y, const char* tip) {
     const ImVec2 b0(x, y), b1(x + h, y + h);
     const bool hov = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
                      ImGui::IsMouseHoveringRect(b0, b1);
-    push_danger_button(hov);
-    ImGui::SetCursorScreenPos(b0);
-    const bool clicked = ImGui::Button(g_icons_ok ? kIcTrash : "×", ImVec2(h, h));
-    pop_danger_button();
+    bool clicked = false;
+    {
+        const ig::StyleColor4 danger = danger_button_style(hov);
+        ImGui::SetCursorScreenPos(b0);
+        clicked = ImGui::Button(g_icons_ok ? kIcTrash : "×", ImVec2(h, h));
+    }
     if (tip != nullptr && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
         ImGui::SetTooltip("%s", tip);
     return clicked;
@@ -1641,10 +1673,8 @@ bool danger_text_button(const char* label) {
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     const bool hov = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
                      ImGui::IsMouseHoveringRect(p0, ImVec2(p0.x + w, p0.y + h));
-    push_danger_button(hov);
-    const bool clicked = ImGui::Button(label);
-    pop_danger_button();
-    return clicked;
+    const ig::StyleColor4 danger = danger_button_style(hov);
+    return ImGui::Button(label);
 }
 
 // 一张文档卡：标题行 + 统计行 + 若干路径行。
@@ -1670,7 +1700,8 @@ void draw_reading_data_card(std::size_t i) {
     const bool hov = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
                      ImGui::IsMouseHoveringRect(p0, p1);
 
-    ImGui::PushID(static_cast<int>(i));
+    // ID 用作用域对象持有：卡片体很长，任何一处提前退出/异常都不该把 ID 留在栈上。
+    ig::Id card_id(static_cast<int>(i));
     ImGui::Dummy(ImVec2(w, card_h));   // 先占位撑开整张卡；后面的元素都按绝对坐标摆
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1754,7 +1785,7 @@ void draw_reading_data_card(std::size_t i) {
 
     ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + px(9.0f)));
     ImGui::Dummy(ImVec2(1.0f, 0.0f));   // 收尾：让下一张卡从这里开始
-    ImGui::PopID();
+    card_id.dismiss();
 }
 
 // 位置未知的旧记录（升级前的 v1 记录没存过路径，永远显示不出文档名）单独成区：
@@ -1775,7 +1806,7 @@ void draw_unknown_records(const std::vector<std::size_t>& idx) {
     for (const std::size_t i : idx) {
         const std::uint64_t key = g_state.docs[i].first;
         const lr::DocRecord& r = g_state.docs[i].second;
-        ImGui::PushID(static_cast<int>(i));
+        ig::Id row_id(static_cast<int>(i));
 
         char text[128];
         if (r.page_count > 0)
@@ -1795,7 +1826,7 @@ void draw_unknown_records(const std::vector<std::size_t>& idx) {
         }
         ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + h + px(2.0f)));
         ImGui::Dummy(ImVec2(1.0f, 0.0f));
-        ImGui::PopID();
+        row_id.dismiss();
     }
 
     ImGui::Spacing();
@@ -1814,22 +1845,60 @@ void draw_unknown_records(const std::vector<std::size_t>& idx) {
 
 }  // namespace
 
-// 设置项表格的辅助函数定义在下面（分栏共用）；这里只是前置声明。
-bool settings_rows_begin(const char* id);
-void settings_rows_end();
-void settings_row(const char* label);
-void settings_note(const char* text);
+// ---- 设置项表格（左列标签 + 右列控件）----
+//
+// 原先是一对 settings_rows_begin()/settings_rows_end()：前者 PushStyleVar + BeginTable、
+// 后者 EndTable + PopStyleVar。**跨函数的配对**在这里尤其危险 —— 中间隔着整段分栏内容，
+// 任何一处提前 return 都会把 CellPadding 留在栈上（此后所有表格的行距都变窄，且看不出是谁漏的）。
+// 改成一个作用域对象：构造即开表、析构即收表，配对由语言保证。
+//
+// CellPadding 收窄：控件自身已有 FramePadding，行再留 6px 会显得空、且撑高窗口。
+// 直接组合 ig::StyleVar + ig::Table：成员按声明序构造、逆序析构，因此"先 PopStyleVar 后
+// EndTable"的顺序天然正确 —— 不需要在这里再手写一次配对逻辑。
+class SettingsRows {
+public:
+    explicit SettingsRows(const char* id)
+        : pad_(ImGuiStyleVar_CellPadding, ImVec2(px(9.0f), px(3.0f))),
+          table_(id, 2, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX) {
+        if (table_) {
+            ImGui::TableSetupColumn("l", ImGuiTableColumnFlags_WidthFixed, px(136.0f));
+            ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
+        }
+    }
+    SettingsRows(const SettingsRows&) = delete;
+    SettingsRows& operator=(const SettingsRows&) = delete;
+    SettingsRows(SettingsRows&&) = delete;
+    SettingsRows& operator=(SettingsRows&&) = delete;
+
+    [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(table_); }
+
+private:
+    ig::StyleVar pad_;
+    ig::Table    table_;
+};
+
+void settings_row(const char* label) {
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::TableSetColumnIndex(1);
+    ImGui::SetNextItemWidth(px(190.0f));
+}
+void settings_note(const char* text) {
+    ImGui::SameLine();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim), "%s", text);
+}
 
 void draw_settings_reading_data_tab() {
     // 顶部一行：智能匹配三态。它决定"文件换位置后要不要沿用同一份阅读数据"，
     // 与这一栏是同一件事 —— 放这儿，免得「阅读」栏里再出现一句"见阅读数据分栏"。
-    if (settings_rows_begin("##set_rd_head")) {
+    if (const SettingsRows rows = SettingsRows("##set_rd_head")) {
         settings_row("智能匹配");
         const char* smart[] = { "关（只认路径）", "询问", "自动沿用" };
         if (ImGui::Combo("##smart", &g_prefs.smart_match, smart, IM_ARRAYSIZE(smart)))
             save_prefs();
         settings_note("换位置后沿用同一份阅读数据");
-        settings_rows_end();
     }
     ImGui::Spacing();
 
@@ -1840,28 +1909,30 @@ void draw_settings_reading_data_tab() {
     for (std::size_t i = 0; i < g_state.docs.size(); ++i)
         (g_state.docs[i].second.locations.empty() ? unknown : known).push_back(i);
 
-    ImGui::BeginChild("##rd_list", ImVec2(0, -footer_h),
-                      ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoNav);
-    if (g_state.docs.empty()) {
-        ImGui::TextColored(col_dim(), "%s", "还没有记录任何阅读数据。");
-        ImGui::TextColored(col_dim(), "%s", "读到哪、书签和视图参数会在关闭文档时自动记下。");
-    }
-    for (const std::size_t i : known) draw_reading_data_card(i);
-    if (!unknown.empty()) draw_unknown_records(unknown);
-    ImGui::EndChild();
+    {
+        const ig::Child rd_list("##rd_list", ImVec2(0, -footer_h),
+                                ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoNav);
+        if (g_state.docs.empty()) {
+            ImGui::TextColored(col_dim(), "%s", "还没有记录任何阅读数据。");
+            ImGui::TextColored(col_dim(), "%s", "读到哪、书签和视图参数会在关闭文档时自动记下。");
+        }
+        for (const std::size_t i : known) draw_reading_data_card(i);
+        if (!unknown.empty()) draw_unknown_records(unknown);
+    }   // 列表子窗口在这里收口（footer 一行必须留在它外面）
 
     char count[64];
     std::snprintf(count, sizeof count, "共 %d 份文档", static_cast<int>(known.size()));
-    ImGui::BeginDisabled(g_state.docs.empty());
-    if (danger_text_button("清空全部")) {
-        char body[176];
-        std::snprintf(body, sizeof body,
-                      "将删除全部 %d 条阅读数据（阅读位置与书签）。\n文档本身不受影响。",
-                      static_cast<int>(g_state.docs.size()));
-        request_confirm(ConfirmKind::ClearAll, "清空全部阅读数据？", body, {},
-                        "清空", "取消", 0);
+    {
+        const ig::Disabled d(g_state.docs.empty());
+        if (danger_text_button("清空全部")) {
+            char body[176];
+            std::snprintf(body, sizeof body,
+                          "将删除全部 %d 条阅读数据（阅读位置与书签）。\n文档本身不受影响。",
+                          static_cast<int>(g_state.docs.size()));
+            request_confirm(ConfirmKind::ClearAll, "清空全部阅读数据？", body, {},
+                            "清空", "取消", 0);
+        }
     }
-    ImGui::EndDisabled();
     const float cw = ImGui::CalcTextSize(count).x;
     ImGui::SameLine(ImGui::GetWindowWidth() - cw - ImGui::GetStyle().WindowPadding.x);
     ImGui::TextColored(col_dim(), "%s", count);
@@ -1878,32 +1949,9 @@ void reset_prefs_to_default() {
     save_prefs();
 }
 
-// ---- 设置项表格（左列标签 + 右列控件）----
-// CellPadding 收窄：控件自身已有 FramePadding，行再留 6px 会显得空、且撑高窗口。
-bool settings_rows_begin(const char* id) {
-    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(px(9.0f), px(3.0f)));
-    const ImGuiTableFlags tf = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX;
-    if (!ImGui::BeginTable(id, 2, tf)) { ImGui::PopStyleVar(); return false; }
-    ImGui::TableSetupColumn("l", ImGuiTableColumnFlags_WidthFixed, px(136.0f));
-    ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
-    return true;
-}
-void settings_rows_end() { ImGui::EndTable(); ImGui::PopStyleVar(); }
-void settings_row(const char* label) {
-    ImGui::TableNextRow();
-    ImGui::TableSetColumnIndex(0);
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-    ImGui::TableSetColumnIndex(1);
-    ImGui::SetNextItemWidth(px(190.0f));
-}
-void settings_note(const char* text) {
-    ImGui::SameLine();
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim), "%s", text);
-}
 
 void draw_settings_interface_tab() {
-    if (settings_rows_begin("##set_ui")) {
+    if (const SettingsRows rows = SettingsRows("##set_ui")) {
         settings_row("界面缩放");
         int pct = static_cast<int>(std::lround(g_prefs.ui_scale * 100.0f));
         if (ImGui::SliderInt("##uiscale", &pct, 80, 150, "%d%%")) {
@@ -1922,10 +1970,11 @@ void draw_settings_interface_tab() {
         settings_row("纸张方案");
         const bool reading = g_doc.kind == UiDoc::Kind::Reading;
         int cm = g_scheme;
-        ImGui::BeginDisabled(!reading);
-        if (ImGui::Combo("##scheme", &cm, kPageSchemeNames, IM_ARRAYSIZE(kPageSchemeNames)))
-            set_scheme(cm);
-        ImGui::EndDisabled();
+        {
+            const ig::Disabled d(!reading);
+            if (ImGui::Combo("##scheme", &cm, kPageSchemeNames, IM_ARRAYSIZE(kPageSchemeNames)))
+                set_scheme(cm);
+        }
         settings_note(reading ? "随当前文档记忆" : "打开文档后可用");
 
         settings_row("联动规则");
@@ -1941,12 +1990,11 @@ void draw_settings_interface_tab() {
         settings_row("界面动效");
         if (ImGui::Checkbox("##motion", &g_prefs.motion)) save_prefs();
         settings_note("页面淡入 / 滚动缩放平滑 / 顶栏与侧栏滑动 / 窗口淡入淡出");
-        settings_rows_end();
     }
 }
 
 void draw_settings_reading_tab() {
-    if (settings_rows_begin("##set_read")) {
+    if (const SettingsRows rows = SettingsRows("##set_read")) {
         settings_row("页面间距");
         float gp = g_prefs.gap_percent;
         if (ImGui::SliderFloat("##gap", &gp, 0.0f, 6.0f, "%.1f%%")) {
@@ -1955,13 +2003,11 @@ void draw_settings_reading_tab() {
             save_prefs();
         }
         settings_note("页与页之间的留白比例");
-
-        settings_rows_end();
     }
 }
 
 void draw_settings_performance_tab() {
-    if (settings_rows_begin("##set_perf")) {
+    if (const SettingsRows rows = SettingsRows("##set_perf")) {
         settings_row("资源档位");
         const char* tiers[] = { "低", "中", "高" };
         if (ImGui::Combo("##resource_tier", &g_prefs.resource_tier, tiers, IM_ARRAYSIZE(tiers))) {
@@ -1976,7 +2022,6 @@ void draw_settings_performance_tab() {
         ImGui::TableSetColumnIndex(1);
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim), "%s", note);
         ImGui::SetItemTooltip("缓存按需占用，不会启动时一次性分配；只保留当前页和预加载页，超出上限按最近使用顺序逐出。\n当前渲染队列使用单个 MuPDF worker。\n低 / 中 / 高：256 / 512 / 768 MB。\n大页面 tile 单边：1536 / 2048 / 2560 px。");
-        settings_rows_end();
     }
 }
 
@@ -2004,14 +2049,17 @@ void draw_bind_button(int cmd, int slot) {
     const std::string label = capturing ? std::string("按下按键…")
                                         : (c == ImGuiKey_None ? std::string("未设置")
                                                               : chord_label(c));
-    ImGui::PushID(slot);
-    if (capturing) {
-        ImGui::PushStyleColor(ImGuiCol_Button, tone_apply(
-            g_dark_theme ? ImVec4(0.42f, 0.65f, 0.94f, 0.35f)
-                         : ImVec4(0.23f, 0.49f, 0.85f, 0.28f)));
-    }
-    const bool clicked = ImGui::Button(label.c_str(), ImVec2(-FLT_MIN, 0));
-    if (capturing) ImGui::PopStyleColor();
+    const ig::Id slot_id(slot);
+    // 捕获态的高亮底色：只在捕获期间压栈（非捕获态用空对象表达"不压"）。
+    const ImVec4 capture_bg = tone_apply(g_dark_theme ? ImVec4(0.42f, 0.65f, 0.94f, 0.35f)
+                                                      : ImVec4(0.23f, 0.49f, 0.85f, 0.28f));
+    const bool clicked = [&] {
+        if (capturing) {
+            const ig::StyleColor highlight(ImGuiCol_Button, capture_bg);
+            return ImGui::Button(label.c_str(), ImVec2(-FLT_MIN, 0));
+        }
+        return ImGui::Button(label.c_str(), ImVec2(-FLT_MIN, 0));
+    }();
     if (clicked) {
         g_capture_cmd = cmd;
         g_capture_slot = slot;
@@ -2027,7 +2075,6 @@ void draw_bind_button(int cmd, int slot) {
     }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
         ImGui::SetTooltip("左键点击后按下新键；右键清除 / 取消捕获");
-    ImGui::PopID();
 }
 
 int conflict_of(int cmd) {
@@ -2045,7 +2092,7 @@ void draw_settings_keys_tab() {
         ImGui::TextColored(dim, "点按键框后按下新键；右键清除。下拉框直接选。");
     ImGui::Separator();
 
-    ImGui::BeginChild("##keys_list", ImVec2(0, 0), false, ImGuiWindowFlags_NoNav);
+    const ig::Child keys_list("##keys_list", ImVec2(0, 0), false, ImGuiWindowFlags_NoNav);
     const ImGuiTableFlags tf = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX;
     int i = 0;
     while (i < kCmdCount) {
@@ -2053,14 +2100,14 @@ void draw_settings_keys_tab() {
         ImGui::SeparatorText(group);
         char tid[32];
         std::snprintf(tid, sizeof tid, "##keys_g%d", i);
-        if (ImGui::BeginTable(tid, 3, tf)) {
+        if (const ig::Table group_table = ig::Table(tid, 3, tf)) {
             ImGui::TableSetupColumn("cmd", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableSetupColumn("k0", ImGuiTableColumnFlags_WidthFixed, px(150.0f));
             ImGui::TableSetupColumn("k1", ImGuiTableColumnFlags_WidthFixed, px(150.0f));
             for (; i < kCmdCount && std::strcmp(kCmds[i].group, group) == 0; ++i) {
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                ImGui::PushID(i);
+                ig::Id row_id(i);
                 ImGui::AlignTextToFramePadding();
                 const int conflict = conflict_of(i);
                 if (conflict >= 0) ImGui::TextColored(col_warn(), "%s", kCmds[i].name);
@@ -2090,9 +2137,8 @@ void draw_settings_keys_tab() {
                         draw_bind_button(i, s);
                     }
                 }
-                ImGui::PopID();
+                row_id.dismiss();
             }
-            ImGui::EndTable();
         }
     }
 
@@ -2101,7 +2147,7 @@ void draw_settings_keys_tab() {
     ImGui::SeparatorText("鼠标与固定键");
     {
         const ImGuiTableFlags rf = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX;
-        if (ImGui::BeginTable("##keys_ref", 2, rf)) {
+        if (const ig::Table ref_table = ig::Table("##keys_ref", 2, rf)) {
             ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, px(190.0f));
             ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
             auto ref = [&](const char* key, const char* desc) {
@@ -2125,10 +2171,8 @@ void draw_settings_keys_tab() {
             ref("单击「渲染失败」占位", "重试渲染该页");
             ref("鼠标移到窗口顶部", "顶栏自动隐藏后重新显示");
             ref("Esc", "关闭当前对话框（设置 / 跳页 / 密码 / 确认）");
-            ImGui::EndTable();
         }
     }
-    ImGui::EndChild();
 }
 
 // 设置窗口本体：**底栏固定、正文装分栏**（内容多时只滚动正文）。
@@ -2166,12 +2210,13 @@ void draw_settings_window() {
     ImGui::SetNextWindowSize(sz, ImGuiCond_Always);
     ImGui::SetNextWindowPos(pos, animating ? ImGuiCond_Always : ImGuiCond_Appearing);
     ImGui::SetNextWindowBgAlpha(a);
-    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, a);
+    const ig::StyleVar win_alpha(ImGuiStyleVar_Alpha, a);
 
     bool keep = true;   // 每帧从 true 起算：真正的关闭由 g_show_settings 驱动，便于淡出
-    if (ImGui::Begin("设置##settings", &keep,
-                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
-                     ImGuiWindowFlags_NoSavedSettings)) {
+    const ig::Window settings_win("设置##settings", &keep,
+                                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
+                                  ImGuiWindowFlags_NoSavedSettings);
+    if (settings_win) {
         if (!animating) {
             // 记住用户拖动后的位置。只在**真的移动过**（与基准差 > 1px）时更新，
             // 否则每次收尾那一帧的亚像素误差会被记成新基准、逐次累积漂移。
@@ -2184,36 +2229,33 @@ void draw_settings_window() {
         g_settings_open_tab = -1;
 
         const float footer_h = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y * 2.0f;
-        ImGui::BeginChild("##settings_body", ImVec2(0, -footer_h), false, ImGuiWindowFlags_NoNav);
-        if (ImGui::BeginTabBar("##settings_tabs")) {
-            if (ImGui::BeginTabItem("界面", nullptr,
-                                    want_tab == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
-                draw_settings_interface_tab();
-                ImGui::EndTabItem();
+        // 正文子窗口必须在这里收口，底部操作条要留在它**外面**（否则会跟着内容一起滚动）。
+        {
+            const ig::Child body("##settings_body", ImVec2(0, -footer_h), false,
+                                 ImGuiWindowFlags_NoNav);
+            if (const ig::TabBar tabs = ig::TabBar("##settings_tabs")) {
+                if (const ig::TabItem t = ig::TabItem(
+                        "界面", nullptr, want_tab == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                    draw_settings_interface_tab();
+                }
+                if (const ig::TabItem t = ig::TabItem(
+                        "阅读", nullptr, want_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                    draw_settings_reading_tab();
+                }
+                if (const ig::TabItem t = ig::TabItem(
+                        "性能", nullptr, want_tab == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                    draw_settings_performance_tab();
+                }
+                if (const ig::TabItem t = ig::TabItem(
+                        "按键", nullptr, want_tab == 3 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                    draw_settings_keys_tab();
+                }
+                if (const ig::TabItem t = ig::TabItem(
+                        "阅读数据", nullptr, want_tab == 4 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                    draw_settings_reading_data_tab();
+                }
             }
-            if (ImGui::BeginTabItem("阅读", nullptr,
-                                    want_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
-                draw_settings_reading_tab();
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("性能", nullptr,
-                                    want_tab == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
-                draw_settings_performance_tab();
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("按键", nullptr,
-                                    want_tab == 3 ? ImGuiTabItemFlags_SetSelected : 0)) {
-                draw_settings_keys_tab();
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("阅读数据", nullptr,
-                                    want_tab == 4 ? ImGuiTabItemFlags_SetSelected : 0)) {
-                draw_settings_reading_data_tab();
-                ImGui::EndTabItem();
-            }
-            ImGui::EndTabBar();
         }
-        ImGui::EndChild();
 
         // 底部操作条**固定在窗口底部**（不随内容滚动）：否则内容稍多时按钮会被挤出滚动区。
         ImGui::Separator();
@@ -2222,8 +2264,6 @@ void draw_settings_window() {
         ImGui::SameLine(ImGui::GetWindowWidth() - close_w - ImGui::GetStyle().WindowPadding.x);
         if (ImGui::Button("关闭")) g_show_settings = false;
     }
-    ImGui::End();
-    ImGui::PopStyleVar();
     if (!keep) g_show_settings = false;
 }
 
@@ -2265,15 +2305,17 @@ void draw_shell() {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->Pos);
     ImGui::SetNextWindowSize(vp->Size);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::Begin("##shell", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
-                 ImGuiWindowFlags_NoBringToFrontOnFocus |
-                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    ImGui::PopStyleVar(3);
+    // 外壳窗口是无边框、零内边距的整屏窗口：三个样式**只覆盖创建窗口那一瞬**
+    // （dismiss 落在原 PopStyleVar(3) 的位置）—— 否则顶栏/状态栏子窗口也会跟着变成零内边距。
+    ig::StyleVar3 shell_style(ImGuiStyleVar_WindowRounding, 0.0f,
+                              ImGuiStyleVar_WindowBorderSize, 0.0f,
+                              ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    const ig::Window shell("##shell", nullptr,
+                           ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                           ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                           ImGuiWindowFlags_NoBringToFrontOnFocus |
+                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    shell_style.dismiss();
 
     // ---- 三段外壳的显式布局（顶栏 / 画布[+侧栏] / 状态栏）----
     //
@@ -2335,7 +2377,6 @@ void draw_shell() {
         draw_rejected();
         break;
     }
-    ImGui::End();
 
     if (g_show_debug) draw_debug_overlay();
     draw_jump_popup();

@@ -18,6 +18,8 @@
 #include "backends/imgui_impl_win32.h"
 // FreeType 装载器（ADR-048）：比内置 stb_truetype 栅格化质量好，且能读 CFF/OTF（子集即 OTF）。
 #include "misc/freetype/imgui_freetype.h"
+// ImGui 内部错误的接管入口（Phase 7）——它需要 imgui_internal.h，故单独隔离在这个头里。
+#include "imgui_stacks.h"
 
 namespace lr::app {
 
@@ -331,6 +333,15 @@ void sync_theme(int scheme) {
 
 // ---------------- D3D11 ----------------
 
+// 把 HRESULT 转成可检索的字段（16 进制），日志里比十进制可读得多。
+namespace {
+std::string hr_field(HRESULT hr) {
+    char buf[16] = {};
+    std::snprintf(buf, sizeof buf, "0x%08lX", static_cast<unsigned long>(hr));
+    return buf;
+}
+}  // namespace
+
 bool Graphics::initialize(HWND hwnd) {
     sc_desc.BufferCount = 2;
     sc_desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -348,53 +359,102 @@ bool Graphics::initialize(HWND hwnd) {
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
     };
     D3D_FEATURE_LEVEL got{};
-    if (FAILED(D3D11CreateDeviceAndSwapChain(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
-            levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-            &sc_desc, &swap_chain, &device, &got, &context)))
+    const HRESULT hr = D3D11CreateDeviceAndSwapChain(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+        levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+        &sc_desc, &swap_chain, &device, &got, &context);
+    if (FAILED(hr)) {
+        // 设备创建失败是"启动即不可用"，必须留痕：常见原因是显卡驱动过旧 / 远程桌面 /
+        // 虚拟机缺 D3D11 支持。之前这里只 return false，用户在入口处只看到"程序没起来"。
+        lr::log::error("platform", "D3D11CreateDeviceAndSwapChain failed " +
+                                       lr::log::kv("hr", hr_field(hr)));
+        shutdown();
         return false;
-    if (!create_rtv()) return false;
+    }
+    if (!create_rtv()) {
+        shutdown();
+        return false;
+    }
     RECT rc{};
     if (GetClientRect(hwnd, &rc)) { cur_w = rc.right - rc.left; cur_h = rc.bottom - rc.top; }
+    lr::log::info("platform", "d3d11 device ready " + lr::log::kv("w", static_cast<int>(cur_w)) +
+                                  " " + lr::log::kv("h", static_cast<int>(cur_h)));
     return true;
 }
 
 bool Graphics::create_rtv() {
+    if (swap_chain == nullptr || device == nullptr) return false;
     ID3D11Texture2D* back = nullptr;
-    if (FAILED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&back)))) return false;
-    const bool ok = SUCCEEDED(device->CreateRenderTargetView(back, nullptr, &rtv));
+    const HRESULT hb = swap_chain->GetBuffer(0, IID_PPV_ARGS(&back));
+    if (FAILED(hb) || back == nullptr) {
+        lr::log::error("platform", "swapchain GetBuffer failed " + lr::log::kv("hr", hr_field(hb)));
+        return false;
+    }
+    const HRESULT hr = device->CreateRenderTargetView(back, nullptr, &rtv);
     back->Release();
-    return ok;
+    if (FAILED(hr)) {
+        lr::log::error("platform",
+                       "CreateRenderTargetView failed " + lr::log::kv("hr", hr_field(hr)));
+        return false;
+    }
+    return true;
 }
 
 void Graphics::resize(UINT w, UINT h) {
     if (!swap_chain || w == 0 || h == 0) return;
     if (rtv && w == cur_w && h == cur_h) return;  // 尺寸未变：不重建（重建会丢后备缓冲内容）
     if (rtv) { rtv->Release(); rtv = nullptr; }
-    if (SUCCEEDED(swap_chain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0))) {
+    const HRESULT hr = swap_chain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    if (SUCCEEDED(hr)) {
         create_rtv();
         cur_w = w;
         cur_h = h;
+    } else {
+        // 重建失败会留下"有尺寸、无渲染目标"的状态；如实记下 HRESULT 并按设备丢失处理。
+        lr::log::error("platform", "ResizeBuffers failed " + lr::log::kv("hr", hr_field(hr)) +
+                                       " " + lr::log::kv("w", static_cast<int>(w)) + " " +
+                                       lr::log::kv("h", static_cast<int>(h)));
+        device_lost = true;
     }
 }
 
 void Graphics::render_frame() {
-    if (!rtv) return;  // resize 失败瞬间可能无渲染目标
+    if (!rtv || device_lost) return;  // resize 失败瞬间 / 设备已丢失：静默跳过本帧
     const float clear[4] = { 0.10f, 0.14f, 0.18f, 1.0f };
     context->OMSetRenderTargets(1, &rtv, nullptr);
     context->ClearRenderTargetView(rtv, clear);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    swap_chain->Present(1, 0);
+    const HRESULT hr = swap_chain->Present(1, 0);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        const HRESULT reason = device->GetDeviceRemovedReason();
+        lr::log::error("platform", "device removed " + lr::log::kv("hr", hr_field(hr)) +
+                                       " " + lr::log::kv("reason", hr_field(reason)));
+        device_lost = true;   // 只标记、不再呈现；重建设备属未实现的边界（见 docs §3.4）
+    }
 }
 
 void Graphics::shutdown() {
-    if (rtv) rtv->Release();
-    if (swap_chain) swap_chain->Release();
-    if (context) context->Release();
-    if (device) device->Release();
+    // 释放顺序必须由内向外（视图 → 交换链 → 上下文 → 设备）：反过来会留下悬垂引用。
+    if (rtv) { rtv->Release(); rtv = nullptr; }
+    if (swap_chain) { swap_chain->Release(); swap_chain = nullptr; }
+    if (context) { context->Release(); context = nullptr; }
+    if (device) { device->Release(); device = nullptr; }
+    cur_w = cur_h = 0;
 }
 
 // ---------------- ImGui 引导 ----------------
+
+namespace {
+// ImGui 内部错误的落点：写进日志（GUI 侧的工具提示由 ImGui 自己显示）。
+// 注意这是被 ImGui 内部调用的回调：拼串可能抛（bad_alloc），必须自己兜住 ——
+// 在"诊断路径"上抛异常，会把一次可恢复的 UI 错误升级成进程终止。
+void imgui_error_sink(ImGuiContext*, void*, const char* msg) noexcept {
+    try {
+        lr::log::error("ui", std::string("imgui error: ") + (msg ? msg : "(null)"));
+    } catch (...) {
+    }
+}
+}  // namespace
 
 void ImGuiRaii::initialize(HWND hwnd) {
     IMGUI_CHECKVERSION();
@@ -407,6 +467,26 @@ void ImGuiRaii::initialize(HWND hwnd) {
     // 设为被拖文件目录，默认相对路径会在用户目录里凭空生成 imgui.ini。窗口/布局状态由
     // LilithReader.ini 自管，故直接禁用。
     io.IniFilename = nullptr;
+
+    // ---- 错误恢复与错误接管（Phase 7）----
+    //
+    // ImGui 1.93 对"可恢复错误"（栈不平、Begin/End 误用、ID 冲突）自带恢复机制：它会自愈到
+    // 一个可用状态，而不是直接把进程带走。我们做两件事：
+    //   1) 保留工具提示（EnableTooltip）：错误**必须**被浮出水面 —— ImGui 官方的原则是
+    //      "不允许错误静默"，一条只在日志里的记录对正在用的用户没有意义；
+    //   2) 把错误同时接到 lr::log（ErrorCallback）：日志里留下时间线与前后文，便于事后追溯。
+    // 二者一起才构成"既看见、又查得到"。
+    io.ConfigErrorRecovery = true;
+    io.ConfigErrorRecoveryEnableTooltip = true;
+    io.ConfigErrorRecoveryEnableDebugLog = true;
+    // 断言只在 Debug 保留：开发时希望"就地断在出错的那一行"，而发布版必须遵守
+    // "一个错误不拖垮进程"—— 可恢复错误降级为"记录 + 自愈"（ADR-078）。
+#ifdef _DEBUG
+    io.ConfigErrorRecoveryEnableAssert = true;
+#else
+    io.ConfigErrorRecoveryEnableAssert = false;
+#endif
+    ig::redirect_errors_to(&imgui_error_sink, nullptr);
 
     // 界面几何基准（100% 缩放值；apply_ui_scale 会在此基础上按 DPI/用户缩放重算）。
     // 必须设在留底之前，保证 ScaleAllSizes 每次都从一致的基准出发。
@@ -502,6 +582,11 @@ void ImGuiRaii::initialize(HWND hwnd) {
 
     win32 = ImGui_ImplWin32_Init(hwnd);
     dx11 = ImGui_ImplDX11_Init(g_gfx.device, g_gfx.context);
+    if (!win32) lr::log::error("platform", "ImGui_ImplWin32_Init failed");
+    if (!dx11) lr::log::error("platform", "ImGui_ImplDX11_Init failed");
+    if (!ui_font_ok)
+        lr::log::warn("platform", "embedded ui font unavailable, fell back to system font");
+    if (!g_icons_ok) lr::log::info("platform", "icon glyphs unavailable, text labels only");
 
     // DPI：按窗口所在显示器缩放字体与界面度量（100% 时为 1.0，等价于旧行为）
     refresh_dpi_scale();
@@ -549,6 +634,13 @@ void load_prefs() {
         lr::read_ini_int_ex(g_ini_path, L"reading", L"SmartMatch", kSmartMatchAsk),
         kSmartMatchOff, kSmartMatchAuto);
     g_user_scale = g_prefs.ui_scale;
+
+    // 启动时把生效的偏好记一行：用户报"设置没生效 / 数字不对"时，这一行就能定性。
+    lr::log::info("platform", "prefs " + lr::log::kv("ui_scale", static_cast<double>(g_prefs.ui_scale)) +
+                                  " " + lr::log::kv("theme", g_prefs.theme) + " " +
+                                  lr::log::kv("resource_tier", g_prefs.resource_tier) + " " +
+                                  lr::log::kv("motion", g_prefs.motion ? 1 : 0) + " " +
+                                  lr::log::kv("smart_match", g_prefs.smart_match));
 }
 
 void save_prefs() {

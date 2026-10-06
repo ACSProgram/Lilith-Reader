@@ -14,6 +14,16 @@
 //
 // 本文件不含任何 fz_* 调用（只经 Document/PageBitmap 的公开接口），
 // 故不受 ADR-009 的 setjmp 纪律约束。
+//
+// ---- 稳定性纪律（Phase 7，ADR-078/079）----
+//   1. **工作线程入口绝不放异常逃逸**：std::jthread 的入口函数抛出 = std::terminate = 进程死亡。
+//      run() 外层包了 try/catch，且各子任务（单页渲染 / 辅助请求 / 检索）**各自**再包一层 ——
+//      粒度越细，"一次失败波及的范围"越小：单页失败只影响该页，不会把整篇文档打回失败态。
+//   2. **所有 D3D 句柄有明确的所有权**：工作线程构建过程中的临时 SRV 一律用 SrvHandle 持有，
+//      失败分支只需"不发布"即可，不必再手工记得 Release。发布出去的那一刻才 release_raw()
+//      转交所有权（进 PageSlot 供 UI 只读，或进退役队列）。PageSlot::texture 是**不拥有**的视图。
+//   3. **尺寸与数量先算后分配**：整页输出像素、tile 个数、页数都有上限，超限返回 TooLarge
+//      而不是让乘法溢出或让分配失败去当"边界检查"。
 
 module;
 
@@ -22,14 +32,19 @@ module;
 #include <d3d11.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <new>
 #include <optional>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -41,6 +56,7 @@ module lilithreader.render;
 import lilithreader.document;
 import lilithreader.page_cache;
 import lilithreader.utils;   // file_fingerprint（ADR-062）
+import lilithreader.log;     // Phase 7：工作线程异常留痕（ADR-077）
 
 namespace lr {
 
@@ -58,12 +74,65 @@ ResourceProfile resource_profile(ResourceTier tier) noexcept {
 
 namespace {
 
+// ---- 尺寸/数量上限（Phase 7）----
+//
+// 为什么要有这些常量：这些上限原先"隐含"在 D3D 的返回值与分配失败里 ——
+// 于是超限的表现是"渲染失败"甚至 bad_alloc，而不是一句明确的 TooLarge。
+// 把边界显式化有两个好处：错误码能如实反映原因；乘法运算不会先溢出再当检查。
+constexpr int           kMaxTextureDim    = 16384;                  // D3D11 feature level 11 上限
+constexpr std::uint64_t kMaxTextureBytes  = 512ull * 1024 * 1024;   // 单张纹理上限（512 MiB）
+constexpr std::uint64_t kMaxOutputPixels  = 268435456ull;           // 整页输出像素上限（2^28 ≈ 2.7 亿）
+constexpr int           kMaxTiles         = 4096;                   // 单页 tile 个数上限
+constexpr int           kMaxPageCount     = 100000;                 // 页数上限（防伪造页数撑爆分配）
+
+// ---- D3D 句柄的所有权包装（Phase 7）----
+//
+// 为什么需要它：PageSlot::texture 是**不拥有**的只读视图（UI 只读、绝不释放），
+// 于是"谁在什么时刻真正拥有这个 SRV"全靠人工记忆。原先 tiled 路径就靠"失败分支记得
+// 手工 Release"来兜底 —— 一旦中途抛异常（std::vector 增长失败等），已建纹理就泄漏，
+// 而泄漏的显存句柄是那种"跑久了才崩"的故障。
+// SrvHandle 把所有权变成类型属性：只要没显式 release_raw() 交出去，析构必定释放。
+struct SrvHandle {
+    ID3D11ShaderResourceView* p = nullptr;
+
+    SrvHandle() = default;
+    explicit SrvHandle(ID3D11ShaderResourceView* v) noexcept : p(v) {}
+    ~SrvHandle() { if (p) p->Release(); }
+
+    SrvHandle(const SrvHandle&) = delete;
+    SrvHandle& operator=(const SrvHandle&) = delete;
+    SrvHandle(SrvHandle&& o) noexcept : p(o.p) { o.p = nullptr; }
+    SrvHandle& operator=(SrvHandle&& o) noexcept {
+        if (this != &o) {
+            if (p) p->Release();
+            p = o.p;
+            o.p = nullptr;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] ID3D11ShaderResourceView* get() const noexcept { return p; }
+    // 交出所有权（发布或入退役队列时用）。此后本对象不再释放它。
+    void* release_raw() noexcept {
+        void* r = p;
+        p = nullptr;
+        return r;
+    }
+};
+
 // 用 MuPDF 的 RGBA8 缓冲直接建纹理：IMMUTABLE + 初始数据，一次调用完成上传。
 // 这是 ID3D11Device 的方法（free-threaded），可在渲染线程安全调用。
 bool create_page_texture(ID3D11Device* dev, const std::uint8_t* data,
                          int w, int h, int stride, ID3D11ShaderResourceView** out) {
     *out = nullptr;
     if (dev == nullptr || data == nullptr || w <= 0 || h <= 0 || stride <= 0) return false;
+    if (w > kMaxTextureDim || h > kMaxTextureDim) return false;   // D3D11 单边上限
+    // 先算后分配：stride 至少要有 w×4，否则 D3D 会按 pitch 跨步读取、越过缓冲区尾部。
+    if (stride < w * 4) return false;
+    // 字节数用 64 位算，避免 w×h×4 在 int 上溢出（超大页 + 高倍率时真会到这一步）。
+    const std::uint64_t bytes = static_cast<std::uint64_t>(stride) *
+                                static_cast<std::uint64_t>(h);
+    if (bytes > kMaxTextureBytes) return false;
 
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = static_cast<UINT>(w);
@@ -88,11 +157,20 @@ bool create_page_texture(ID3D11Device* dev, const std::uint8_t* data,
     sv.Texture2D.MostDetailedMip = 0;
     sv.Texture2D.MipLevels = 1;
     const HRESULT hr = dev->CreateShaderResourceView(tex, &sv, out);
-    tex->Release();
+    tex->Release();   // SRV 已自持对纹理的引用
     if (FAILED(hr)) {
         *out = nullptr;
         return false;
     }
+    return true;
+}
+
+// SrvHandle 版本：成功时句柄归调用方所有。
+bool create_page_texture(ID3D11Device* dev, const std::uint8_t* data,
+                         int w, int h, int stride, SrvHandle& out) {
+    ID3D11ShaderResourceView* raw = nullptr;
+    if (!create_page_texture(dev, data, w, h, stride, &raw)) return false;
+    out = SrvHandle(raw);
     return true;
 }
 
@@ -231,29 +309,39 @@ struct Renderer::Impl {
     Document     doc_engine;  // 仅工作线程访问
     std::jthread worker;
 
-    void start() { worker = std::jthread([this](std::stop_token st) { run(std::move(st)); }); }
+    void start() {
+        // lambda 标 noexcept：run() 本身不抛，这里再钉一道，杜绝"入口逃逸异常"这条路径。
+        worker = std::jthread([this](std::stop_token st) noexcept { run(st); });
+        lr::log::info("render", "worker started");
+    }
 
     void shutdown() {
         worker.request_stop();
         cv.notify_all();
-        if (worker.joinable()) worker.join();
-        std::lock_guard lock(mtx);
-        for (Entry& e : pages) {
-            release_srv(e.slot.texture);
-            for (const PageSlot::Tile& t : e.slot.tiles) release_srv(t.texture);
+        if (worker.joinable()) worker.join();   // 必须先 join：此后才没有人再动这些纹理
+        std::size_t released = 0;
+        {
+            std::lock_guard lock(mtx);
+            for (Entry& e : pages) {
+                release_srv(e.slot.texture);
+                for (const PageSlot::Tile& t : e.slot.tiles) release_srv(t.texture);
+            }
+            released += pages.size();
+            pages.clear();
+            for (Entry& e : thumbs) {
+                release_srv(e.slot.texture);
+                for (const PageSlot::Tile& t : e.slot.tiles) release_srv(t.texture);
+            }
+            thumbs.clear();
+            released += retired_pending.size() + retired_ready.size();
+            for (void* p : retired_pending) release_srv(p);
+            for (void* p : retired_ready) release_srv(p);
+            retired_pending.clear();
+            retired_ready.clear();
+            used_bytes = 0;
+            thumb_bytes = 0;
         }
-        pages.clear();
-        for (Entry& e : thumbs) {
-            release_srv(e.slot.texture);
-            for (const PageSlot::Tile& t : e.slot.tiles) release_srv(t.texture);
-        }
-        thumbs.clear();
-        for (void* p : retired_pending) release_srv(p);
-        for (void* p : retired_ready) release_srv(p);
-        retired_pending.clear();
-        retired_ready.clear();
-        used_bytes = 0;
-        thumb_bytes = 0;
+        lr::log::info("render", "worker stopped " + lr::log::kv("slots_released", released));
     }
 
     static void release_srv(void* p) {
@@ -362,57 +450,145 @@ struct Renderer::Impl {
     }
 
     // ---- 工作线程主循环 ----
-
-    void run(std::stop_token st) {
+    //
+    // 稳定性要点（ADR-078）：**入口是 noexcept 的**，任何异常都在这里被截住。
+    // 若让异常逃出 std::jthread 的入口函数，运行库会直接调用 std::terminate ——
+    // 这是 C++ 里"一个错误让整个程序消失"最典型的一条路径，也是本文件加固的重点。
+    // 截住之后把文档打成 Failed 并如实告知 UI：用户看到的是"这份文档打不开"，
+    // 而不是"阅读器不见了"。
+    void run(std::stop_token st) noexcept {
+        int consecutive_faults = 0;
         for (;;) {
-            std::optional<Command>  c;
-            std::optional<AuxReq>   a;
-            std::vector<RenderWant> w;
-            std::vector<int>        tw;
-            bool have_wants = false;
-            bool have_thumbs = false;
-            int  thumb_px = 150;
-            {
-                std::unique_lock lock(mtx);
-                cv.wait(lock, st, [this] {
-                    return cmd.has_value() || aux_dirty || wants_dirty || thumbs_dirty ||
-                           search.active;
-                });
-                if (st.stop_requested()) return;
-                // 优先级：显式命令 > 辅助请求 > 渲染请求 > 缩略图 > 检索。
-                // 辅助请求排在渲染之前：它由用户动作直接触发（悬停/复制），延迟可感知；
-                // 且每个请求只处理一页，成本与渲染一页同量级，不会造成长停顿。
-                // 检索排在最后：它是长任务，必须让位给渲染（滚动时不卡）。
-                if (cmd) {                      // 命令优先，渲染请求留到下一轮
-                    c = std::move(cmd);
-                    cmd.reset();
-                } else if (aux_dirty) {
-                    if (!aux.empty()) {
-                        a = aux.front();
-                        aux.pop_front();
-                    }
-                    aux_dirty = !aux.empty();
-                } else if (wants_dirty) {
-                    w = std::move(wants);
-                    wants.clear();
-                    wants_dirty = false;
-                    have_wants = true;
-                } else if (thumbs_dirty) {
-                    tw = thumb_pages;
-                    thumb_px = thumb_target_px;
-                    thumbs_dirty = false;
-                    have_thumbs = true;
-                }
+            if (st.stop_requested()) return;
+            bool keep_going = true;
+            try {
+                keep_going = step_once(st);
+                consecutive_faults = 0;
+            } catch (const std::exception& e) {
+                consecutive_faults = on_worker_fault(e.what(), consecutive_faults);
+            } catch (...) {
+                consecutive_faults = on_worker_fault("non-std exception", consecutive_faults);
             }
-            if (c) handle_command(*c);
-            else if (a) handle_aux(*a);
-            else if (have_wants) handle_wants(w);
-            else if (have_thumbs) handle_thumbs(tw, thumb_px);
-            else search_step();
-            // 渲染/缩略图之后捎带一轮检索：两者都不忙时才轮到它，天然与渲染交替。
-            if (have_wants || have_thumbs) search_step();
+            if (!keep_going) return;
+            // 连续故障时节流：避免"每次唤醒都立刻再抛一次"把 CPU 打满、把日志刷爆。
+            if (consecutive_faults >= 3) std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
     }
+
+    // 一轮：取任务 → 执行。返回 false = 请求停止。
+    bool step_once(std::stop_token st) {
+        inject_fault_for_tests("worker-step");
+        std::optional<Command>  c;
+        std::optional<AuxReq>   a;
+        std::vector<RenderWant> w;
+        std::vector<int>        tw;
+        bool have_wants = false;
+        bool have_thumbs = false;
+        int  thumb_px = 150;
+        {
+            std::unique_lock lock(mtx);
+            cv.wait(lock, st, [this] {
+                return cmd.has_value() || aux_dirty || wants_dirty || thumbs_dirty ||
+                       search.active;
+            });
+            if (st.stop_requested()) return false;
+            // 优先级：显式命令 > 辅助请求 > 渲染请求 > 缩略图 > 检索。
+            // 辅助请求排在渲染之前：它由用户动作直接触发（悬停/复制），延迟可感知；
+            // 且每个请求只处理一页，成本与渲染一页同量级，不会造成长停顿。
+            // 检索排在最后：它是长任务，必须让位给渲染（滚动时不卡）。
+            if (cmd) {                      // 命令优先，渲染请求留到下一轮
+                c = std::move(cmd);
+                cmd.reset();
+            } else if (aux_dirty) {
+                if (!aux.empty()) {
+                    a = aux.front();
+                    aux.pop_front();
+                }
+                aux_dirty = !aux.empty();
+            } else if (wants_dirty) {
+                w = std::move(wants);
+                wants.clear();
+                wants_dirty = false;
+                have_wants = true;
+            } else if (thumbs_dirty) {
+                tw = thumb_pages;
+                thumb_px = thumb_target_px;
+                thumbs_dirty = false;
+                have_thumbs = true;
+            }
+        }
+        if (c) handle_command(*c);
+        else if (a) handle_aux(*a);
+        else if (have_wants) handle_wants(w);
+        else if (have_thumbs) handle_thumbs(tw, thumb_px);
+        else search_step();
+        // 渲染/缩略图之后捎带一轮检索：两者都不忙时才轮到它，天然与渲染交替。
+        if (have_wants || have_thumbs) search_step();
+        return true;
+    }
+
+    // 工作线程级故障的处理：留痕 + 把文档打成失败态（比"整个进程消失"温和得多）。
+    // 返回新的连续故障计数。
+    int on_worker_fault(const char* what, int consecutive) noexcept {
+        const std::string detail = what ? what : "internal error";
+        lr::log::error("render", "worker fault " + lr::log::kv("what", detail) + " " +
+                                     lr::log::kv("consecutive", consecutive + 1));
+        try {
+            // 用 try_to_lock：异常可能发生在临界区被破坏之后，宁可只留下日志，
+            // 也不要在崩溃边缘死等一把可能永远不会释放的锁。
+            std::unique_lock lock(mtx, std::try_to_lock);
+            if (lock.owns_lock()) {
+                doc_engine.close();
+                clear_pages_locked();
+                clear_thumbs_locked();
+                cancel_search_locked();
+                content_fresh = false;
+                content_page = -1;
+                last_wants.clear();
+                info_ = DocumentInfo{};
+                outline_.clear();
+                DocState s;
+                s.phase = DocPhase::Failed;
+                s.error = DocError::Internal;
+                s.detail_u8 = detail;
+                s.id = doc.id;   // 沿用当前请求序号：让 UI 认得出这是"本份文档"的失败
+                s.file_fingerprint = fp_;
+                doc = s;
+                fp_ = 0;
+            } else {
+                lr::log::error("render", "worker fault: mutex busy, state left as-is");
+            }
+        } catch (...) {
+        }
+        return consecutive + 1;
+    }
+
+    // ---- 测试专用故障注入（ADR-078 的验证手段）----
+    //
+    // 环境变量 LILITH_FAULT_INJECT=N → 前 N 轮工作任务主动抛异常，用来验证"工作线程入口
+    // 逃出异常会 terminate"这条防线真的立住了（见 tests/render_fault_test.cpp）。
+    // **Release 构建整段不编译**，发布版没有任何可触发的崩溃入口。
+#ifndef NDEBUG
+    int  fault_budget_ = 0;
+    bool fault_checked_ = false;
+
+    void inject_fault_for_tests(const char* where) {
+        if (!fault_checked_) {
+            fault_checked_ = true;
+            char buf[32] = {};
+            std::size_t n = 0;
+            if (::getenv_s(&n, buf, sizeof buf, "LILITH_FAULT_INJECT") == 0 && n > 0)
+                fault_budget_ = std::atoi(buf);
+        }
+        if (fault_budget_ > 0) {
+            --fault_budget_;
+            lr::log::warn("render", std::string("fault injected at ") + where);
+            throw std::runtime_error("injected fault");
+        }
+    }
+#else
+    void inject_fault_for_tests(const char*) noexcept {}
+#endif
 
     void handle_command(const Command& c) {
         switch (c.kind) {
@@ -423,7 +599,24 @@ struct Renderer::Impl {
     }
 
     // ---- 辅助请求处理（Phase 8）----
-    void handle_aux(const AuxReq& a) {
+    //
+    // 异常边界：一次文本/图片提取失败只让这次请求没有结果，**不能**把整篇文档打回失败态 ——
+    // 用户只是把鼠标移到了一段排版奇怪的文字上而已。
+    void handle_aux(const AuxReq& a) noexcept {
+        try {
+            handle_aux_impl(a);
+        } catch (const std::exception& e) {
+            lr::log::error("render", "aux request threw " + lr::log::kv("kind", static_cast<int>(a.kind)) +
+                                         " " + lr::log::kv("page", a.page) + " " +
+                                         lr::log::kv("what", e.what()));
+        } catch (...) {
+            lr::log::error("render", "aux request threw " +
+                                         lr::log::kv("page", a.page) + " " +
+                                         lr::log::kv("what", "non-std"));
+        }
+    }
+
+    void handle_aux_impl(const AuxReq& a) {
         if (!doc_engine.is_open()) return;
         switch (a.kind) {
         case AuxReq::Kind::PageContent: {
@@ -460,7 +653,30 @@ struct Renderer::Impl {
     //   1) 每页开始前重读 `search.id` —— 新查询/取消会换 id，在途批次据此立即收工；
     //   2) 每轮只扫 kSearchBatchPages 页 —— 之后必然回到主循环，渲染请求得以及时插队；
     //   3) 结果攒够一批才进 pending —— UI 每帧取一次，不产生逐页的锁竞争。
-    void search_step() {
+    void search_step() noexcept {
+        try {
+            search_step_impl();
+        } catch (const std::exception& e) {
+            lr::log::error("render", "search step threw " + lr::log::kv("what", e.what()));
+            fault_search();
+        } catch (...) {
+            lr::log::error("render", "search step threw " + lr::log::kv("what", "non-std"));
+            fault_search();
+        }
+    }
+
+    // 检索出错时**让检索收敛**而不是把文档打回失败态：把结果标记为已扫完并停止，
+    // 界面于是停在"共 N 处"上 —— 用户看得懂，也不会每帧再撞一次同一个异常。
+    void fault_search() noexcept {
+        try {
+            std::lock_guard lock(mtx);
+            search.active = false;
+            search.truncated = false;
+        } catch (...) {
+        }
+    }
+
+    void search_step_impl() {
         std::string   needle;
         std::uint64_t id = 0;
         int           page = 0;
@@ -540,7 +756,9 @@ struct Renderer::Impl {
         if (err == DocError::Ok) {
             DocumentInfo info;
             const DocError ierr = doc_engine.info(info);
-            if (ierr == DocError::Ok) {
+            // 页数上限：损坏或伪造的文档可能报出天文数字页数。先拦在这里，
+            // 不让 pages.assign 的分配失败去充当"边界检查"（那会升级成线程级故障）。
+            if (ierr == DocError::Ok && info.page_count <= kMaxPageCount) {
                 s.phase = DocPhase::Ready;
                 s.info = info;
                 info_ = info;  // 缩略图按页尺寸算倍率用（工作线程私有，无需加锁）
@@ -554,7 +772,7 @@ struct Renderer::Impl {
                 outline_ = std::move(ol);
             } else {
                 s.phase = DocPhase::Failed;
-                s.error = ierr;
+                s.error = (ierr == DocError::Ok) ? DocError::TooLarge : ierr;
                 s.detail_u8.assign(doc_engine.last_error());
                 doc_engine.close();
             }
@@ -563,6 +781,12 @@ struct Renderer::Impl {
             s.error = err;
             s.detail_u8.assign(doc_engine.last_error());
         }
+        lr::log::info("render", std::string("open ") +
+                                   (s.phase == DocPhase::Ready ? "ok" : "failed") + " " +
+                                   lr::log::kv("path", c.path) + " " +
+                                   lr::log::kv("pages", s.info.page_count) + " " +
+                                   lr::log::kv("err", std::string(to_string(s.error))) +
+                                   (s.detail_u8.empty() ? "" : " " + lr::log::kv("detail", s.detail_u8)));
         publish_doc(s);
     }
 
@@ -592,7 +816,7 @@ struct Renderer::Impl {
         if (err == DocError::Ok) {
             DocumentInfo info;
             const DocError ierr = doc_engine.info(info);
-            if (ierr == DocError::Ok) {
+            if (ierr == DocError::Ok && info.page_count <= kMaxPageCount) {
                 s.phase = DocPhase::Ready;
                 s.info = info;
                 info_ = info;
@@ -612,7 +836,7 @@ struct Renderer::Impl {
                 last_wants.clear();
             } else {
                 s.phase = DocPhase::Failed;
-                s.error = ierr;
+                s.error = (ierr == DocError::Ok) ? DocError::TooLarge : ierr;
                 s.detail_u8.assign(doc_engine.last_error());
             }
         } else {
@@ -620,6 +844,9 @@ struct Renderer::Impl {
             s.error = err;
             s.detail_u8.assign(doc_engine.last_error());
         }
+        lr::log::info("render", std::string("auth ") +
+                                   (s.phase == DocPhase::Ready ? "ok" : "failed") + " " +
+                                   lr::log::kv("err", std::string(to_string(s.error))));
         publish_doc(s);
     }
 
@@ -697,10 +924,27 @@ struct Renderer::Impl {
     // 渲染单页。失败时自动重试至多 kMaxAutoRetries 次，仍失败则定格为 Failed
     // （等待 UI 点击重试，见 retry_page）。加载/重试期间**保留旧纹理**（ADR-024）。
     struct BuiltTile {
-        PageSlot::Tile view;
+        SrvHandle handle;          // 构建期间的所有权（析构自动释放）
+        PageSlot::Tile view;       // 发布用的只读视图；仅在其 handle 被 release_raw 后有效
     };
 
-    void render_one(int page, float scale) {
+    // 单页渲染的**异常边界**（ADR-078）：这里的 try/catch 只把异常转成"这一页失败"，
+    // 而不是让整篇文档被打回失败态 —— 粒度越小，一次内存不足的波及面就越小。
+    void render_one(int page, float scale) noexcept {
+        try {
+            render_one_impl(page, scale);
+        } catch (const std::exception& e) {
+            lr::log::error("render", "page render threw " + lr::log::kv("page", page) + " " +
+                                         lr::log::kv("what", e.what()));
+            mark_failed(page, DocError::Internal, scale);
+        } catch (...) {
+            lr::log::error("render", "page render threw " + lr::log::kv("page", page) + " " +
+                                         lr::log::kv("what", "non-std"));
+            mark_failed(page, DocError::Internal, scale);
+        }
+    }
+
+    void render_one_impl(int page, float scale) {
         {
             std::lock_guard lock(mtx);
             if (page < 0 || static_cast<std::size_t>(page) >= pages.size()) return;
@@ -744,6 +988,17 @@ struct Renderer::Impl {
             full_w = static_cast<int>(std::lround(swap ? ph : pw));
             full_h = static_cast<int>(std::lround(swap ? pw : ph));
         }
+        // 先算后分配：整页输出像素总量超限直接判 TooLarge（不让乘法溢出，也不让分配失败当边界检查）。
+        if (full_w > 0 && full_h > 0) {
+            const std::uint64_t pixels =
+                static_cast<std::uint64_t>(full_w) * static_cast<std::uint64_t>(full_h);
+            if (pixels > kMaxOutputPixels) {
+                lr::log::warn("render", "page too large " + lr::log::kv("page", page) + " " +
+                                            lr::log::kv("w", full_w) + " " + lr::log::kv("h", full_h));
+                mark_failed(page, DocError::TooLarge, scale);
+                return;
+            }
+        }
         if (full_w > profile.tile_size_px || full_h > profile.tile_size_px) {
             render_one_tiled(page, scale, full_w, full_h);
             return;
@@ -754,17 +1009,16 @@ struct Renderer::Impl {
             DocError err = doc_engine.render_page(page, scale, bmp, 8192, rotation_,
                                                   static_cast<PageScheme>(scheme_));
 
-            ID3D11ShaderResourceView* srv = nullptr;
+            SrvHandle srv;   // 未发布即析构 → 自动释放，无需在每条失败分支手工 Release
             if (err == DocError::Ok &&
                 !create_page_texture(device, bmp.samples(), bmp.width(), bmp.height(),
-                                     bmp.stride(), &srv)) {
+                                     bmp.stride(), srv)) {
                 err = DocError::Internal;
             }
             if (err == DocError::Ok) {
-                publish_loaded(page, srv, bmp);
+                publish_loaded(page, std::move(srv), bmp);
                 return;
             }
-            if (srv) { srv->Release(); srv = nullptr; }
 
             // 失败：还有自动重试额度吗？
             bool again = false;
@@ -788,6 +1042,16 @@ struct Renderer::Impl {
             mark_failed(page, DocError::Internal, scale);
             return;
         }
+        // tile 个数先算后建：上限既防"页尺寸算错导致几万个 tile"的雪崩，
+        // 也保证 built 这个 vector 的容量是有界的。
+        const std::int64_t tiles_x = (static_cast<std::int64_t>(full_w) + tile_size - 1) / tile_size;
+        const std::int64_t tiles_y = (static_cast<std::int64_t>(full_h) + tile_size - 1) / tile_size;
+        if (tiles_x * tiles_y > kMaxTiles) {
+            lr::log::warn("render", "too many tiles " + lr::log::kv("page", page) + " " +
+                                        lr::log::kv("tiles", tiles_x * tiles_y));
+            mark_failed(page, DocError::TooLarge, scale);
+            return;
+        }
         for (;;) {
             std::vector<BuiltTile> built;
             DocError failure = DocError::Ok;
@@ -802,16 +1066,17 @@ struct Renderer::Impl {
                         page, scale, r, bmp, tile_size, rotation_,
                         static_cast<PageScheme>(scheme_));
                     if (err != DocError::Ok) { failure = err; break; }
-                    ID3D11ShaderResourceView* srv = nullptr;
+                    BuiltTile t;
                     if (!create_page_texture(device, bmp.samples(), bmp.width(), bmp.height(),
-                                             bmp.stride(), &srv)) {
+                                             bmp.stride(), t.handle)) {
                         failure = DocError::Internal;
                         break;
                     }
-                    BuiltTile t;
-                    t.view.texture = srv;
+                    t.view.texture = t.handle.get();
                     t.view.x = x; t.view.y = y;
                     t.view.w = bmp.width(); t.view.h = bmp.height();
+                    // push_back 可能抛（扩容失败）：此时 built 里已建好的 tile 由各自
+                    // 的 SrvHandle 析构释放 —— 原来的"失败后手工 Release 一遍"因此可以删掉。
                     built.push_back(std::move(t));
                 }
             }
@@ -819,12 +1084,7 @@ struct Renderer::Impl {
                 publish_loaded_tiles(page, scale, full_w, full_h, std::move(built));
                 return;
             }
-            for (BuiltTile& t : built) {
-                if (t.view.texture) {
-                    static_cast<ID3D11ShaderResourceView*>(t.view.texture)->Release();
-                    t.view.texture = nullptr;
-                }
-            }
+            // 失败：built 整体析构即释放全部已建纹理（SrvHandle 的析构路径）。
             bool again = false;
             {
                 std::lock_guard lock(mtx);
@@ -837,13 +1097,15 @@ struct Renderer::Impl {
         }
     }
 
-    void publish_loaded(int page, ID3D11ShaderResourceView* srv, const PageBitmap& bmp) {
+    // 接管 srv 的所有权（发布给 UI 只读；被替换的旧纹理进退役队列）。
+    // 传 SrvHandle&& 而不是裸指针：调用方不必再关心"发布失败时谁负责释放"。
+    void publish_loaded(int page, SrvHandle&& srv, const PageBitmap& bmp) {
         const std::size_t bytes =
             static_cast<std::size_t>(bmp.width()) * static_cast<std::size_t>(bmp.height()) * 4u;
 
         PageSlot loaded;
         loaded.status = PageStatus::Loaded;
-        loaded.texture = srv;
+        loaded.texture = srv.get();
         loaded.pixel_w = bmp.width();
         loaded.pixel_h = bmp.height();
         loaded.full_pixel_w = bmp.width();
@@ -852,7 +1114,8 @@ struct Renderer::Impl {
 
         std::lock_guard lock(mtx);
         if (page < 0 || static_cast<std::size_t>(page) >= pages.size()) {
-            retired_pending.push_back(srv);  // 文档已切换，结果作废
+            // 文档已切换，结果作废：交还给退役队列（由 UI 帧首统一释放）。
+            retired_pending.push_back(srv.release_raw());
             return;
         }
         Entry& e = pages[static_cast<std::size_t>(page)];
@@ -864,6 +1127,7 @@ struct Renderer::Impl {
         e.failed_scale = -1.0f;
         e.stale = false;
         used_bytes += bytes;
+        srv.release_raw();   // 所有权已转入 e.slot
     }
 
     void publish_loaded_tiles(int page, float requested_scale, int full_w, int full_h,
@@ -878,7 +1142,8 @@ struct Renderer::Impl {
         for (BuiltTile& t : built) {
             bytes += static_cast<std::size_t>(t.view.w) * static_cast<std::size_t>(t.view.h) * 4u;
             loaded.tiles.push_back(t.view);
-            t.view.texture = nullptr; // ownership moved into the published slot
+            t.view.texture = nullptr;
+            t.handle.release_raw();   // 所有权转入 loaded.tiles（同下：交不入则入退役队列）
         }
         if (!loaded.tiles.empty()) {
             loaded.pixel_w = loaded.tiles.front().w;
@@ -886,7 +1151,8 @@ struct Renderer::Impl {
         }
         std::lock_guard lock(mtx);
         if (page < 0 || static_cast<std::size_t>(page) >= pages.size()) {
-            for (const PageSlot::Tile& t : loaded.tiles) if (t.texture) retired_pending.push_back(t.texture);
+            for (const PageSlot::Tile& t : loaded.tiles)
+                if (t.texture) retired_pending.push_back(t.texture);
             return;
         }
         Entry& e = pages[static_cast<std::size_t>(page)];
@@ -930,10 +1196,26 @@ struct Renderer::Impl {
         }
     }
 
+    // 缩略图的异常边界（同 render_one）：失败只影响这一张缩略图。
+    void render_thumb(int page, int target_px) noexcept {
+        try {
+            render_thumb_impl(page, target_px);
+        } catch (const std::exception& e) {
+            lr::log::error("render", "thumb render threw " + lr::log::kv("page", page) + " " +
+                                         lr::log::kv("what", e.what()));
+            std::lock_guard lock(mtx);
+            if (page >= 0 && static_cast<std::size_t>(page) < thumbs.size()) {
+                thumbs[static_cast<std::size_t>(page)].slot.status = PageStatus::Failed;
+                thumbs[static_cast<std::size_t>(page)].slot.error = DocError::Internal;
+            }
+        } catch (...) {
+        }
+    }
+
     // 按"旋转后"页尺寸算目标倍率，使最长边 ≈ target_px。
     // 缩略图失败**不自动重试**（侧栏是辅助视图，失败就留空占位）；
     // 视图变换变化或重新打开文档会重置状态、自然重试。
-    void render_thumb(int page, int target_px) {
+    void render_thumb_impl(int page, int target_px) {
         float w = info_.page_width_pt;
         float h = info_.page_height_pt;
         if (page >= 0 && static_cast<std::size_t>(page) < info_.page_sizes.size()) {
@@ -958,28 +1240,24 @@ struct Renderer::Impl {
         PageBitmap bmp;
         DocError err = doc_engine.render_page(page, scale, bmp, 4096, rotation_,
                                               static_cast<PageScheme>(scheme_));
-        ID3D11ShaderResourceView* srv = nullptr;
+        SrvHandle srv;   // 未发布即析构 → 自动释放
         if (err == DocError::Ok &&
             !create_page_texture(device, bmp.samples(), bmp.width(), bmp.height(),
-                                 bmp.stride(), &srv)) {
+                                 bmp.stride(), srv)) {
             err = DocError::Internal;
         }
 
         std::lock_guard lock(mtx);
-        if (page < 0 || static_cast<std::size_t>(page) >= thumbs.size()) {
-            if (srv) srv->Release();
-            return;
-        }
+        if (page < 0 || static_cast<std::size_t>(page) >= thumbs.size()) return;  // srv 自动释放
         Entry& e = thumbs[static_cast<std::size_t>(page)];
         if (err != DocError::Ok) {
-            if (srv) srv->Release();
             e.slot.status = PageStatus::Failed;
             e.slot.error = err;
             return;
         }
         retire_thumb_locked(e);
         e.slot.status = PageStatus::Loaded;
-        e.slot.texture = srv;
+        e.slot.texture = srv.get();
         e.slot.pixel_w = bmp.width();
         e.slot.pixel_h = bmp.height();
         e.slot.scale = bmp.effective_scale();
@@ -987,6 +1265,7 @@ struct Renderer::Impl {
         e.bytes = static_cast<std::size_t>(bmp.width()) *
                   static_cast<std::size_t>(bmp.height()) * 4u;
         thumb_bytes += e.bytes;
+        srv.release_raw();   // 所有权已转入 e.slot
     }
 };
 

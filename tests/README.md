@@ -6,7 +6,7 @@
 ## 用法
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(72) + canvas_test(126) + page_cache_test(32) + reader_state_test(110) + tone_test(113) + page_map_test(26) + render_search_test(10) + 菜单文案宽度 + 主题重置 / 优先级 + 资源断言（字体子集 / 图标帧集）
+powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(72) + canvas_test(126) + page_cache_test(32) + reader_state_test(110) + tone_test(113) + page_map_test(26) + render_search_test(10) + render_fault_test(7) + imgui_raii_test(8) + 菜单文案宽度 + 主题重置 / 优先级 + 资源断言（字体子集 / 图标帧集）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Probe   # 额外跑 MuPDF 诊断探针（打印 FZ_META_FORMAT 等）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # 复用已有 samples/
 ```
@@ -26,6 +26,8 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # �
 | `mupdf_probe.cpp` | 诊断工具：打印 MuPDF 对每个样本的原始判定（页数、`FZ_META_FORMAT`），新增格式支持时先用它摸底 |
 | `tone_test.cpp` | 113 例断言（ADR-068，含 `src/app/tone.h`）：**原色零改动**（逐通道相等）、**黄金值**（深色纸张/暖色各 13 个角色色的最终 RGB，改参数即红）、**对比度下限**（正文/次要文字/强调色/控件层次的 WCAG 对比度）、**结构不变量**（换色不改变中性族明暗次序 / 强调族不再偏冷 / 语义色仍是红橙且可区分 / 中性族保亮度 = 原值 × level） |
 | `render_search_test.cpp` | 10 例断言（ADR-069/070/071/075）：**渲染层检索通道的端到端测试**。检索是跨线程的（UI 投递 → 工作线程增量扫描 → UI 取结果），纯函数单测覆盖不到；用例真跑整条链路：`open` → 等 Ready → `start_search` → 轮询 `take_search_hits`。断言覆盖页内容、命中、跨页扫描、命中矩形坐标、收敛状态、无匹配、换词不混入旧结果、取消立即收敛、空关键字不启动。**设备传 `nullptr`**：用例只走文本通道、不建纹理。 |
+| `render_fault_test.cpp` | 7 例断言（Phase 7，ADR-079）：**渲染工作线程的故障隔离**——必须在真实线程边界上跑，单测覆盖不到 `std::jthread` 入口。断言：5 种坏文件（不存在/截断/随机字节/空 PDF/坏 zip 容器）全部**文档级** Failed 且错误详情非空、失败后**仍能**正常打开下一个文档（无 `std::terminate` 的直接证据）、越界页码/请求（slot/retry/wants/thumbs/copy）安全退化且不污染文档状态、25 轮好坏交替 open/close 无死锁无累积、400 轮请求洪峰 + 检索起停后仍收敛、1200 页文档可打开可检索、A0 幅面（2384×3370pt，走 tile 路径）收敛后调度器仍健康。设备传 `nullptr`：建纹理必然失败，恰好压到"整页分块渲染 → 逐 tile 失败 → 自动重试 → 清理"路径 |
+| `imgui_raii_test.cpp` | 8 例断言（Phase 7，ADR-078）：**ImGui RAII 包装与栈平衡自检的 headless 测试**。只编 ImGui 核心（无 Win32/D3D 后端），NewFrame → 绘制 → Render 无后端同样成立，故栈平衡可完全离线、确定性验证。断言：Push/Pop 全家族配对、Begin/End 条件配对（含返回 false 分支）、**异常展开收回全部栈**（抛出点无条件执行，不依赖任何 ImGui 返回值）、`dismiss()` 提前收口且幂等、`format_stack_diff` 能检出注入的漏配对、200 帧连续绘制不累积泄漏、帧首基线跨帧稳定（判据是"帧尾 == 帧首"而非"各层为 0"——ImGui 的隐式窗口与默认字体使后者恒假）。另把 ImGui 自身检出的错误接到计数回调：**报错即失败**，比"崩没崩"严格 |
 | `page_map_test.cpp` | 26 例断言（ADR-069，含 `src/app/page_map.h`）：屏幕点 ↔ **未旋转页面 pt** 的折算。四类：**四角对应**（90°/180°/270° 下未旋转页面的四个角各落到屏幕矩形的哪个角 —— 这是最容易写反的一处）、**正逆往返一致**（含页外点，拖动选择依赖它）、**退化输入返回 false**（页尺寸/页矩形为 0，不产生 NaN）、**角度归一化**（负数 / 超 360 / 非 90 倍数）。文本选择、复制、超链接命中、搜索高亮全部建立在这组折算之上，而它的错误是"0° 正常、一旋转就整体偏一格"这类肉眼难判的一类 |
 | `check_theme_reset.py` | 主题重置断言（ADR-068）：`apply_theme_colors` 的两个分支必须先 `StyleColorsLight` / `StyleColorsDark` **整套重置**再逐项覆盖 —— 否则未覆盖的颜色项会带着上一个主题的值活过来（深色勾选框曾因此变成亮奶油色）。跨状态残留这类 bug 在代码里毫无痕迹，只能靠结构性约束挡住 |
 | `check_theme_precedence.py` | 外观契约断言：深色纸张只在“跟随系统”时额外令界面变暗，显式浅色/深色不被文档状态覆盖；同时检查菜单分组、统一标签表与设置项顺序 |
@@ -47,6 +49,13 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # �
   + `page_cache.ixx.obj` + `utils.ixx.obj`，并额外加 `d3d11.lib`（`render.cpp` 里建纹理用；
   本用例不实际建，但符号必须能解析）。编译 `render.ixx` 时要 `/reference` 它 import 的
   `document` / `page_cache` / `utils` 三个 `.ifc`。
+- Phase 7 起 `render.cpp` import 了 `lilithreader.log`，故编译 `render.obj` 时需 `/reference log.ifc`，
+  链接时需加 `log.obj` + `log.ixx.obj`（`render_fault_test.exe` 同）。
+  编译顺序：`log.ixx` 必须先于 `render.cpp`。
+- `imgui_raii_test.exe` 只编 ImGui **核心**四个 TU（imgui/draw/tables/widgets，放 `_build/raii/`
+  子目录避免与其它用例重名），**不**编任何后端；头文件搜索路径需 `/I<repo>\src\app`
+  （`imgui_raii.h` / `imgui_stacks.h`）。目标文件多源编译时每个源要单独 `/Fo`——
+  MSVC 不允许多个源文件共用一个 `/Fo<文件>`。
 - `page_map_test.cpp` / `tone_test.cpp` 只依赖 C++ 标准库，但都要 `/I<repo>\src\app` 才能找到头；
   两者都是"把 app 层里可判定的纯函数抽出来单测"（ADR-068/069），不需要额外的 .obj。
   用例里**不要**写 `for (int r : {0,90,180,270})`：range-for 初始化列表需要 `<initializer_list>`，

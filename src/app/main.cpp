@@ -2,8 +2,10 @@
 //
 // 职责（进程与窗口的生命周期，不含任何界面绘制与文档逻辑）：
 //   · 命令行解析（LilithReader.exe <文档路径>）
+//   · 进程级崩溃防线安装、日志初始化、上次异常退出的提示
 //   · 进程 DPI 感知、窗口类注册、窗口创建与恢复（exe 同目录 LilithReader.ini）
 //   · 主消息循环（ImGui 帧 → draw_shell → 呈现；模态文件对话框在帧间执行）
+//   · **帧级异常边界**（ADR-078）：任何一块界面绘制抛异常都只作废这一帧，不带走进程
 //   · 窗口过程：尺寸/DPI 变化、拖放打开、关闭时落盘阅读位置与窗口状态
 //
 // 分层（架构文档 §1）：main 只做"把外部事件接进来"；界面在 ui.cpp、状态在 session.cpp、
@@ -13,6 +15,9 @@
 // 人工运行验证项统一记录在 docs/04-人工验证.md。
 
 #include "app_internal.h"
+
+#include "crash.h"          // 进程级崩溃防线（Phase 7）
+#include "imgui_stacks.h"   // 帧级栈平衡自检与 ImGui 异常后恢复（Phase 7）
 
 // Win32 后端消息处理器的前向声明。两点说明：
 //  1. 该声明**刻意不出现在 imgui_impl_win32.h**（避免那头引入 windows.h），官方要求使用者
@@ -26,6 +31,17 @@ namespace lr::app {
 namespace {
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+
+// 崩溃摘要只取前几行交给弹窗：完整报告（含日志尾部）留在 crash\last_crash.txt 里，
+// 弹窗的职责只是"告诉用户出过事、报告在哪"，不是把转储内容塞进模态框。
+std::string crash_summary_head(const std::string& full) {
+    constexpr std::size_t kMaxLines = 6;
+    std::size_t lines = 0;
+    for (std::size_t i = 0; i < full.size(); ++i) {
+        if (full[i] == '\n' && ++lines >= kMaxLines) return full.substr(0, i);
+    }
+    return full;
+}
 
 // 窗口矩形是否落在虚拟屏幕内且不至于太小（恢复窗口状态前的合法性校验）。
 bool placement_usable(const lr::WindowState& s) {
@@ -145,6 +161,24 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+    // ---- 最早的接线（Phase 7）----
+    // 崩溃标记的读取必须**先于** install()：install 会写 running.flag，晚于它读到的永远是
+    // 本次进程自己的标记，结果就是"每次启动都提示上次异常退出"（实测踩过；take_last_crash
+    // 内部另有 PID 自检兜底，双保险）。
+    crash::set_phase("startup");
+    std::string crash_summary;
+    const bool had_last_crash = crash::take_last_crash(crash_summary);
+    // 崩溃防线必须**早于任何可能抛异常的代码**：Crash 类问题不允许"来不及装处理器"。
+    crash::install();
+    lr::log::init(lr::exe_dir());
+    lr::log::info("app", "LilithReader start " + lr::log::kv("exe_dir", lr::exe_dir()));
+
+    // 上次异常退出：只提示一次，交给确认弹窗展示。
+    if (had_last_crash) {
+        lr::log::warn("app", "previous run ended abnormally; see crash\\last_crash.txt");
+        g_last_crash_summary = crash_summary_head(crash_summary);
+    }
+
     // 命令行解析：LilithReader.exe <文档路径>（wWinMain 的 cmd_line 不含程序名）
     std::wstring doc_path;
     if (cmd_line && *cmd_line) {
@@ -207,6 +241,20 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
     ShowWindow(g_hwnd, (saved.valid && saved.maximized) ? SW_MAXIMIZE : show);
     UpdateWindow(g_hwnd);
 
+    // 上次异常退出的提示：复用既有的通用确认弹窗（ADR-063），不新增界面类型。
+    // 主按钮直接打开报告目录 —— 用户"看得到、点得动"，而不是只收到一句看不见的日志。
+    if (!g_last_crash_summary.empty()) {
+        request_confirm(ConfirmKind::CrashNotice,
+                        std::string("上次运行异常退出"),
+                        g_last_crash_summary +
+                            "\n\n完整摘要（含转储文件名与日志尾部）在报告目录的 last_crash.txt 里。",
+                        { { "报告目录", lr::wide_to_utf8(crash::report_dir()) } },
+                        std::string("打开报告文件夹"), std::string("忽略"));
+        g_last_crash_summary.clear();
+    }
+
+    crash::set_phase("frame");
+
     MSG msg{};
     while (msg.message != WM_QUIT) {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -234,9 +282,44 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
             g_gfx.resize(g_resize_w, g_resize_h);
         }
         g_ui.new_frame();
-        draw_shell();
+
+        // ---- 帧级异常边界（ADR-078）----
+        //  1) 先记下 ImGui 各栈的基线（官方 ErrorRecoveryStoreState，专为"异常后恢复"设计）；
+        //  2) draw_shell 抛异常 → 记录 + 把内部状态拉回基线；
+        //  3) Debug 下再比对一次栈深度：任何漏配对都在**当帧**被点名，而不是拖成几帧后的怪现象。
+        // 顺序要求：恢复必须在 ImGui::Render() **之前**完成，否则会带着脏栈进 EndFrame。
+        const ig::StackDepths stack_base = ig::capture_stacks();
+        ImGuiErrorRecoveryState frame_base;
+        ig::store_frame_state(frame_base);
+
+        bool frame_ok = true;
+        try {
+            draw_shell();
+        } catch (const std::exception& e) {
+            frame_ok = false;
+            char buf[256] = {};
+            std::snprintf(buf, sizeof buf, "frame aborted: %s", e.what() ? e.what() : "?");
+            lr::log::error("ui", buf);
+        } catch (...) {
+            frame_ok = false;
+            lr::log::error("ui", "frame aborted: non-std exception");
+        }
+        if (!frame_ok) ig::recover_frame_state(frame_base);
+
+#ifndef NDEBUG
+        {
+            char diff[256] = {};
+            ig::format_stack_diff(stack_base, diff, sizeof diff);
+            if (diff[0] != '\0') lr::log::error("ui", diff);
+        }
+#endif
+
+        // ImGui::Render() **必须**调用：它负责关闭本帧（合成绘制数据、结算各栈）。
+        // 漏掉它，下一次 NewFrame 会命中 ImGui 的 "Forgot to call Render()" 断言。
         ImGui::Render();
-        g_gfx.render_frame();
+        // 帧被异常截断时不提交绘制数据：窗口保留上一帧画面，胜过闪一帧半成品。
+        // （ImGui 帧已经在上面正常收口，故跳过一次 Present 不会留下不完整状态。）
+        if (frame_ok) g_gfx.render_frame();
 
         // 「打开文档…」：模态文件对话框放到帧与帧之间执行（见 open_file_dialog_now 注释）。
         if (g_request_open_dialog) {
@@ -245,8 +328,12 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
         }
     }
 quit:
+    crash::set_phase("shutdown");
     g_renderer.reset();  // 必须先于 gfx 释放：纹理依赖 D3D11 设备
     g_ui.shutdown();
     g_gfx.shutdown();
+    lr::log::info("app", "clean exit");
+    crash::mark_clean_exit();   // 正常退出：清掉"运行中"标记，下次启动不误报
+    lr::log::shutdown();
     return 0;
 }

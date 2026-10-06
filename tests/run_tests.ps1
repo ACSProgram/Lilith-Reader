@@ -124,6 +124,13 @@ function Invoke-Cl($argv, $what) {
 # 只会一路报"XXX 不是类或命名空间名称"，极难排查。
 Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\utils.ifc", "/Fo$out\utils.ixx.obj",
     (Join-Path $src "utils\utils.ixx"))) "编译 utils.ixx"
+
+# Phase 7：日志模块。render.cpp / 崩溃防线都依赖它，故凡涉及 render 的用例都要一并编译与链接。
+Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\log.ifc", "/Fo$out\log.ixx.obj",
+    (Join-Path $src "log\log.ixx"))) "编译 log.ixx"
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\log.ifc",
+    "/Fo$out\log.obj", (Join-Path $src "log\log.cpp"))) "编译 log.cpp"
+
 Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\document.ifc", "/Fo$out\document.ixx.obj",
     (Join-Path $src "document\document.ixx"))) "编译 document.ixx"
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\document.ifc",
@@ -161,13 +168,37 @@ Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\document.ifc",
     (Join-Path $src "render\render.ixx"))) "编译 render.ixx"
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\render.ifc",
     "/reference", "$out\document.ifc", "/reference", "$out\page_cache.ifc",
-    "/reference", "$out\utils.ifc",
+    "/reference", "$out\utils.ifc", "/reference", "$out\log.ifc",
     "/Fo$out\render.obj", (Join-Path $src "render\render.cpp"))) "编译 render.cpp"
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\render.ifc",
     "/reference", "$out\document.ifc", "/reference", "$out\page_cache.ifc",
     "/reference", "$out\utils.ifc",
     "/Fo$out\render_search_test.obj",
     (Join-Path $tests "render_search_test.cpp"))) "编译 render_search_test.cpp"
+
+# Phase 7：渲染工作线程的「故障隔离」测试（跨线程，必须在真实线程边界上跑）。
+# 命题是"一个错误不会让调度器死掉"：坏文件只置文档级 Failed，之后仍能正常打开。
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\render.ifc",
+    "/reference", "$out\document.ifc", "/reference", "$out\page_cache.ifc",
+    "/reference", "$out\utils.ifc",
+    "/Fo$out\render_fault_test.obj",
+    (Join-Path $tests "render_fault_test.cpp"))) "编译 render_fault_test.cpp"
+
+# Phase 7：ImGui RAII 包装的 headless 测试。
+# 只编译 ImGui **核心**（无 Win32 / 无 D3D 后端）：NewFrame → 绘制 → Render 无后端同样成立，
+# 于是"栈是否平衡"可以完全离线、确定性验证。目标文件放独立子目录，避免与其它用例重名。
+$raiiOut = Join-Path $out "raii"
+New-Item -ItemType Directory -Force -Path $raiiOut | Out-Null
+$imguiDir = Join-Path $repo "third_party\imgui"
+$imguiSrc = @("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp")
+foreach ($f in $imguiSrc) {
+    $obj = Join-Path $raiiOut ([IO.Path]::GetFileNameWithoutExtension($f) + ".obj")
+    Invoke-Cl ($defs + @("/I$imguiDir") + $incs + @("/c", "/Fo$obj",
+        (Join-Path $imguiDir $f))) "编译 $f（headless）"
+}
+Invoke-Cl ($defs + @("/I$imguiDir", "/I$(Join-Path $src 'app')") + $incs + @("/c",
+    "/Fo$(Join-Path $raiiOut 'imgui_raii_test.obj')",
+    (Join-Path $tests "imgui_raii_test.cpp"))) "编译 imgui_raii_test.cpp"
 
 # Phase 5：阅读状态持久化（纯序列化 + Win32 文件 I/O），单独编译成 reader_state_test.exe
 Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\reader_state.ifc", "/Fo$out\reader_state.ixx.obj",
@@ -213,8 +244,20 @@ Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\page_cache_test.exe", "$out\page_cache_
 # 以及 d3d11（render.cpp 里建纹理用；本用例不实际建，但符号必须能解析）。
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\render_search_test.exe", "$out\render_search_test.obj",
     "$out\render.obj", "$out\render.ixx.obj", "$out\document.obj", "$out\document.ixx.obj",
-    "$out\page_cache.ixx.obj", "$out\utils.ixx.obj",
+    "$out\page_cache.ixx.obj", "$out\utils.ixx.obj", "$out\log.obj", "$out\log.ixx.obj",
     "/link") + $libdirs + $libs + @("d3d11.lib")) "链接 render_search_test.exe"
+
+# 故障隔离测试：链接目标与 render_search_test 完全一致（同一套模块）。
+Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\render_fault_test.exe", "$out\render_fault_test.obj",
+    "$out\render.obj", "$out\render.ixx.obj", "$out\document.obj", "$out\document.ixx.obj",
+    "$out\page_cache.ixx.obj", "$out\utils.ixx.obj", "$out\log.obj", "$out\log.ixx.obj",
+    "/link") + $libdirs + $libs + @("d3d11.lib")) "链接 render_fault_test.exe"
+
+# headless ImGui RAII 测试：只链 ImGui 核心，无任何后端。
+$raiiObjs = @("imgui_raii_test") + @("imgui", "imgui_draw", "imgui_tables", "imgui_widgets") |
+    ForEach-Object { Join-Path $raiiOut "$_.obj" }
+Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\imgui_raii_test.exe") + $raiiObjs +
+    @("/link") + $libdirs + @("user32.lib", "gdi32.lib", "shell32.lib", "ole32.lib")) "链接 imgui_raii_test.exe"
 
 # 阅读状态测试：链 reader_state 的接口单元与实现单元。
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\reader_state_test.exe", "$out\reader_state_test.obj",
@@ -311,6 +354,26 @@ try {
 $renderSearchExit = $LASTEXITCODE
 Write-Host "  render_search_test.exe 退出码 = $renderSearchExit"
 
+Step "运行渲染层故障隔离测试"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & "$out\render_fault_test.exe" $samples
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$renderFaultExit = $LASTEXITCODE
+Write-Host "  render_fault_test.exe 退出码 = $renderFaultExit"
+
+Step "运行 ImGui RAII 栈平衡测试（headless）"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & "$out\imgui_raii_test.exe"
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$raiiExit = $LASTEXITCODE
+Write-Host "  imgui_raii_test.exe 退出码 = $raiiExit"
+
 if ($Probe) {
     Step "编译并运行 MuPDF 诊断探针"
     Invoke-Cl ($defs + $incs + @("/c", "/Fo$out\mupdf_probe.obj",
@@ -384,6 +447,7 @@ Write-Host "  check_theme_precedence.py 退出码 = $themePrecedenceExit"
 Step "结束"
 if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $stateExit -eq 0 -and
     $toneExit -eq 0 -and $pageMapExit -eq 0 -and $renderSearchExit -eq 0 -and
+    $renderFaultExit -eq 0 -and $raiiExit -eq 0 -and
     $fontExit -eq 0 -and $iconExit -eq 0 -and
     $menuExit -eq 0 -and $themeExit -eq 0 -and $themePrecedenceExit -eq 0) {
     Write-Host "全部通过。" -ForegroundColor Green
@@ -397,6 +461,8 @@ if ($stateExit -ne 0) { exit $stateExit }
 if ($toneExit -ne 0) { exit $toneExit }
 if ($pageMapExit -ne 0) { exit $pageMapExit }
 if ($renderSearchExit -ne 0) { exit $renderSearchExit }
+if ($renderFaultExit -ne 0) { exit $renderFaultExit }
+if ($raiiExit -ne 0) { exit $raiiExit }
 if ($fontExit -ne 0) { exit $fontExit }
 if ($iconExit -ne 0) { exit $iconExit }
 if ($menuExit -ne 0) { exit $menuExit }
