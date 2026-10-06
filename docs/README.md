@@ -10,9 +10,9 @@
 | 画布布局（缩放/滚动/网格/阅读游标） | [架构设计 §2](02-架构设计.md) | `src/canvas/canvas.ixx`、`tests/canvas_test.cpp` |
 | 渲染调度、纹理生命周期、页状态机 | [架构设计 §3](02-架构设计.md) | `src/render/render.ixx`、`render.cpp` |
 | MuPDF 封装、错误码、格式识别 | [架构设计 §3](02-架构设计.md)、[决策记录 ADR-009~017](03-决策记录.md) | `src/document/document.ixx`、`document.cpp` |
-| 输入映射、命令表与按键自定义排查 | [架构设计 §2.2](02-架构设计.md)、[决策记录 ADR-054](03-决策记录.md) | `src/app/session.cpp`（`kCmds`/`cmd_pressed`）、`src/app/ui.cpp`（按键分栏） |
+| 输入映射、命令表与按键自定义排查 | [架构设计 §2.2](02-架构设计.md)、[决策记录 ADR-054/066](03-决策记录.md) | `src/app/session.cpp`（`kCmds`/`cmd_pressed`）、`src/app/ui.cpp`（按键分栏） |
 | 阅读功能（阅读位置/目录/书签/缩略图/旋转/对开/配色/密码） | [架构设计 §6](02-架构设计.md)、[决策记录 ADR-034~040](03-决策记录.md) | `src/app/session.cpp`、`src/app/ui.cpp`、`src/state/reader_state.ixx` |
-| 界面外壳（顶栏/主菜单/右键菜单/设置/按键/主题/图标/动效） | [架构设计 §7](02-架构设计.md)、[决策记录 ADR-045/054~056/059/061](03-决策记录.md) | `src/app/ui.cpp`、`src/app/platform.cpp`、`src/app/app.rc` |
+| 界面外壳（顶栏/主菜单/右键菜单/设置/按键/主题/图标/动效） | [架构设计 §7](02-架构设计.md)、[决策记录 ADR-045/054~056/059/061/066](03-决策记录.md) | `src/app/ui.cpp`、`src/app/platform.cpp`、`src/app/app.rc` |
 | 窗口尺寸/全屏/最小化（swapchain 重建、闪烁） | [架构设计 §7.1](02-架构设计.md)、[决策记录 ADR-057/058/060/061](03-决策记录.md) | `src/app/main.cpp`、`src/app/platform.cpp` |
 | 阶段计划、下一步做什么、风险 | [迁移计划](01-迁移计划.md) | 规划项明确列出的文件 |
 | 体积构成、裁剪手段 | [体积预算](05-体积预算.md) | — |

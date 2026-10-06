@@ -337,14 +337,18 @@ void draw_canvas_area(float height) {
             const float sh = px(3.0f);
             dl->AddRectFilled(ImVec2(pmin.x + sh, pmin.y + sh),
                               ImVec2(pmax.x + sh, pmax.y + sh), g_pal.shadow, px(2.0f));
-            // 淡入：纹理首次出现的那一帧从 0 渐显（kPageFadeSec），避免生硬跳出
+            // 淡入：**只在"纹理在眼前就绪"时渐显**（占位 → 内容的换入），
+            // 页面预加载好之后才滑入视野的不淡入（直接显示）—— 否则每次翻页都从透明渐显，
+            // 看起来就像"翻到哪才开始加载"（人工反馈的"换页轻微闪烁"）。
             PageFade& pf = g_page_fade[static_cast<std::size_t>(i)];
             if (g_prefs.motion) {
-                if (!pf.seen) { pf.seen = true; pf.alpha = 0.0f; }
+                if (!pf.seen) { pf.seen = true; pf.alpha = pf.waiting ? 0.0f : 1.0f; }
                 if (pf.alpha < 1.0f)
                     pf.alpha = std::min(1.0f, pf.alpha + dt / kPageFadeSec);
+                pf.waiting = false;
             } else {
                 pf.alpha = 1.0f;
+                pf.waiting = false;
             }
             const int a = static_cast<int>(std::lround(pf.alpha * 255.0f));
             dl->AddImage(static_cast<ImTextureID>(reinterpret_cast<std::intptr_t>(s.texture)),
@@ -352,7 +356,9 @@ void draw_canvas_area(float height) {
                          IM_COL32(255, 255, 255, a));
             dl->AddRect(pmin, pmax, g_pal.page_border);
         } else {
+            // 无纹理：本页正在"眼前等纹理"（waiting）→ 纹理到达时才值得淡入。
             g_page_fade[static_cast<std::size_t>(i)].seen = false;
+            g_page_fade[static_cast<std::size_t>(i)].waiting = true;
             g_page_fade[static_cast<std::size_t>(i)].alpha = 1.0f;
             draw_page_placeholder(dl, pmin, pmax, s);
         }
@@ -947,7 +953,10 @@ void draw_canvas_context_menu() {
 
 // ---- 顶栏自动隐藏 ----
 // 阅读态下，鼠标离开窗口顶部一段时间就收起顶栏（沉浸阅读）；移到顶部即重现。
-// 引导/失败/密码等状态、以及打开菜单/设置/帮助时始终显示（否则用户找不到入口）。
+// 引导/失败/密码等状态、以及打开设置时始终显示（否则用户找不到入口）。
+// **画布右键菜单、跳页/密码/确认弹窗刻意不唤醒顶栏**（人工反馈）：它们是屏幕中央/画布上的
+// 操作，把顶栏一并滑出来只是无谓的视觉噪音。唯一例外是**顶栏自己的弹出菜单**
+// （主菜单 / 缩放档位）—— 它们挂在顶栏按钮下方，顶栏滑走会让菜单悬空，故用 g_toolbar_pinned 钉住。
 void update_toolbar_visibility() {
     if (g_doc.kind != UiDoc::Kind::Reading || !g_prefs.auto_hide_toolbar) {
         g_toolbar_visible = true;
@@ -957,7 +966,7 @@ void update_toolbar_visibility() {
     const ImVec2 mp = ImGui::GetIO().MousePos;
     const ImVec2 vp = ImGui::GetMainViewport()->Pos;
     const bool near_top = (mp.y - vp.y) <= px(kTopBarH + kToolbarRevealBandPx);
-    if (near_top || g_show_settings) {
+    if (near_top || g_show_settings || g_toolbar_pinned) {
         g_toolbar_visible = true;
         g_toolbar_idle_since = -1.0;
         return;
@@ -975,9 +984,7 @@ void update_toolbar_visibility() {
 bool top_bar_should_show() {
     if (g_doc.kind != UiDoc::Kind::Reading) return true;
     if (!g_prefs.auto_hide_toolbar) return true;
-    if (g_show_settings || g_open_jump || g_open_password) return true;
-    if (ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
-        return true;
+    if (g_show_settings || g_toolbar_pinned) return true;
     return g_toolbar_visible;
 }
 
@@ -1039,11 +1046,14 @@ void draw_top_bar(float bar_h) {
     ImGui::SetCursorPos(ImVec2(px(kChromePadX), y));
 
     // 主菜单（☰）——所有命令的唯一入口，避免把按钮铺满工具栏
+    bool pinned = false;   // 顶栏自己的弹出菜单是否开着（见 g_toolbar_pinned）
     if (tool_button("##mainmenu", kIcMenu, "菜单", nullptr))
         ImGui::OpenPopup("##mainmenu_pop");
     push_popup_style();
-    if (ImGui::BeginPopup("##mainmenu_pop")) { draw_main_menu_contents(); ImGui::EndPopup(); }
+    const bool main_open = ImGui::BeginPopup("##mainmenu_pop");
+    if (main_open) { draw_main_menu_contents(); ImGui::EndPopup(); }
     pop_popup_style();
+    if (main_open) pinned = true;
 
     if (rd) {
         ImGui::SameLine();
@@ -1083,8 +1093,10 @@ void draw_top_bar(float bar_h) {
         pop_flat_button();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) ImGui::SetTooltip("缩放");
         push_popup_style();
-        if (ImGui::BeginPopup("##zoompop")) { draw_zoom_menu_contents(); ImGui::EndPopup(); }
+        const bool zoom_open = ImGui::BeginPopup("##zoompop");
+        if (zoom_open) { draw_zoom_menu_contents(); ImGui::EndPopup(); }
         pop_popup_style();
+        if (zoom_open) pinned = true;
         ImGui::SameLine();
         if (tool_button("##zin", kIcZoomIn, "+", "放大"))
             zoom_at_center(kZoomStep);
@@ -1100,6 +1112,7 @@ void draw_top_bar(float bar_h) {
     if (tool_button("##settings", kIcSettings, "设置", tip_settings.c_str(), g_show_settings))
         g_show_settings = true;
 
+    g_toolbar_pinned = pinned;   // 供下一帧的 update_toolbar_visibility / top_bar_should_show 读
     ImGui::EndChild();
 }
 
@@ -1658,6 +1671,18 @@ void draw_settings_performance_tab() {
 // 每条命令一行：命令名 + 两个按键框（主键 / 备键）。左键点框进入捕获（"按下按键…"），
 // 按下的第一个键即写入该槽；右键清除（捕获中则取消）。同一键被多条命令使用会以警示色
 // 标出并给出冲突对象——**只提示不阻止**：有人确实想让一个键在不同状态下做不同事。
+//
+// 修饰键型命令（kCmds[i].mod_only，"滚轮缩放"）**不是一条被按下的命令**，而是"按住不放的
+// 键"，故不用捕获框，改用下拉框（无 / Ctrl / Alt / Shift / Ctrl+Alt）。
+//
+// 分栏末尾还有一节**鼠标与固定键**：这些操作改不了（不是命令），但用户必须能查到 ——
+// 早期只列可自定义的命令，结果"Ctrl+滚轮能缩放""右键有菜单"这类事全靠猜（人工反馈）。
+
+// 滚轮缩放修饰键的候选（值与 ini 里的存储串一一对应，见 chord_to_string）。
+const char* const kModLabels[] = { "无", "Ctrl", "Alt", "Shift", "Ctrl+Alt" };
+const ImGuiKeyChord kModValues[] = { 0, ImGuiMod_Ctrl, ImGuiMod_Alt, ImGuiMod_Shift,
+                                     ImGuiMod_Ctrl | ImGuiMod_Alt };
+constexpr int kModCount = static_cast<int>(IM_ARRAYSIZE(kModValues));
 
 void draw_bind_button(int cmd, int slot) {
     const bool capturing = (g_capture_cmd == cmd && g_capture_slot == slot);
@@ -1703,7 +1728,7 @@ void draw_settings_keys_tab() {
     if (g_capture_cmd < kCmdCount)
         ImGui::TextColored(col_warn(), "正在捕获按键…（点别处或右键取消）");
     else
-        ImGui::TextColored(dim, "点按键框后按下新键；右键清除。");
+        ImGui::TextColored(dim, "点按键框后按下新键；右键清除。下拉框直接选。");
     ImGui::Separator();
 
     ImGui::BeginChild("##keys_list", ImVec2(0, 0), false, ImGuiWindowFlags_NoNav);
@@ -1728,12 +1753,62 @@ void draw_settings_keys_tab() {
                 else               ImGui::TextUnformatted(kCmds[i].name);
                 if (conflict >= 0 && ImGui::IsItemHovered())
                     ImGui::SetTooltip("与「%s」使用了同一个键", kCmds[conflict].name);
-                for (int s = 0; s < kBindSlots; ++s) {
-                    ImGui::TableSetColumnIndex(1 + s);
-                    draw_bind_button(i, s);
+                if (kCmds[i].mod_only) {
+                    // 修饰键型：下拉框选"按住哪个键"，第二列留给说明文字（没有备键）
+                    const ImGuiKeyChord cur = g_binds[i][0] & ImGuiMod_Mask_;
+                    int sel = 0;
+                    for (int o = 0; o < kModCount; ++o)
+                        if ((kModValues[o] & ImGuiMod_Mask_) == cur) { sel = o; break; }
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::SetNextItemWidth(px(150.0f));
+                    if (ImGui::Combo("##mod", &sel, kModLabels, kModCount)) {
+                        g_binds[i][0] = kModValues[sel];
+                        save_binds();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                        ImGui::SetTooltip("按住此键滚动滚轮 = 缩放；不按则滚动页面");
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextColored(dim, "%s", "按住 + 滚轮");
+                } else {
+                    for (int s = 0; s < kBindSlots; ++s) {
+                        ImGui::TableSetColumnIndex(1 + s);
+                        draw_bind_button(i, s);
+                    }
                 }
                 ImGui::PopID();
             }
+            ImGui::EndTable();
+        }
+    }
+
+    // ---- 鼠标与固定键（**不可自定义**的操作清单）----
+    // 用户查不到就会以为"没有这个功能"：滚轮缩放、右键菜单、滚条拖拽都属于这一类。
+    ImGui::SeparatorText("鼠标与固定键");
+    {
+        const ImGuiTableFlags rf = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX;
+        if (ImGui::BeginTable("##keys_ref", 2, rf)) {
+            ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, px(190.0f));
+            ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
+            auto ref = [&](const char* key, const char* desc) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(key);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextColored(dim, "%s", desc);
+            };
+            const std::string mod = chord_label(g_binds[static_cast<int>(Cmd::ZoomWheelMod)][0]);
+            const std::string wheel_zoom =
+                mod.empty() ? std::string("滚轮缩放：未设置修饰键（当前不可用）")
+                            : ("按住 " + mod + " + 滚轮");
+            ref("滚轮", "上下滚动");
+            ref(wheel_zoom.c_str(), "以鼠标位置为中心缩放（修饰键可改，见上）");
+            ref("左键拖拽", "平移页面");
+            ref("右键", "打开画布菜单（Shift+F10 / 菜单键同效）");
+            ref("拖拽右侧滚动条 / 点轨道", "定位到该处");
+            ref("单击「渲染失败」占位", "重试渲染该页");
+            ref("鼠标移到窗口顶部", "顶栏自动隐藏后重新显示");
+            ref("Esc", "关闭当前对话框（设置 / 跳页 / 密码 / 确认）");
             ImGui::EndTable();
         }
     }

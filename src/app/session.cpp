@@ -56,6 +56,9 @@ const CmdDef kCmds[kCmdCount] = {
     { "ZoomIn",         "缩放", "放大",                      true,  false, kb(ImGuiKey_Equal),          kb(ImGuiKey_KeypadAdd) },
     { "ZoomOut",        "缩放", "缩小",                      true,  false, kb(ImGuiKey_Minus),          kb(ImGuiKey_KeypadSubtract) },
     { "FitWidth",       "缩放", "适合宽度",                  false, false, kb(ImGuiKey_F),              ImGuiKey_None },
+    // 修饰键型：绑定的是"按住不放的键"（ImGuiMod_*），不是一条命令。
+    // 末位 mod_only=true → 按键分栏渲染成下拉框，不走捕获；派发由 handle_canvas_input 读。
+    { "ZoomWheelMod",   "缩放", "滚轮缩放",                  false, false, ImGuiMod_Ctrl,               ImGuiKey_None, true },
 
     { "Col1",           "视图", "单页",                      false, false, kb(ImGuiKey_1),              kb(ImGuiKey_Keypad1) },
     { "Col2",           "视图", "双页",                      false, false, kb(ImGuiKey_2),              kb(ImGuiKey_Keypad2) },
@@ -123,13 +126,19 @@ bool is_bindable_key(ImGuiKey k) {
 
 // ini 存储用：纯 ASCII 的 "Ctrl+Shift+RightArrow"。键名取 ImGui::GetKeyName 原文，
 // 保证 load 时能按名反查（不受显示美化影响）。
+// 修饰键型命令（mod_only）没有主键：只写修饰键本身（"Ctrl" / "Ctrl+Alt"），空 = 无。
 std::string chord_to_string(ImGuiKeyChord c) {
     if (c == ImGuiKey_None) return {};
     std::string s;
     if (c & ImGuiMod_Ctrl)  s += "Ctrl+";
     if (c & ImGuiMod_Shift) s += "Shift+";
     if (c & ImGuiMod_Alt)   s += "Alt+";
-    s += ImGui::GetKeyName(static_cast<ImGuiKey>(c & ~ImGuiMod_Mask_));
+    const ImGuiKey key = static_cast<ImGuiKey>(c & ~ImGuiMod_Mask_);
+    if (key == ImGuiKey_None) {          // 只有修饰键：去掉末尾的 '+'
+        if (!s.empty()) s.pop_back();
+        return s;
+    }
+    s += ImGui::GetKeyName(key);
     return s;
 }
 
@@ -163,14 +172,23 @@ ImGuiKeyChord chord_from_string(const std::string& s) {
     for (;;) {
         const std::size_t p = s.find('+', start);
         const std::string tok = (p == std::string::npos) ? s.substr(start) : s.substr(start, p - start);
-        if (p == std::string::npos) { key_name = tok; break; }
+        // 末段也要先判修饰键名："Ctrl" / "Ctrl+Alt" 是修饰键型命令的合法存储串
+        // （它们没有主键，整串由修饰键组成），不这样判会被当键名去做反查而落空。
+        if (p == std::string::npos) {
+            if (tok == "Ctrl")       mods |= ImGuiMod_Ctrl;
+            else if (tok == "Shift") mods |= ImGuiMod_Shift;
+            else if (tok == "Alt")   mods |= ImGuiMod_Alt;
+            else                     key_name = tok;
+            break;
+        }
         if (tok == "Ctrl")       mods |= ImGuiMod_Ctrl;
         else if (tok == "Shift") mods |= ImGuiMod_Shift;
         else if (tok == "Alt")   mods |= ImGuiMod_Alt;
         else { key_name = tok; break; }   // 意外前缀：把剩下的整体当键名，交给反查判定
         start = p + 1;
     }
-    if (key_name.empty()) return ImGuiKey_None;
+    // 只有修饰键（"Ctrl" / "Ctrl+Alt"）：修饰键型命令的绑定，直接返回修饰键集合。
+    if (key_name.empty()) return static_cast<ImGuiKeyChord>(mods);
     // 按名反查：遍历具名键（量级 140，仅解析 ini 时调用，可接受）
     for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; ++k) {
         const char* n = ImGui::GetKeyName(static_cast<ImGuiKey>(k));
@@ -183,16 +201,34 @@ ImGuiKeyChord chord_from_string(const std::string& s) {
 int find_bind_conflict(int cmd, int slot) {
     const ImGuiKeyChord c = g_binds[cmd][slot];
     if (c == ImGuiKey_None) return -1;
+    if (kCmds[cmd].mod_only) return -1;   // 修饰键型绑定不与"主键组合"同域，谈不上冲突
     for (int i = 0; i < kCmdCount; ++i) {
         if (i == cmd) continue;   // 同一命令的两个槽不算冲突
+        if (kCmds[i].mod_only) continue;
         for (int s = 0; s < kBindSlots; ++s)
             if (g_binds[i][s] == c) return i;
     }
     return -1;
 }
 
+// 滚轮缩放的修饰键：取 ZoomWheelMod 的绑定（mods-only），与当前按住的修饰键**严格相等**。
+// 未设置（无）→ 恒 false，滚轮只滚动。用"严格相等"的理由与 chord_pressed 一致：
+// 绑了 Alt 之后按住 Ctrl+Alt 滚轮不该缩放，否则用户无法用 Ctrl+滚轮做别的事。
+bool wheel_zoom_mod_held() {
+    const ImGuiKeyChord want = g_binds[static_cast<int>(Cmd::ZoomWheelMod)][0] & ImGuiMod_Mask_;
+    if (want == 0) return false;
+    const ImGuiIO& io = ImGui::GetIO();
+    int held = 0;
+    if (io.KeyCtrl)  held |= ImGuiMod_Ctrl;
+    if (io.KeyShift) held |= ImGuiMod_Shift;
+    if (io.KeyAlt)   held |= ImGuiMod_Alt;
+    return (held & ImGuiMod_Mask_) == want;
+}
+
 void update_key_capture() {
     if (g_capture_cmd >= kCmdCount) return;
+    // 修饰键型命令不参与捕获（它在界面上是下拉框）；万一被置进来就立刻退出，避免卡住。
+    if (kCmds[g_capture_cmd].mod_only) { g_capture_cmd = kCmdCount; return; }
     // 鼠标点别处 / 右键 → 取消（不写入）。跳过进入捕获的那一次点击所在帧。
     if (g_capture_frame >= 0 && ImGui::GetFrameCount() > g_capture_frame &&
         (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
@@ -797,10 +833,10 @@ void scroll_by_rows(int dir) {
 void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered) {
     ImGuiIO& io = ImGui::GetIO();
 
-    // 滚轮：Ctrl 缩放（以鼠标为不动点），否则滚动。
+    // 滚轮：按住「滚轮缩放」的修饰键（默认 Ctrl，可改）→ 以鼠标为不动点缩放，否则滚动。
     // 两者都进动效层（ADR-047）：滚动进待定量、缩放进插值；关闭动效时即等价于直接改画布。
     if (hovered && io.MouseWheel != 0.0f) {
-        if (io.KeyCtrl) {
+        if (wheel_zoom_mod_held()) {
             zoom_by_animated(std::pow(kZoomStep, io.MouseWheel),
                              io.MousePos.x - origin.x, io.MousePos.y - origin.y);
         } else {

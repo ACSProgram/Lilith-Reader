@@ -393,8 +393,12 @@ inline bool   g_scroll_hover = false;     // 悬停在轨道上（用于高亮�
 inline bool g_open_jump = false;
 inline int  g_jump_page = 1;
 
-// 页面淡入（微动效）：仅在纹理"首次出现"的那一帧从 0 渐显。
-struct PageFade { bool seen = false; float alpha = 1.0f; };
+// 页面淡入（微动效）：**只在"纹理在眼前就绪"时渐显**（占位 → 内容的换入），
+// 页面预加载好之后才滑入视野的**不淡入**（直接显示）—— 否则每次翻页都从透明渐显，
+// 看起来就像"翻到哪才开始加载"（人工反馈）。
+//   seen    ：本页纹理已画过（同一份纹理不重复淡入）
+//   waiting ：本页当前正以占位显示（说明纹理尚未就绪）
+struct PageFade { bool seen = false; bool waiting = false; float alpha = 1.0f; };
 inline std::vector<PageFade> g_page_fade;
 
 // ---- 会话操作 ----
@@ -467,6 +471,9 @@ enum class Cmd : int {
     NextRow, PrevRow, ScrollDown, ScrollUp, PageDown, PageUp, FirstPage, LastPage, JumpPage,
     // 缩放
     ZoomIn, ZoomOut, FitWidth,
+    // 缩放：滚轮缩放的**修饰键**（Ctrl+滚轮那种）。它是"按住不放的键"而不是一条被按下的
+    // 命令，故不参与 cmd_pressed 派发，只由 handle_canvas_input 读取（见 wheel_zoom_mod_held）。
+    ZoomWheelMod,
     // 视图
     Col1, Col2, Col3, Col4, ToggleSpread, RotateCW, ToggleInvert, ToggleSepia,
     // 界面
@@ -485,6 +492,10 @@ struct CmdDef {
     bool          global;  // 是否任何状态都可用（不受"阅读态/画布输入"约束）
     ImGuiKeyChord def0;    // 默认主键（ImGuiKey | ImGuiMod_*）
     ImGuiKeyChord def1;    // 默认备键（ImGuiKey_None = 无）
+    // 修饰键型命令：绑定内容**只是修饰键集合**（ImGuiMod_Ctrl 等，不含主键），
+    // 既不参与 cmd_pressed 派发（那要求"有主键被按下"），也不用"捕获按键"改 ——
+    // 在按键分栏里渲染成下拉框（无 / Ctrl / Alt / Shift / Ctrl+Alt）。
+    bool          mod_only = false;
 };
 
 extern const CmdDef kCmds[kCmdCount];
@@ -502,6 +513,9 @@ void reset_binds_to_default();
 void load_binds();                      // 需在 ImGui 上下文建立后调用（GetKeyName）
 void save_binds();
 bool cmd_pressed(Cmd c);                // 任一槽按下即 true（含修饰键严格匹配）
+// 滚轮缩放的修饰键当前是否按住（严格匹配：绑定 Ctrl 时按住 Ctrl+Shift 不触发）。
+// 未设置（"无"）时恒 false —— 此时滚轮只滚动，不缩放。
+bool wheel_zoom_mod_held();
 bool is_bindable_key(ImGuiKey k);       // 排除修饰键/鼠标/手柄
 std::string chord_label(ImGuiKeyChord c);   // 显示用（"Ctrl+O"）
 std::string chord_to_string(ImGuiKeyChord c);   // ini 存储用（纯 ASCII）
@@ -541,6 +555,11 @@ inline bool g_open_canvas_ctx = false;
 // 顶栏自动隐藏（沉浸阅读）：鼠标离开顶部一段时间后收起，靠近窗口顶端即重现。
 inline bool   g_toolbar_visible = true;
 inline double g_toolbar_idle_since = -1.0;
+// **顶栏自己的弹出菜单**（主菜单 / 缩放档位）开着时钉住顶栏：菜单挂在顶栏按钮下方，
+// 顶栏若在这时滑走，菜单就成了"悬空的菜单"，观感是坏的。
+// 与之相对，**画布上的右键菜单、跳页/密码/确认弹窗一律不钉顶栏** —— 它们是画布/屏幕中央
+// 的操作，把顶栏一并唤醒属于无谓的视觉噪音（人工反馈）。由 ui.cpp 的 draw_top_bar 每帧写。
+inline bool   g_toolbar_pinned = false;
 
 // 自绘滚动指示条：滚动时浮现、静止后渐隐。
 inline float  g_scroll_ind_alpha = 0.0f;
