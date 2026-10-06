@@ -4,9 +4,10 @@
 
 ## 目标特性
 
-- 单文件 exe（/MT 静态链接，MuPDF 静态库，无 DLL/运行时依赖）；当前 **40.0MiB**（41,949,184 字节），
-  其中约 34MB 是 MuPDF 内置的 CJK 兜底字体（思源宋体）——中文文档未内嵌字体时的必需资源，
-  约 1.04MiB 是内嵌的 UI 字体子集；构成与裁剪手段见 [体积预算](docs/05-体积预算.md)
+- 单文件 exe（/MT 静态链接，MuPDF 静态库，无 DLL/运行时依赖）；当前 **38.1MiB**（39,909,888 字节），
+  其中约 30.4MiB 是 MuPDF 内置字体资源（思源宋体 23.7MiB——中文文档未内嵌字体时的必需资源，
+  Noto 各文种 6.1MiB——含数学符号/表情兜底，Base14/西文 0.9MiB），约 1.04MiB 是内嵌的 UI 字体子集；
+  构成与裁剪手段见 [体积预算](docs/05-体积预算.md)
 - `LilithReader.exe <文件路径>` 直接打开，可注册"打开方式"双击关联
 - 支持格式：PDF、EPUB、MOBI、FB2、CBZ、XPS 及常见图片（png/jpg/jpeg/gif/bmp/tif/tiff，
   按单页文档打开；`.webp` 无 MuPDF 解码器，不支持）；识别策略为**内容优先**（扩展名不符时
@@ -91,9 +92,10 @@
 
 - Visual Studio 18 (2026) Community，PlatformToolset v145（MSVC 14.51）
 - vcpkg，manifest 模式，triplet `x64-windows-static`；依赖 `libmupdf` 1.26.10
+  （经 [ADR-072](docs/03-决策记录.md) 的 overlay port 裁剪罕用字体）
 - MSVC `/MT`（静态 CRT）+ `/O2` + `/utf-8`
 - 构建：VS 打开 `LilithReader.slnx` 直接 F5，或命令行运行 `build.bat`
-- 产出：`bin\Release\LilithReader.exe`（约 40 MiB / 41,949,184 字节，静态 CRT，仅依赖系统组件 DLL）
+- 产出：`bin\Release\LilithReader.exe`（约 38 MiB / 39,909,888 字节，静态 CRT，仅依赖系统组件 DLL）
 - **若 MSBuild 报 `MSB6001`（"CL.exe 的命令行开关无效 / 字典中的关键字 "Path"**）：
   这是环境问题而非工程问题 —— 当前进程的环境块里同时有 `Path` 与 `PATH`（大小写重复），
   MSBuild 构造子进程环境时抛异常。用一份清理过重复键的环境启动 MSBuild 即可，`build.bat` 本身无需改。
@@ -113,6 +115,7 @@ triplet 的独立目录可一并消除，故在 `src/LilithReader.vcxproj` 中�
 `<VcpkgInstalledDir>`。**首次克隆后直接 `build.bat` 即可**（vcpkg 会自动装依赖）。
 
 `overlay-ports/gumbo/` 是修正上游归档哈希的覆盖端口（[ADR-011](docs/03-决策记录.md)）；
+`overlay-ports/libmupdf/` 是 libmupdf 的字体裁剪覆盖端口（[ADR-072](docs/03-决策记录.md)）；
 旧 `vcpkg_installed/` 已删除（一直在 `.gitignore` 里，不影响构建）。
 
 ## 安装

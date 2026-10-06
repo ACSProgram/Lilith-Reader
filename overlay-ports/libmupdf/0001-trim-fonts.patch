@@ -1,0 +1,84 @@
+diff --git a/source/fitz/font-table.h b/source/fitz/font-table.h
+index ab79aa7..3a46cbd 100644
+--- a/source/fitz/font-table.h
++++ b/source/fitz/font-table.h
+@@ -89,15 +89,12 @@ ALIAS(noto,	NotoSerif_Regular_otf,	"Noto Serif",	UCDN_SCRIPT_COMMON,	FZ_LANG_UNS
+ ALIAS(noto,	NotoSerif_Regular_otf,	"Noto Serif",	UCDN_SCRIPT_INHERITED,	FZ_LANG_UNSET,	NO_SUBFONT,	REGULAR)
+ ALIAS(noto,	NotoSerif_Regular_otf,	"Noto Serif",	UCDN_SCRIPT_UNKNOWN,	FZ_LANG_UNSET,	NO_SUBFONT,	REGULAR)
+ 
+-FONT(noto,	NotoNastaliqUrdu_Regular_otf,	"Noto Nastaliq Urdu",	UCDN_SCRIPT_ARABIC,	FZ_LANG_ur,	NO_SUBFONT,	REGULAR)
+-ALIAS(noto,	NotoNastaliqUrdu_Regular_otf,	"Noto Nastaliq Urdu",	UCDN_SCRIPT_ARABIC,	FZ_LANG_urd,	NO_SUBFONT,	REGULAR)
+ FONT(noto,	NotoNaskhArabic_Regular_otf,	"Noto Nastaliq Urdu",	UCDN_SCRIPT_ARABIC,	FZ_LANG_UNSET,	NO_SUBFONT,	REGULAR)
+ 
+ #define DEFNOTO(symbol,name,script) FONT(noto, symbol, name, script, FZ_LANG_UNSET, NO_SUBFONT, REGULAR)
+ 
+ DEFNOTO(NotoSansAdlam_Regular_otf,			"Noto Sans Adlam",			UCDN_SCRIPT_ADLAM)
+ DEFNOTO(NotoSerifAhom_Regular_otf,			"Noto Serif Ahom",			UCDN_SCRIPT_AHOM)
+-DEFNOTO(NotoSansAnatolianHieroglyphs_Regular_otf,	"Noto Sans Anatolian Hieroglyphs",	UCDN_SCRIPT_ANATOLIAN_HIEROGLYPHS)
+ DEFNOTO(NotoSerifArmenian_Regular_otf,			"Noto Serif Armenian",			UCDN_SCRIPT_ARMENIAN)
+ DEFNOTO(NotoSansAvestan_Regular_otf,			"Noto Sans Avestan",			UCDN_SCRIPT_AVESTAN)
+ DEFNOTO(NotoSerifBalinese_Regular_otf,			"Noto Serif Balinese",			UCDN_SCRIPT_BALINESE)
+@@ -117,7 +114,6 @@ DEFNOTO(NotoSansCham_Regular_otf,			"Noto Sans Cham",			UCDN_SCRIPT_CHAM)
+ DEFNOTO(NotoSansCherokee_Regular_otf,			"Noto Sans Cherokee",			UCDN_SCRIPT_CHEROKEE)
+ DEFNOTO(NotoSansChorasmian_Regular_otf,			"Noto Sans Chorasmian",			UCDN_SCRIPT_CHORASMIAN)
+ DEFNOTO(NotoSansCoptic_Regular_otf,			"Noto Sans Coptic",			UCDN_SCRIPT_COPTIC)
+-DEFNOTO(NotoSansCuneiform_Regular_otf,			"Noto Sans Cuneiform",			UCDN_SCRIPT_CUNEIFORM)
+ DEFNOTO(NotoSansCypriot_Regular_otf,			"Noto Sans Cypriot",			UCDN_SCRIPT_CYPRIOT)
+ DEFNOTO(NotoSansCyproMinoan_Regular_otf,		"Noto Sans Cypro Minoan",		UCDN_SCRIPT_CYPRO_MINOAN)
+ DEFNOTO(NotoSansDeseret_Regular_otf,			"Noto Sans Deseret",			UCDN_SCRIPT_DESERET)
+@@ -125,14 +121,12 @@ DEFNOTO(NotoSerifDevanagari_Regular_otf,		"Noto Serif Devanagari",		UCDN_SCRIPT_
+ DEFNOTO(NotoSerifDivesAkuru_Regular_otf,		"Noto Serif Dives Akuru",		UCDN_SCRIPT_DIVES_AKURU)
+ DEFNOTO(NotoSerifDogra_Regular_otf,			"Noto Serif Dogra",			UCDN_SCRIPT_DOGRA)
+ DEFNOTO(NotoSansDuployan_Regular_otf,			"Noto Sans Duployan",			UCDN_SCRIPT_DUPLOYAN)
+-DEFNOTO(NotoSansEgyptianHieroglyphs_Regular_otf,	"Noto Sans Egyptian Hieroglyphs",	UCDN_SCRIPT_EGYPTIAN_HIEROGLYPHS)
+ DEFNOTO(NotoSansElbasan_Regular_otf,			"Noto Sans Elbasan",			UCDN_SCRIPT_ELBASAN)
+ DEFNOTO(NotoSansElymaic_Regular_otf,			"Noto Sans Elymaic",			UCDN_SCRIPT_ELYMAIC)
+ DEFNOTO(NotoSerifEthiopic_Regular_otf,			"Noto Serif Ethiopic",			UCDN_SCRIPT_ETHIOPIC)
+ DEFNOTO(NotoSerifGeorgian_Regular_otf,			"Noto Serif Georgian",			UCDN_SCRIPT_GEORGIAN)
+ DEFNOTO(NotoSansGlagolitic_Regular_otf,			"Noto Sans Glagolitic",			UCDN_SCRIPT_GLAGOLITIC)
+ DEFNOTO(NotoSansGothic_Regular_otf,			"Noto Sans Gothic",			UCDN_SCRIPT_GOTHIC)
+-DEFNOTO(NotoSerifGrantha_Regular_otf,			"Noto Serif Grantha",			UCDN_SCRIPT_GRANTHA)
+ DEFNOTO(NotoSerifGujarati_Regular_otf,			"Noto Serif Gujarati",			UCDN_SCRIPT_GUJARATI)
+ DEFNOTO(NotoSansGunjalaGondi_Regular_otf,		"Noto Sans Gunjala Gondi",		UCDN_SCRIPT_GUNJALA_GONDI)
+ DEFNOTO(NotoSerifGurmukhi_Regular_otf,			"Noto Serif Gurmukhi",			UCDN_SCRIPT_GURMUKHI)
+@@ -149,7 +143,6 @@ DEFNOTO(NotoSerifKannada_Regular_otf,			"Noto Serif Kannada",			UCDN_SCRIPT_KANN
+ DEFNOTO(NotoSansKayahLi_Regular_otf,			"Noto Sans Kayah Li",			UCDN_SCRIPT_KAYAH_LI)
+ DEFNOTO(NotoSansKawi_Regular_otf,			"Noto Sans Kawi",			UCDN_SCRIPT_KAWI)
+ DEFNOTO(NotoSansKharoshthi_Regular_otf,			"Noto Sans Kharoshthi",			UCDN_SCRIPT_KHAROSHTHI)
+-DEFNOTO(NotoSerifKhitanSmallScript_Regular_otf,		"Noto Serif Khitan Small Script",	UCDN_SCRIPT_KHITAN_SMALL_SCRIPT)
+ DEFNOTO(NotoSerifKhmer_Regular_otf,			"Noto Serif Khmer",			UCDN_SCRIPT_KHMER)
+ DEFNOTO(NotoSerifKhojki_Regular_otf,			"Noto Serif Khojki",			UCDN_SCRIPT_KHOJKI)
+ DEFNOTO(NotoSansKhudawadi_Regular_otf,			"Noto Sans Khudawadi",			UCDN_SCRIPT_KHUDAWADI)
+@@ -246,11 +239,9 @@ DEFNOTO(NotoSansYi_Regular_otf,				"Noto Sans Yi",				UCDN_SCRIPT_YI)
+ DEFNOTO(NotoSansZanabazarSquare_Regular_otf,		"Noto Sans Zanabazar Square",		UCDN_SCRIPT_ZANABAZAR_SQUARE)
+ 
+ #if NOTO_TANGUT
+-DEFNOTO(NotoSerifTangut_Regular_otf,			"Noto Serif Tangut",			UCDN_SCRIPT_TANGUT)
+ #endif
+ 
+ #if NOTO_SIGNWRITING
+-DEFNOTO(NotoSansSignWriting_Regular_otf,		"Noto Sans SignWriting",		UCDN_SCRIPT_SIGNWRITING)
+ #endif
+ 
+ #undef DEFNOTO
+@@ -297,20 +288,10 @@ ALIAS(han,	SourceHanSerif_Regular_ttc,	"Source Han Serif",		UCDN_SCRIPT_BOPOMOFO
+ 
+ #else
+ 
+-FONT(droid,	DroidSansFallbackFull_ttf,	"Droid Sans Fallback Full",	UCDN_SCRIPT_HAN,	FZ_LANG_UNSET,		0,	REGULAR)
+-ALIAS(droid,	DroidSansFallbackFull_ttf,	"Droid Sans Fallback Full",	UCDN_SCRIPT_HANGUL,	FZ_LANG_UNSET,		0,	REGULAR)
+-ALIAS(droid,	DroidSansFallbackFull_ttf,	"Droid Sans Fallback Full",	UCDN_SCRIPT_HIRAGANA,	FZ_LANG_UNSET,		0,	REGULAR)
+-ALIAS(droid,	DroidSansFallbackFull_ttf,	"Droid Sans Fallback Full",	UCDN_SCRIPT_KATAKANA,	FZ_LANG_UNSET,		0,	REGULAR)
+-ALIAS(droid,	DroidSansFallbackFull_ttf,	"Droid Sans Fallback Full",	UCDN_SCRIPT_BOPOMOFO,	FZ_LANG_UNSET,		0,	REGULAR)
+ 
+ #endif
+ #else
+ 
+-FONT(droid,	DroidSansFallback_ttf,		"Droid Sans Fallback",		UCDN_SCRIPT_HAN,	FZ_LANG_UNSET,		0,	REGULAR)
+-ALIAS(droid,	DroidSansFallback_ttf,		"Droid Sans Fallback",		UCDN_SCRIPT_HANGUL,	FZ_LANG_UNSET,		0,	REGULAR)
+-ALIAS(droid,	DroidSansFallback_ttf,		"Droid Sans Fallback",		UCDN_SCRIPT_HIRAGANA,	FZ_LANG_UNSET,		0,	REGULAR)
+-ALIAS(droid,	DroidSansFallback_ttf,		"Droid Sans Fallback",		UCDN_SCRIPT_KATAKANA,	FZ_LANG_UNSET,		0,	REGULAR)
+-ALIAS(droid,	DroidSansFallback_ttf,		"Droid Sans Fallback",		UCDN_SCRIPT_BOPOMOFO,	FZ_LANG_UNSET,		0,	REGULAR)
+ 
+ #endif
+ #endif
