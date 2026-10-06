@@ -301,7 +301,7 @@ struct UiPrefs {
     bool  auto_hide_toolbar = true;    // [ui] AutoHideToolbar
     bool  motion = true;               // [ui] Motion       页面淡入 / 滚动指示条渐隐
     float gap_percent = kCanvasGapRatio * 100.0f;  // [ui] GapPercent   页面间距（列宽百分比）0~6
-    int   cache_mb = 512;              // [cache] BudgetMB  128~2048
+    int   resource_tier = 1;           // [cache] ResourceTier 0低 / 1中 / 2高
     int   smart_match = kSmartMatchAsk;// [reading] SmartMatch  0 关 / 1 询问 / 2 自动（ADR-062）
 };
 inline UiPrefs g_prefs;

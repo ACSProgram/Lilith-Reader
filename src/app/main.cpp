@@ -188,9 +188,7 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
 
     g_renderer = std::make_unique<lr::Renderer>(g_gfx.device);
 
-    // 页缓存字节预算（ADR-030）：来自 [cache] BudgetMB（设置界面可调）；渲染层再钳制。
-    g_renderer->set_cache_budget(
-        static_cast<std::size_t>(g_prefs.cache_mb) * 1024ull * 1024ull);
+    g_renderer->set_resource_tier(static_cast<lr::ResourceTier>(g_prefs.resource_tier));
 
     g_ui.initialize(g_hwnd);
     load_binds();  // 按键绑定（[keys] 节）：需在 ImGui 上下文建立后（按名反查键码）

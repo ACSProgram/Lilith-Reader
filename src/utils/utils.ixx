@@ -164,7 +164,7 @@ struct WindowState {
 
 inline int read_ini_int(const std::wstring& ini, const wchar_t* key, int fallback);
 
-// 通用 ini 整数读取（指定节）。供 [cache] BudgetMB 与 [window] 等设置项使用。
+// 通用 ini 整数读取（指定节）。供 [cache] ResourceTier 与 [window] 等设置项使用。
 // 缺键/非法值返回 fallback；负数与超范围由调用方钳制。
 inline int read_ini_int_ex(const std::wstring& ini, const wchar_t* section,
                            const wchar_t* key, int fallback) {

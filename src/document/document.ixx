@@ -169,6 +169,15 @@ private:
     Impl* impl_ = nullptr;
 };
 
+// tile 在旋转后输出像素空间中的矩形。x/y 相对于整页输出的左上角。
+// 调度层用它把超大页面拆成有界纹理，避免为整页分配单个巨型 pixmap。
+struct TileRect {
+    int x = 0;
+    int y = 0;
+    int w = 0;
+    int h = 0;
+};
+
 // ---- 页面可交互内容：文本布局 / 嵌入图片 / 链接 ----
 //
 // **坐标空间约定（唯一且贯穿全部接口）**：一律是**未旋转的页面 pt 空间**，即
@@ -281,6 +290,13 @@ public:
                          int rotation_deg = 0,
                          PageScheme scheme = PageScheme::Original) noexcept;
 
+    // 只栅格化整页输出像素空间中的一个 tile。scale 不因整页尺寸被钳低；
+    // max_dimension 仅作为 tile 单边防御上限（0 表示不额外钳制）。
+    DocError render_page_tile(int index, float scale, TileRect tile, PageBitmap& out,
+                              int max_dimension = 0,
+                              int rotation_deg = 0,
+                              PageScheme scheme = PageScheme::Original) noexcept;
+
     // ---- 文本 / 图片 / 链接（Phase 8）----
     //
     // 三者都只在拥有本对象的线程内调用（与 render_page 同一纪律）。
@@ -315,6 +331,9 @@ public:
     [[nodiscard]] std::string_view last_error() const noexcept;
 
 private:
+    DocError render_page_region(int index, float scale, PageBitmap& out,
+                                int max_dimension, int rotation_deg,
+                                PageScheme scheme, const TileRect* tile) noexcept;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

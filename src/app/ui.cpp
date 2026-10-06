@@ -402,7 +402,7 @@ void draw_canvas_area(float height) {
             pmax.y < origin.y || pmin.y > clip_max.y)
             continue;
         const lr::PageSlot s = g_renderer->slot(i);
-        if (s.texture != nullptr) {
+        if (s.texture != nullptr || !s.tiles.empty()) {
             // 页面投影：右下偏移的半透明矩形，给纸面一点立体感
             const float sh = px(3.0f);
             dl->AddRectFilled(ImVec2(pmin.x + sh, pmin.y + sh),
@@ -421,9 +421,21 @@ void draw_canvas_area(float height) {
                 pf.waiting = false;
             }
             const int a = static_cast<int>(std::lround(pf.alpha * 255.0f));
-            dl->AddImage(static_cast<ImTextureID>(reinterpret_cast<std::intptr_t>(s.texture)),
-                         pmin, pmax, ImVec2(0, 0), ImVec2(1, 1),
-                         IM_COL32(255, 255, 255, a));
+            if (!s.tiles.empty() && s.full_pixel_w > 0 && s.full_pixel_h > 0) {
+                for (const lr::PageSlot::Tile& tile : s.tiles) {
+                    const float tx0 = pmin.x + r.w * (static_cast<float>(tile.x) / s.full_pixel_w);
+                    const float ty0 = pmin.y + r.h * (static_cast<float>(tile.y) / s.full_pixel_h);
+                    const float tx1 = pmin.x + r.w * (static_cast<float>(tile.x + tile.w) / s.full_pixel_w);
+                    const float ty1 = pmin.y + r.h * (static_cast<float>(tile.y + tile.h) / s.full_pixel_h);
+                    dl->AddImage(static_cast<ImTextureID>(reinterpret_cast<std::intptr_t>(tile.texture)),
+                                 ImVec2(tx0, ty0), ImVec2(tx1, ty1), ImVec2(0, 0), ImVec2(1, 1),
+                                 IM_COL32(255, 255, 255, a));
+                }
+            } else {
+                dl->AddImage(static_cast<ImTextureID>(reinterpret_cast<std::intptr_t>(s.texture)),
+                             pmin, pmax, ImVec2(0, 0), ImVec2(1, 1),
+                             IM_COL32(255, 255, 255, a));
+            }
             dl->AddRect(pmin, pmax, g_pal.page_border);
         } else {
             // 无纹理：本页正在"眼前等纹理"（waiting）→ 纹理到达时才值得淡入。
@@ -1841,7 +1853,7 @@ void reset_prefs_to_default() {
     g_prefs = UiPrefs{};
     g_user_scale = g_prefs.ui_scale;
     g_apply_scale_pending = true;
-    g_renderer->set_cache_budget(static_cast<std::size_t>(g_prefs.cache_mb) * 1024ull * 1024ull);
+    g_renderer->set_resource_tier(static_cast<lr::ResourceTier>(g_prefs.resource_tier));
     apply_gap_pref();
     save_prefs();
 }
@@ -1923,13 +1935,18 @@ void draw_settings_reading_tab() {
 
 void draw_settings_performance_tab() {
     if (settings_rows_begin("##set_perf")) {
-        settings_row("页缓存预算");
-        if (ImGui::SliderInt("##cache", &g_prefs.cache_mb, 128, 2048, "%d MB")) {
-            g_renderer->set_cache_budget(
-                static_cast<std::size_t>(g_prefs.cache_mb) * 1024ull * 1024ull);
+        settings_row("资源档位");
+        const char* tiers[] = { "低", "中", "高" };
+        if (ImGui::Combo("##resource_tier", &g_prefs.resource_tier, tiers, IM_ARRAYSIZE(tiers))) {
+            g_renderer->set_resource_tier(static_cast<lr::ResourceTier>(g_prefs.resource_tier));
             save_prefs();
         }
-        settings_note("128 ~ 2048 MB");
+        const lr::ResourceProfile profile = g_renderer->resource_profile();
+        char note[96];
+        std::snprintf(note, sizeof note, "缓存 %zu MB · tile %d px · worker %d",
+                      profile.cache_bytes / (1024ull * 1024ull), profile.tile_size_px,
+                      profile.render_workers);
+        settings_note(note);
         settings_rows_end();
     }
 }

@@ -531,13 +531,19 @@ void load_prefs() {
     g_prefs.motion = lr::read_ini_int_ex(g_ini_path, L"ui", L"Motion", 1) != 0;
     g_prefs.gap_percent = std::clamp(
         lr::read_ini_float_ex(g_ini_path, L"ui", L"GapPercent", 1.3f), 0.0f, 6.0f);
-    // 缓存预算的默认值与范围直接取自渲染层的单一真源（page_cache.ixx），不在此另立常量。
-    const int cache_mb_default =
-        static_cast<int>(lr::kCacheBudgetDefault / (1024ull * 1024ull));
-    g_prefs.cache_mb = std::clamp(
-        lr::read_ini_int_ex(g_ini_path, L"cache", L"BudgetMB", cache_mb_default),
-        static_cast<int>(lr::kCacheBudgetMin / (1024ull * 1024ull)),
-        static_cast<int>(lr::kCacheBudgetMax / (1024ull * 1024ull)));
+    // 资源档位是缓存预算、tile 单边和 worker 并发的唯一入口。
+    // 旧版 BudgetMB 只用于一次性兼容映射，避免升级后突然改变用户的资源策略。
+    const int old_mb = lr::read_ini_int_ex(g_ini_path, L"cache", L"BudgetMB", -1);
+    const int old_tier = lr::read_ini_int_ex(g_ini_path, L"cache", L"ResourceTier", -1);
+    if (old_tier >= 0) {
+        g_prefs.resource_tier = std::clamp(old_tier, 0, 2);
+    } else if (old_mb >= 0) {
+        g_prefs.resource_tier = old_mb < 384 ? 0 : (old_mb < 640 ? 1 : 2);
+    } else {
+        g_prefs.resource_tier = 1;
+    }
+    if (old_tier < 0 && old_mb >= 0)
+        lr::write_ini_int(g_ini_path, L"cache", L"ResourceTier", g_prefs.resource_tier);
     g_prefs.smart_match = std::clamp(
         lr::read_ini_int_ex(g_ini_path, L"reading", L"SmartMatch", kSmartMatchAsk),
         kSmartMatchOff, kSmartMatchAuto);
@@ -550,7 +556,7 @@ void save_prefs() {
     lr::write_ini_int(g_ini_path, L"ui", L"AutoHideToolbar", g_prefs.auto_hide_toolbar ? 1 : 0);
     lr::write_ini_int(g_ini_path, L"ui", L"Motion", g_prefs.motion ? 1 : 0);
     lr::write_ini_float(g_ini_path, L"ui", L"GapPercent", g_prefs.gap_percent);
-    lr::write_ini_int(g_ini_path, L"cache", L"BudgetMB", g_prefs.cache_mb);
+    lr::write_ini_int(g_ini_path, L"cache", L"ResourceTier", g_prefs.resource_tier);
     lr::write_ini_int(g_ini_path, L"reading", L"SmartMatch", g_prefs.smart_match);
 }
 

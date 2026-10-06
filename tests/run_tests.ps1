@@ -20,7 +20,8 @@ param(
     [string]$VcpkgRoot = "",
     [string]$Python = "",
     [switch]$Probe,
-    [switch]$NoRegenerate
+    [switch]$NoRegenerate,
+    [switch]$Perf
 )
 
 $ErrorActionPreference = "Stop"
@@ -131,6 +132,13 @@ Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\utils.ifc",
     "/reference", "$out\document.ifc", "/Fo$out\doc_test.obj",
     (Join-Path $tests "doc_test.cpp"))) "编译 doc_test.cpp"
 
+# 性能基线：默认不运行；-Perf 时对生成样本和 Downloads\documents 中的代表性文档
+# 输出稳定的 CSV（QPC + 工作集），不启动阅读器。
+if ($Perf) {
+    Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\document.ifc",
+        "/Fo$out\perf_baseline.obj", (Join-Path $tests "perf_baseline.cpp"))) "编译 perf_baseline.cpp"
+}
+
 # Phase 3：画布是纯布局数学（不依赖 MuPDF），单独编译成 canvas_test.exe
 Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\canvas.ifc", "/Fo$out\canvas.ixx.obj",
     (Join-Path $src "canvas\canvas.ixx"))) "编译 canvas.ixx"
@@ -185,6 +193,10 @@ $libs = @("libmupdf.lib", "freetype.lib", "harfbuzz.lib", "jbig2dec.lib", "jpeg.
 $libdirs = @("/LIBPATH:$lib", "/LIBPATH:$(Join-Path $msvc.FullName 'lib\x64')",
              "/LIBPATH:$(Join-Path $sdkLib $sdkVer)\ucrt\x64",
              "/LIBPATH:$(Join-Path $sdkLib $sdkVer)\um\x64")
+if ($Perf) {
+    Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\perf_baseline.exe", "$out\perf_baseline.obj",
+        "$out\document.obj", "/link", "psapi.lib") + $libdirs + $libs) "链接 perf_baseline.exe"
+}
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\doc_test.exe", "$out\doc_test.obj", "$out\document.obj",
     "/link") + $libdirs + $libs) "链接 doc_test.exe"
 
@@ -232,6 +244,12 @@ try {
 }
 $testExit = $LASTEXITCODE
 Write-Host "  doc_test.exe 退出码 = $testExit"
+
+if ($Perf) {
+    Step "运行性能基线"
+    & "$out\perf_baseline.exe" $samples "C:\Users\ACSProgram\Downloads\documents"
+    if ($LASTEXITCODE -ne 0) { Die "性能基线失败" }
+}
 
 Step "运行画布测试"
 try {

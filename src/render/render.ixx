@@ -63,6 +63,16 @@ struct PageSlot {
     int        pixel_h = 0;
     float      scale = 0.0f;       // 实际使用的渲染倍率（可能因尺寸上限被下调）
     DocError   error = DocError::Ok;
+    int        full_pixel_w = 0;   // tiled 页的整页输出宽度；普通页等于 pixel_w
+    int        full_pixel_h = 0;   // tiled 页的整页输出高度；普通页等于 pixel_h
+    struct Tile {
+        void* texture = nullptr;   // ID3D11ShaderResourceView*，UI 只读
+        int x = 0;                  // 相对于整页输出左上角的像素偏移
+        int y = 0;
+        int w = 0;
+        int h = 0;
+    };
+    std::vector<Tile> tiles;       // 空 = 普通单纹理页；非空 = tile 页
 };
 
 // ---- 文档级状态 ----
@@ -93,6 +103,17 @@ struct CacheStats {
     int         resident_pages = 0;  // 已驻留页数
     int         evictions = 0;       // 自打开文档以来累计逐出页数
 };
+
+enum class ResourceTier : int { Low = 0, Balanced = 1, High = 2 };
+
+struct ResourceProfile {
+    ResourceTier tier = ResourceTier::Balanced;
+    int render_workers = 1;        // MuPDF context 数；不创建额外 D3D device
+    int tile_size_px = 2048;       // 超过此单边才启用 tile
+    std::size_t cache_bytes = kCacheBudgetDefault;
+};
+
+[[nodiscard]] ResourceProfile resource_profile(ResourceTier tier) noexcept;
 
 // ---- 全文搜索状态快照（Phase 8）----
 //
@@ -141,6 +162,12 @@ public:
     // 预算调小会立即触发一次逐出。默认 kCacheBudgetDefault。
     void set_cache_budget(std::size_t bytes);
     [[nodiscard]] CacheStats cache_stats() const;
+
+    // 资源档位同时约束 MuPDF worker 数、tile 单边和默认页缓存预算。
+    // 变更在下一次文档打开或下一批渲染请求生效，不创建新的 D3D device。
+    void set_resource_tier(ResourceTier tier);
+    [[nodiscard]] ResourceTier resource_tier() const;
+    [[nodiscard]] ResourceProfile resource_profile() const;
 
     // 手动重试某页（用户点击失败占位）：重置自动重试计数并重新排队。
     // 页不可见时仅置标记，待其重新进入可见范围后生效。

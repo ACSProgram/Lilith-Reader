@@ -1643,6 +1643,18 @@ DocError Document::search_page(int index, std::string_view utf8_needle, int max_
 DocError Document::render_page(int index, float scale, PageBitmap& out,
                                int max_dimension, int rotation_deg,
                                PageScheme scheme) noexcept {
+    return render_page_region(index, scale, out, max_dimension, rotation_deg, scheme, nullptr);
+}
+
+DocError Document::render_page_tile(int index, float scale, TileRect tile, PageBitmap& out,
+                                    int max_dimension, int rotation_deg,
+                                    PageScheme scheme) noexcept {
+    return render_page_region(index, scale, out, max_dimension, rotation_deg, scheme, &tile);
+}
+
+DocError Document::render_page_region(int index, float scale, PageBitmap& out,
+                                      int max_dimension, int rotation_deg,
+                                      PageScheme scheme, const TileRect* tile) noexcept {
     out.reset();
     if (!impl_ || !impl_->doc || !impl_->ctx) return DocError::NotOpen;
     if (index < 0 || !(scale > 0.0f)) return DocError::Internal;
@@ -1677,11 +1689,35 @@ DocError Document::render_page(int index, float scale, PageBitmap& out,
         // 尺寸钳制按**旋转后**包围盒：90/270 时宽高互换。若按未旋转的 bounds 钳制，
         // 一张 8000×100 的横幅旋转后会得到 8000 高，仍然爆内存。
         const fz_rect rotated = fz_transform_rect(bounds, fz_rotate(static_cast<float>(rot)));
-        used = clamp_scale(rotated, scale, max_dimension);
+        // tile 模式按请求倍率渲染；只为当前 tile 分配 pixmap，不能按整页尺寸把倍率压低。
+        used = tile ? scale : clamp_scale(rotated, scale, max_dimension);
 
         // 旋转与缩放都是线性变换，且缩放是等比的（标量×单位矩阵）⇒ 二者可交换，顺序无关。
         const fz_matrix ctm = fz_pre_rotate(fz_scale(used, used), static_cast<float>(rot));
-        const fz_irect  bbox = fz_round_rect(fz_transform_rect(bounds, ctm));
+        const fz_irect  full_bbox = fz_round_rect(fz_transform_rect(bounds, ctm));
+        fz_irect bbox = full_bbox;
+        if (tile) {
+            int tx = tile->x;
+            int ty = tile->y;
+            int tw = tile->w;
+            int th = tile->h;
+            if (max_dimension > 0 && tw > max_dimension) tw = max_dimension;
+            if (max_dimension > 0 && th > max_dimension) th = max_dimension;
+            if (tx < 0) tx = 0;
+            if (ty < 0) ty = 0;
+            if (tw < 1) tw = 1;
+            if (th < 1) th = 1;
+            const int full_w = full_bbox.x1 - full_bbox.x0;
+            const int full_h = full_bbox.y1 - full_bbox.y0;
+            if (tx > full_w - 1) tx = full_w - 1;
+            if (ty > full_h - 1) ty = full_h - 1;
+            if (tx + tw > full_w) tw = full_w - tx;
+            if (ty + th > full_h) th = full_h - ty;
+            bbox.x0 = full_bbox.x0 + tx;
+            bbox.y0 = full_bbox.y0 + ty;
+            bbox.x1 = bbox.x0 + tw;
+            bbox.y1 = bbox.y0 + th;
+        }
 
         // RGB + alpha ⇒ 4 分量 RGBA8，可直接上传 DXGI_FORMAT_R8G8B8A8_UNORM
         pix = fz_new_pixmap_with_bbox(s.ctx, fz_device_rgb(s.ctx), bbox, nullptr, 1);

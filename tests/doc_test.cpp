@@ -529,6 +529,14 @@ void run_render_cases(const std::wstring& dir) {
     else fail("real.pdf", "深色保留 alpha=255", "alpha 被改");
     if (pe[0] > pe[2]) pass("real.pdf", "暖色：背景为暖色（R>B）");
     else fail("real.pdf", "暖色：背景为暖色（R>B）", "像素不符");
+
+    lr::PageBitmap tile;
+    const lr::TileRect tr{ 0, 0, 64, 96 };
+    if (doc.render_page_tile(0, 1.0f, tr, tile, 128) == lr::DocError::Ok &&
+        tile.width() == 64 && tile.height() == 96)
+        pass("real.pdf", "tile 渲染尺寸与请求一致");
+    else
+        fail("real.pdf", "tile 渲染尺寸与请求一致", "tile 输出尺寸不符");
 }
 
 // 取位图某点的 RGB（越界或无效位图返回全 0）。

@@ -43,6 +43,19 @@ import lilithreader.page_cache;
 import lilithreader.utils;   // file_fingerprint（ADR-062）
 
 namespace lr {
+
+ResourceProfile resource_profile(ResourceTier tier) noexcept {
+    switch (tier) {
+    case ResourceTier::Low:
+        return { ResourceTier::Low, 1, 1536, 256u << 20 };
+    case ResourceTier::High:
+        return { ResourceTier::High, 3, 2560, 768u << 20 };
+    case ResourceTier::Balanced:
+    default:
+        return { ResourceTier::Balanced, 2, 2048, kCacheBudgetDefault };
+    }
+}
+
 namespace {
 
 // 用 MuPDF 的 RGBA8 缓冲直接建纹理：IMMUTABLE + 初始数据，一次调用完成上传。
@@ -144,6 +157,8 @@ struct Renderer::Impl {
     std::size_t         budget_bytes = kCacheBudgetDefault;   // 字节预算
     std::uint64_t       use_tick = 0;                         // LRU 时钟
     int                 evictions = 0;                        // 累计逐出页数
+    ResourceTier        tier = ResourceTier::Balanced;
+    ResourceProfile     profile = lr::resource_profile(ResourceTier::Balanced);
 
     // ---- 视图变换（Phase 5）----
     // 全局（文档级）的旋转与配色：渲染每一页时传给 Document::render_page。
@@ -223,9 +238,15 @@ struct Renderer::Impl {
         cv.notify_all();
         if (worker.joinable()) worker.join();
         std::lock_guard lock(mtx);
-        for (Entry& e : pages) release_srv(e.slot.texture);
+        for (Entry& e : pages) {
+            release_srv(e.slot.texture);
+            for (const PageSlot::Tile& t : e.slot.tiles) release_srv(t.texture);
+        }
         pages.clear();
-        for (Entry& e : thumbs) release_srv(e.slot.texture);
+        for (Entry& e : thumbs) {
+            release_srv(e.slot.texture);
+            for (const PageSlot::Tile& t : e.slot.tiles) release_srv(t.texture);
+        }
         thumbs.clear();
         for (void* p : retired_pending) release_srv(p);
         for (void* p : retired_ready) release_srv(p);
@@ -248,12 +269,17 @@ struct Renderer::Impl {
             retired_pending.push_back(e.slot.texture);
             e.slot.texture = nullptr;
         }
+        for (const PageSlot::Tile& t : e.slot.tiles)
+            if (t.texture) retired_pending.push_back(t.texture);
+        e.slot.tiles.clear();
         if (e.bytes) {
             used_bytes = used_bytes >= e.bytes ? used_bytes - e.bytes : 0;
             e.bytes = 0;
         }
         e.slot.pixel_w = 0;
         e.slot.pixel_h = 0;
+        e.slot.full_pixel_w = 0;
+        e.slot.full_pixel_h = 0;
         e.slot.scale = 0.0f;
     }
 
@@ -276,6 +302,8 @@ struct Renderer::Impl {
         }
         e.slot.pixel_w = 0;
         e.slot.pixel_h = 0;
+        e.slot.full_pixel_w = 0;
+        e.slot.full_pixel_h = 0;
         e.slot.scale = 0.0f;
     }
 
@@ -668,6 +696,10 @@ struct Renderer::Impl {
 
     // 渲染单页。失败时自动重试至多 kMaxAutoRetries 次，仍失败则定格为 Failed
     // （等待 UI 点击重试，见 retry_page）。加载/重试期间**保留旧纹理**（ADR-024）。
+    struct BuiltTile {
+        PageSlot::Tile view;
+    };
+
     void render_one(int page, float scale) {
         {
             std::lock_guard lock(mtx);
@@ -690,6 +722,31 @@ struct Renderer::Impl {
             // 只改状态，绝不动 texture/scale —— 重渲染期间 UI 继续显示旧纹理，不闪白。
             e.slot.status = PageStatus::Loading;
             e.slot.error = DocError::Ok;
+        }
+
+        // 超过档位 tile 单边时，按整页输出像素拆分。每次只在 MuPDF 中保留一个
+        // tile pixmap，避免巨型页面先分配完整 RGBA 缓冲；上传仍在本工作线程完成。
+        int full_w = 0;
+        int full_h = 0;
+        if (page >= 0 && static_cast<std::size_t>(page) < info_.page_sizes.size()) {
+            const PageSize ps = info_.page_sizes[static_cast<std::size_t>(page)];
+            const bool swap = (rotation_ % 180) != 0;
+            const double pw = std::max(0.0, static_cast<double>(ps.width_pt) * scale);
+            const double ph = std::max(0.0, static_cast<double>(ps.height_pt) * scale);
+            const double fw = swap ? ph : pw;
+            const double fh = swap ? pw : ph;
+            full_w = fw > 2147483000.0 ? 2147483000 : static_cast<int>(std::lround(fw));
+            full_h = fh > 2147483000.0 ? 2147483000 : static_cast<int>(std::lround(fh));
+        } else if (info_.page_sizes.empty()) {
+            const bool swap = (rotation_ % 180) != 0;
+            const double pw = std::max(0.0, static_cast<double>(info_.page_width_pt) * scale);
+            const double ph = std::max(0.0, static_cast<double>(info_.page_height_pt) * scale);
+            full_w = static_cast<int>(std::lround(swap ? ph : pw));
+            full_h = static_cast<int>(std::lround(swap ? pw : ph));
+        }
+        if (full_w > profile.tile_size_px || full_h > profile.tile_size_px) {
+            render_one_tiled(page, scale, full_w, full_h);
+            return;
         }
 
         for (;;) {
@@ -725,6 +782,61 @@ struct Renderer::Impl {
         }
     }
 
+    void render_one_tiled(int page, float scale, int full_w, int full_h) {
+        const int tile_size = std::max(256, profile.tile_size_px);
+        if (full_w <= 0 || full_h <= 0) {
+            mark_failed(page, DocError::Internal, scale);
+            return;
+        }
+        for (;;) {
+            std::vector<BuiltTile> built;
+            DocError failure = DocError::Ok;
+            for (int y = 0; y < full_h && failure == DocError::Ok; y += tile_size) {
+                for (int x = 0; x < full_w; x += tile_size) {
+                    TileRect r;
+                    r.x = x; r.y = y;
+                    r.w = std::min(tile_size, full_w - x);
+                    r.h = std::min(tile_size, full_h - y);
+                    PageBitmap bmp;
+                    const DocError err = doc_engine.render_page_tile(
+                        page, scale, r, bmp, tile_size, rotation_,
+                        static_cast<PageScheme>(scheme_));
+                    if (err != DocError::Ok) { failure = err; break; }
+                    ID3D11ShaderResourceView* srv = nullptr;
+                    if (!create_page_texture(device, bmp.samples(), bmp.width(), bmp.height(),
+                                             bmp.stride(), &srv)) {
+                        failure = DocError::Internal;
+                        break;
+                    }
+                    BuiltTile t;
+                    t.view.texture = srv;
+                    t.view.x = x; t.view.y = y;
+                    t.view.w = bmp.width(); t.view.h = bmp.height();
+                    built.push_back(std::move(t));
+                }
+            }
+            if (failure == DocError::Ok) {
+                publish_loaded_tiles(page, scale, full_w, full_h, std::move(built));
+                return;
+            }
+            for (BuiltTile& t : built) {
+                if (t.view.texture) {
+                    static_cast<ID3D11ShaderResourceView*>(t.view.texture)->Release();
+                    t.view.texture = nullptr;
+                }
+            }
+            bool again = false;
+            {
+                std::lock_guard lock(mtx);
+                if (page >= 0 && static_cast<std::size_t>(page) < pages.size()) {
+                    Entry& e = pages[static_cast<std::size_t>(page)];
+                    if (e.auto_retries < kMaxAutoRetries) { ++e.auto_retries; again = true; }
+                }
+            }
+            if (!again) { mark_failed(page, failure, scale); return; }
+        }
+    }
+
     void publish_loaded(int page, ID3D11ShaderResourceView* srv, const PageBitmap& bmp) {
         const std::size_t bytes =
             static_cast<std::size_t>(bmp.width()) * static_cast<std::size_t>(bmp.height()) * 4u;
@@ -734,6 +846,8 @@ struct Renderer::Impl {
         loaded.texture = srv;
         loaded.pixel_w = bmp.width();
         loaded.pixel_h = bmp.height();
+        loaded.full_pixel_w = bmp.width();
+        loaded.full_pixel_h = bmp.height();
         loaded.scale = bmp.effective_scale();
 
         std::lock_guard lock(mtx);
@@ -744,6 +858,40 @@ struct Renderer::Impl {
         Entry& e = pages[static_cast<std::size_t>(page)];
         retire_entry_locked(e);  // 旧纹理入退役队列（由 UI 帧首释放）
         e.slot = loaded;
+        e.bytes = bytes;
+        e.auto_retries = 0;
+        e.manual_retry = false;
+        e.failed_scale = -1.0f;
+        e.stale = false;
+        used_bytes += bytes;
+    }
+
+    void publish_loaded_tiles(int page, float requested_scale, int full_w, int full_h,
+                              std::vector<BuiltTile> built) {
+        std::size_t bytes = 0;
+        PageSlot loaded;
+        loaded.status = PageStatus::Loaded;
+        loaded.scale = requested_scale;
+        loaded.full_pixel_w = full_w;
+        loaded.full_pixel_h = full_h;
+        loaded.tiles.reserve(built.size());
+        for (BuiltTile& t : built) {
+            bytes += static_cast<std::size_t>(t.view.w) * static_cast<std::size_t>(t.view.h) * 4u;
+            loaded.tiles.push_back(t.view);
+            t.view.texture = nullptr; // ownership moved into the published slot
+        }
+        if (!loaded.tiles.empty()) {
+            loaded.pixel_w = loaded.tiles.front().w;
+            loaded.pixel_h = loaded.tiles.front().h;
+        }
+        std::lock_guard lock(mtx);
+        if (page < 0 || static_cast<std::size_t>(page) >= pages.size()) {
+            for (const PageSlot::Tile& t : loaded.tiles) if (t.texture) retired_pending.push_back(t.texture);
+            return;
+        }
+        Entry& e = pages[static_cast<std::size_t>(page)];
+        retire_entry_locked(e);
+        e.slot = std::move(loaded);
         e.bytes = bytes;
         e.auto_retries = 0;
         e.manual_retry = false;
@@ -953,6 +1101,32 @@ void Renderer::set_cache_budget(std::size_t bytes) {
         impl_->wants_dirty = true;
         impl_->cv.notify_all();
     }
+}
+
+void Renderer::set_resource_tier(ResourceTier tier) {
+    if (!impl_) return;
+    const ResourceProfile p = lr::resource_profile(tier);
+    std::lock_guard lock(impl_->mtx);
+    impl_->tier = tier;
+    impl_->profile = p;
+    impl_->budget_bytes = clamp_cache_budget(p.cache_bytes);
+    if (!impl_->last_wants.empty()) {
+        impl_->wants = impl_->last_wants;
+        impl_->wants_dirty = true;
+        impl_->cv.notify_all();
+    }
+}
+
+ResourceTier Renderer::resource_tier() const {
+    if (!impl_) return ResourceTier::Balanced;
+    std::lock_guard lock(impl_->mtx);
+    return impl_->tier;
+}
+
+ResourceProfile Renderer::resource_profile() const {
+    if (!impl_) return lr::resource_profile(ResourceTier::Balanced);
+    std::lock_guard lock(impl_->mtx);
+    return impl_->profile;
 }
 
 CacheStats Renderer::cache_stats() const {
