@@ -48,7 +48,7 @@ struct DocRecord {
     int   rotation = 0;       // 0/90/180/270
     bool  fit_width = true;   // 是否 fit-width 模式
     bool  spread = false;     // 双页对开（书籍模式）
-    int   scheme = 0;     // 纸张方案：0 原色 / 1 深色 / 2 暖色（lr::PageScheme）
+    int   scheme = 0;     // 纸张方案：0 原色 / 1 深色纸张 / 2 暖色（lr::PageScheme）
     std::vector<Bookmark> bookmarks;
 
     // ---- 身份（ADR-062 / ADR-065）----

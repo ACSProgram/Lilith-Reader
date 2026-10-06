@@ -39,10 +39,19 @@ constexpr float  kToolbarRevealBandPx = 4.0f;  // 距窗口顶端多少像素内
 constexpr float  kPageFadeSec = 0.18f;         // 页面首次出现淡入时长
 constexpr double kScrollIndHoldSec = 1.2;      // 滚动指示条静止后渐隐的等待
 
+constexpr const char* kThemeNames[] = { "跟随系统", "浅色", "深色" };
+constexpr const char* kPageSchemeNames[] = { "原色", "深色纸张", "暖色" };
+
+const char* page_scheme_name(int scheme) {
+    return (scheme >= 0 && scheme < static_cast<int>(IM_ARRAYSIZE(kPageSchemeNames)))
+               ? kPageSchemeNames[scheme]
+               : kPageSchemeNames[0];
+}
+
 // ---------------- 引导 / 状态页 ----------------
 
 // 引导页文字颜色**必须随主题**：早期写死浅色，浅色主题下几乎看不见（已修）。
-// 还要**随纸张方案**（tone_apply）：状态页画在画布底色上，不跟着走就会在暖色/深色下
+// 还要**随纸张方案**（tone_apply）：状态页画在画布底色上，不跟着走就会在暖色/深色纸张下
 // 留下一块纯中性灰的字（ADR-068 统一走同一处派生）。
 ImVec4 col_text()   { return tone_apply(g_dark_theme ? ImVec4(0.90f, 0.91f, 0.93f, 1.0f)
                                                      : ImVec4(0.15f, 0.17f, 0.20f, 1.0f)); }
@@ -498,8 +507,7 @@ void draw_status_bar() {
     if (g_canvas.state().spread) chip("对开");
     else if (g_canvas.state().columns > 1) chip("%d 列", g_canvas.state().columns);
     if (g_rotation != 0) chip("旋转 %d°", g_rotation);
-    if (g_scheme == 1) chip("深色");
-    else if (g_scheme == 2) chip("暖色");
+    if (g_scheme != 0) chip("%s", page_scheme_name(g_scheme));
     if (current_page_has_bookmark()) chip("已加书签");
 
     // 操作提示（Phase 8）：居中显示"已复制 / 此处没有图片"这类一次性反馈。
@@ -824,8 +832,7 @@ void draw_sidebar(float height, float width) {
 // 也不会遮挡正文。中文输入由既有的输入法关联切换自动支持（ADR-028/040）。
 void draw_search_tab() {
     // 输入框：**改字即取消旧查询，停手 kSearchDebounceSec 后自动检索**（防抖）。
-    // 回车与「搜索」按钮是"不等防抖、立刻检索"的快捷路；「停止」让长检索收手。
-    // 为什么必须有「停止」：此前只能"把关键字删掉再按一次搜索"才能中断，是反直觉的操作。
+    // 回车与「搜索」按钮是"不等防抖、立刻检索"的快捷路；「取消」清掉本次查询。
     if (g_search_focus) {
         ImGui::SetKeyboardFocusHere();
         g_search_focus = false;
@@ -837,18 +844,17 @@ void draw_search_tab() {
     const float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
     const bool click = ImGui::Button("搜索", ImVec2(bw, 0.0f));
     ImGui::SameLine();
-    // 「停止」只在"有检索在跑"或"防抖计时中"时可用：其余时候置灰，避免用户误以为点了没反应。
-    ImGui::BeginDisabled(!(g_search_active || g_search_pending));
-    const bool stop = ImGui::Button("停止", ImVec2(bw, 0.0f));
+    const bool can_cancel = search_has_query() || g_search_active || g_search_pending || !g_search_hits.empty();
+    ImGui::BeginDisabled(!can_cancel);
+    const bool cancel = ImGui::Button("取消", ImVec2(bw, 0.0f));
     ImGui::EndDisabled();
     if (enter || click) {
         search_start();
         g_search_focus = true;   // 保持焦点，方便连续改词
     }
-    if (stop) search_stop();
+    if (cancel) search_cancel();
 
     const int n = static_cast<int>(g_search_hits.size());
-    // "扫完"与"中途停下"必须分开说：停下时若也写"共 N 处"，用户会以为全文只有这么多命中。
     const bool scanned_all = (g_search_scanned >= g_search_total);
     if (!search_has_query()) {
         ImGui::TextDisabled("在全文范围内查找文字");
@@ -858,17 +864,11 @@ void draw_search_tab() {
         ImGui::TextDisabled("检索中… %d / %d 页 · 已找到 %d 处",
                             g_search_scanned, g_search_total, n);
     } else if (n == 0) {
-        if (scanned_all)
-            ImGui::TextDisabled("没有找到「%s」", g_search_buf);
-        else
-            ImGui::TextDisabled("已停止 · 已扫描 %d / %d 页 · 未找到",
-                                g_search_scanned, g_search_total);
+        ImGui::TextDisabled("没有找到「%s」", g_search_buf);
     } else {
-        if (scanned_all)
-            ImGui::TextDisabled("共 %d 处", n);
-        else
-            ImGui::TextDisabled("已停止 · 已扫描 %d / %d 页 · 已找到 %d 处",
-                                g_search_scanned, g_search_total, n);
+        if (scanned_all) ImGui::TextDisabled("共 %d 处", n);
+        else ImGui::TextDisabled("检索中… %d / %d 页 · 已找到 %d 处",
+                                 g_search_scanned, g_search_total, n);
         if (g_search_truncated) {
             ImGui::SameLine();
             ImGui::TextDisabled("（已达上限）");
@@ -1048,6 +1048,14 @@ void zoom_set(float z) {
     zoom_to_animated(z, g_canvas.viewport_w() * 0.5f, g_canvas.viewport_h() * 0.5f);
 }
 
+// 界面主题是全局偏好；菜单与设置页共用这一入口，避免一处保存而另一处漏保存。
+void set_theme_pref(int theme) {
+    theme = std::clamp(theme, 0, 2);
+    if (g_prefs.theme == theme) return;
+    g_prefs.theme = theme;
+    save_prefs();  // 下一帧 sync_theme 生效（不在帧中途改样式）
+}
+
 // 页面间距（设置项）变更后立即下发；会失效布局缓存，故只在真正变化时调用。
 void apply_gap_pref() {
     g_canvas.set_margin_gap(px(kCanvasMarginPx), gap_ratio_pref());
@@ -1067,6 +1075,21 @@ void draw_zoom_menu_contents() {
         std::snprintf(lab, sizeof lab, "%d%%", p);
         if (ImGui::MenuItem(lab)) zoom_set(static_cast<float>(p) / 100.0f);
     }
+}
+
+void draw_appearance_menu_contents(bool reading) {
+    ImGui::SeparatorText("界面（全局）");
+    for (int i = 0; i < static_cast<int>(IM_ARRAYSIZE(kThemeNames)); ++i) {
+        if (ImGui::MenuItem(kThemeNames[i], nullptr, g_prefs.theme == i, true))
+            set_theme_pref(i);
+    }
+
+    ImGui::SeparatorText("纸张（本书）");
+    const std::string si = chord_label(g_binds[static_cast<int>(Cmd::ToggleDark)][0]);
+    const std::string se = chord_label(g_binds[static_cast<int>(Cmd::ToggleWarm)][0]);
+    if (ImGui::MenuItem(kPageSchemeNames[0], nullptr, g_scheme == 0, reading)) set_scheme(0);
+    if (ImGui::MenuItem(kPageSchemeNames[1], si.c_str(), g_scheme == 1, reading)) set_scheme(1);
+    if (ImGui::MenuItem(kPageSchemeNames[2], se.c_str(), g_scheme == 2, reading)) set_scheme(2);
 }
 
 void draw_view_menu_contents() {
@@ -1102,12 +1125,8 @@ void draw_view_menu_contents() {
         }
         ImGui::EndMenu();
     }
-    if (ImGui::BeginMenu(with_icon(kIcPalette, "配色").c_str(), rd)) {
-        if (ImGui::MenuItem("原色", nullptr, g_scheme == 0)) set_scheme(0);
-        const std::string si = chord_label(g_binds[static_cast<int>(Cmd::ToggleDark)][0]);
-        const std::string se = chord_label(g_binds[static_cast<int>(Cmd::ToggleWarm)][0]);
-        if (ImGui::MenuItem("深色", si.c_str(), g_scheme == 1)) set_scheme(1);
-        if (ImGui::MenuItem("暖色", se.c_str(), g_scheme == 2)) set_scheme(2);
+    if (ImGui::BeginMenu(with_icon(kIcPalette, "外观").c_str(), rd)) {
+        draw_appearance_menu_contents(rd);
         ImGui::EndMenu();
     }
     ImGui::Separator();
@@ -1138,7 +1157,8 @@ void draw_main_menu_contents() {
     if (menu_item_cmd(kIcOpenFile, "打开文档…", Cmd::OpenFile)) g_request_open_dialog = true;
     if (menu_item(kIcClose, "关闭文档", nullptr, false, has_doc)) close_document();
     ImGui::Separator();
-    if (ImGui::BeginMenu(with_icon(kIcDoc, "视图").c_str(), rd)) {
+    // 视图菜单里包含全局外观设置；无文档时仍可打开它，纸张项会单独置灰。
+    if (ImGui::BeginMenu(with_icon(kIcDoc, "视图").c_str())) {
         draw_view_menu_contents(); ImGui::EndMenu();
     }
     if (ImGui::BeginMenu(with_icon(kIcNext, "导航").c_str(), rd)) {
@@ -1894,10 +1914,22 @@ void draw_settings_interface_tab() {
         }
         settings_note("80% ~ 150%");
 
-        settings_row("主题");
-        const char* themes[] = { "跟随系统", "浅色", "深色" };
-        if (ImGui::Combo("##theme", &g_prefs.theme, themes, IM_ARRAYSIZE(themes)))
-            save_prefs();   // 下一帧 sync_theme 生效（不在帧中途改配色）
+        settings_row("界面主题");
+        int theme = g_prefs.theme;
+        if (ImGui::Combo("##theme", &theme, kThemeNames, IM_ARRAYSIZE(kThemeNames)))
+            set_theme_pref(theme);
+
+        settings_row("纸张方案");
+        const bool reading = g_doc.kind == UiDoc::Kind::Reading;
+        int cm = g_scheme;
+        ImGui::BeginDisabled(!reading);
+        if (ImGui::Combo("##scheme", &cm, kPageSchemeNames, IM_ARRAYSIZE(kPageSchemeNames)))
+            set_scheme(cm);
+        ImGui::EndDisabled();
+        settings_note(reading ? "随当前文档记忆" : "打开文档后可用");
+
+        settings_row("联动规则");
+        ImGui::TextWrapped("仅“跟随系统”时，深色纸张会额外启用深色界面；手动选浅色或深色则固定明暗。纸张方案随当前文档记忆，并协调界面色调。");
 
         settings_row("顶栏自动隐藏");
         if (ImGui::Checkbox("##autohide", &g_prefs.auto_hide_toolbar)) {
@@ -1924,11 +1956,6 @@ void draw_settings_reading_tab() {
         }
         settings_note("页与页之间的留白比例");
 
-        settings_row("纸张方案");
-        const char* schemes[] = { "原色", "深色", "暖色" };
-        int cm = g_scheme;
-        if (ImGui::Combo("##scheme", &cm, schemes, IM_ARRAYSIZE(schemes))) set_scheme(cm);
-        settings_note("只改页面；照片与插图保持原色。快捷键见「按键」分栏");
         settings_rows_end();
     }
 }
@@ -1943,10 +1970,12 @@ void draw_settings_performance_tab() {
         }
         const lr::ResourceProfile profile = g_renderer->resource_profile();
         char note[96];
-        std::snprintf(note, sizeof note, "缓存 %zu MB · tile %d px · worker %d",
-                      profile.cache_bytes / (1024ull * 1024ull), profile.tile_size_px,
-                      profile.render_workers);
-        settings_note(note);
+        std::snprintf(note, sizeof note, "缓存上限 %zu MB · tile %d px",
+                      profile.cache_bytes / (1024ull * 1024ull), profile.tile_size_px);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim), "%s", note);
+        ImGui::SetItemTooltip("缓存按需占用，不会启动时一次性分配；只保留当前页和预加载页，超出上限按最近使用顺序逐出。\n当前渲染队列使用单个 MuPDF worker。\n低 / 中 / 高：256 / 512 / 768 MB。\n大页面 tile 单边：1536 / 2048 / 2560 px。");
         settings_rows_end();
     }
 }

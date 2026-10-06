@@ -167,14 +167,14 @@ bool system_prefers_dark_cached() {
 // 三套方案 = 三份 Tone。**原色是 inactive 的**：一个通道都不动 —— 它是用户认可的基准，
 // 任何"顺手调一下"都是回归（tests/tone_test.cpp 里有逐通道断言钉着）。
 //
-// 深色/暖色则把中性表面族旋到**页面纸色所在的色相**上，两边同族 —— "页面暖、周围冷"
+// 深色纸张/暖色则把中性表面族旋到**页面纸色所在的色相**上，两边同族 —— "页面暖、周围冷"
 // 从结构上不再可能发生。强调色与语义色各有归属，规则与理由见 tone.h。
 namespace {
 
 constexpr Tone kToneOriginal{ false, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, {} };
 
 // 深色纸：#1F1D1B（hue 30）—— 纸面本身是暖黑，chrome 取同色相但**饱和度压得很低**：
-// 深色主题的"暖"极易过量，因为文字面积小、对比强，一丁点色相在亮色上就非常显眼
+// 深色纸张对应的 chrome 的"暖"极易过量，因为文字面积小、对比强，一丁点色相在亮色上就非常显眼
 // （sat 0.22 时正文会被染成 #EFD7C1 那样的奶油色，整屏就"变成暖深色"了）。
 // 暖意只留在强调色上，中性族基本保持中性。
 constexpr Tone kToneDarkPage{ true, 29.0f, 0.08f, 1.00f, 1.00f, 0.25f,
@@ -309,14 +309,15 @@ void apply_theme_colors() {
 // 依据「界面主题 + 纸张方案」决定 chrome 的明暗与色调；只在需要时真正改动。
 //
 // 两个维度的分工（ADR-067/068）：
-//   · 明暗来自**界面主题**（用户偏好），唯一例外是「深色」纸张方案 —— 页面已经是深纸，
-//     四周留亮边反而更累眼，故强制深色 chrome（沿用 ADR-043 的判断）；
+//   · 明暗来自**界面主题**（用户偏好）。只有在主题为「跟随系统」时，「深色纸张」才会
+//     额外令 chrome 变暗；用户显式选浅色/深色后，文档状态不能覆盖这个决定；
 //   · 色调来自**纸张方案**：中性表面族旋到与纸面同色相，强调色换成该方案的强调色。
 // 这样"页面暖、周围冷""页面暖、按钮冷"两个不协调从源头消失 —— 两侧走同一条映射。
 void sync_theme(int scheme) {
+    const bool follows_system = g_prefs.theme == 0;
     const bool want_dark = (g_prefs.theme == 2) ||
-                           (g_prefs.theme == 0 && system_prefers_dark_cached()) ||
-                           (scheme == 1);   // 深色纸张方案强制深色 chrome
+                           (follows_system &&
+                            (system_prefers_dark_cached() || scheme == 1));
     const Tone& want_tone = (scheme == 1) ? kToneDarkPage
                           : (scheme == 2) ? kToneWarmPage
                                           : kToneOriginal;

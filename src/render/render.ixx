@@ -17,7 +17,7 @@
 //      （架构文档 §3.3，ADR-019/033）。
 //   4. **缓存**：按**字节预算**的 LRU 逐出（默认 512MiB，可设 128MiB~2GiB）。
 //      逐出策略本身是纯函数，单独放在 lilithreader.page_cache 里可单测（ADR-030）。
-//   5. **视图变换**（Phase 5）：旋转（0/90/180/270）与纸张方案（原色/深色/暖色）为
+//   5. **视图变换**（Phase 5）：旋转（0/90/180/270）与纸张方案（原色/深色纸张/暖色）为
 //      文档级视图状态；变化即让全部纹理失效并整篇重渲（变换已固化进像素）。
 //   6. **缩略图通道**（Phase 5）：侧栏用的低 DPI 缩略图，独立缓存、不占页缓存预算。
 //
@@ -108,7 +108,6 @@ enum class ResourceTier : int { Low = 0, Balanced = 1, High = 2 };
 
 struct ResourceProfile {
     ResourceTier tier = ResourceTier::Balanced;
-    int render_workers = 1;        // MuPDF context 数；不创建额外 D3D device
     int tile_size_px = 2048;       // 超过此单边才启用 tile
     std::size_t cache_bytes = kCacheBudgetDefault;
 };
@@ -216,10 +215,6 @@ public:
     // 发起一次全文检索（UTF-8 关键字；空串 = 取消）。会取消上一次仍在跑的检索。
     void start_search(std::string utf8_needle);
     void cancel_search();
-    // 停止在途检索，但**保留**已扫描进度与已找到的命中（UI「停止」按钮）。
-    // 与 cancel_search 的分工：cancel 是"作废"（换关键字 / 换文档，进度与结果都不要了），
-    // stop 是"收手"（用户不想再等，但已找到的结果还要能看、能跳）。
-    void stop_search();
     [[nodiscard]] SearchStatus search_status() const;
     // 把自上次调用以来**新增**的命中追加到 out 尾部（不覆盖已有内容）。
     void take_search_hits(std::vector<SearchHit>& out);

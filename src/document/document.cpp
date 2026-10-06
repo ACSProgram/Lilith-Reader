@@ -163,7 +163,7 @@ float clamp_scale(fz_rect bounds, float scale, int max_dimension) noexcept {
 // 配色变换 = 一张逐通道 LUT，**只作用于"纸墨层"**（背景/文字/矢量/单色蒙版图），
 // 照片与插图由分流设备留在另一层、原样叠回（见下面的 SplitDevice）。
 //
-//   mode 1（深色）：**柔化**的暗色映射，而非纯黑底白字（纯反色刺眼）：
+//   mode 1（深色纸张）：**柔化**的暗色映射，而非纯黑底白字（纯反色刺眼）：
 //                   白 → 深暖灰 #1F1D1B，黑 → 浅暖灰 #D7D5D3（= 纸色逐通道 + 184），
 //                   中间调线性过渡；逐通道 LUT，等价于"先反相再把对比度压到 [暗,亮] 区间"。
 //                   两端点**必须等斜率**，否则"越亮的那一端越暖"（见下面 kLight 处的说明）。
@@ -185,7 +185,7 @@ void apply_scheme_lut(fz_context* ctx, fz_pixmap* pix, int mode) noexcept {
     if (mode == 1) {
         // 两个端点必须让**逐通道斜率相同**（kLight = kDark + 184），否则"越亮的那一端越暖"：
         // 原端点 #D8D4CE 的 r−b 差是 10，而纸面 #1F1D1B 只有 4 —— 正文比纸面暖 2.5 倍，
-        // 深色下正文于是发黄（与 ADR-068"亮、面积小、对比强的元素，一点色相就非常显眼"同一条规律）。
+        // 深色纸张下正文于是发黄（与 ADR-068"亮、面积小、对比强的元素，一点色相就非常显眼"同一条规律）。
         // 等斜率后，整个映射等价于"按亮度一个标量 + 一个**恒定**暖偏"：两端与中间调暖度一致。
         constexpr unsigned char kDark[3]  = { 0x1F, 0x1D, 0x1B };  // 白 → 深暖灰
         constexpr unsigned char kLight[3] = { 0xD7, 0xD5, 0xD3 };  // 黑 → 浅暖灰（= kDark + 184）
@@ -233,7 +233,7 @@ void apply_scheme_lut(fz_context* ctx, fz_pixmap* pix, int mode) noexcept {
 //
 // 于是纸墨与照片分两遍绘到**同一张 pixmap**：先纸墨、套配色 LUT、再把照片叠回去 ——
 // 照片因此不参与配色变换。这解决了"整张位图套一个 LUT"分不清纸墨与照片、
-// 把照片一起变成负片（深色）或一起染黄（暖色）的根因。
+// 把照片一起变成负片（深色纸张）或一起染黄（暖色）的根因。
 //
 // 为什么自己写转发函数：MuPDF 没有内置的"过滤设备"。fz_device 的回调表虽是公开结构，
 // 但**派生设备的状态就存在基础结构之后**（回调里把 dev 直接 cast 成自己的派生类型），
@@ -243,7 +243,7 @@ void apply_scheme_lut(fz_context* ctx, fz_pixmap* pix, int mode) noexcept {
 //
 // 分类规则（唯一需要拍板的一条）：只有 **fill_image（真正的位图绘制）** 算图像层；
 // **fill_image_mask（单色蒙版图，如 logo/图标）算墨迹** —— 它画出来的是"墨色形状"，
-// 深色模式下必须跟着变浅，否则黑白 logo 会是一块白。
+// 深色纸张模式下必须跟着变浅，否则黑白 logo 会是一块白。
 // 只裁剪不涂色的调用（clip_* / pop_clip / begin_mask / end_mask）与容器类调用
 // （group / tile / layer / structure）**两层都转发**，保证两层看到同一套裁剪与容器状态。
 // 蒙版内容（begin_mask 与 end_mask 之间）两层都放行：它不进画面、只是各自栅格化一份，
@@ -1747,7 +1747,7 @@ DocError Document::render_page_region(int index, float scale, PageBitmap& out,
             dev_inner = nullptr;
 
             // 整页扫描件：图像几乎铺满整页、且纸墨层没画什么东西（扫描书、扫描证件…）。
-            // 这类页面的内容**全在图像里**，若照常"纸墨层套配色、照片原样叠回"，深色模式下
+            // 这类页面的内容**全在图像里**，若照常"纸墨层套配色、照片原样叠回"，深色纸张模式下
             // 会得到一整页白 —— 等于没开。故改走：图像原样铺满 → 最后整体套一次配色。
             // 反例（不触发）：整页底图 + 正文的杂志封面 —— 纸墨层有文字，就该只变换文字。
             const float page_area =

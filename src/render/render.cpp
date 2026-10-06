@@ -47,12 +47,12 @@ namespace lr {
 ResourceProfile resource_profile(ResourceTier tier) noexcept {
     switch (tier) {
     case ResourceTier::Low:
-        return { ResourceTier::Low, 1, 1536, 256u << 20 };
+        return { ResourceTier::Low, 1536, 256u << 20 };
     case ResourceTier::High:
-        return { ResourceTier::High, 3, 2560, 768u << 20 };
+        return { ResourceTier::High, 2560, 768u << 20 };
     case ResourceTier::Balanced:
     default:
-        return { ResourceTier::Balanced, 2, 2048, kCacheBudgetDefault };
+        return { ResourceTier::Balanced, 2048, kCacheBudgetDefault };
     }
 }
 
@@ -1248,18 +1248,6 @@ void Renderer::cancel_search() {
     std::lock_guard lock(impl_->mtx);
     impl_->cancel_search_locked();
     impl_->cv.notify_all();
-}
-
-void Renderer::stop_search() {
-    if (!impl_) return;
-    std::lock_guard lock(impl_->mtx);
-    if (!impl_->search.active) return;
-    // 只关 active 并换 id（在途批次据此收工）；next_page / hits / pending / needle **全部保留**。
-    // 于是 UI 仍能如实报"已扫描 N / M 页 · 已找到 K 处"，也仍能取走最后一批命中。
-    // 若这里改用 cancel_search_locked()，进度会被清零，UI 会显示"已扫描 0 / M 页"——
-    // 那是"从未搜过"的样子，与"搜到一半停下"是两回事。
-    impl_->search.active = false;
-    impl_->search.id = ++impl_->next_search_id;
 }
 
 SearchStatus Renderer::search_status() const {

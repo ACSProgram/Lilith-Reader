@@ -370,11 +370,22 @@ try {
 $themeExit = $LASTEXITCODE
 Write-Host "  check_theme_reset.py 退出码 = $themeExit"
 
+# 主题优先级断言：显式浅色/深色不应被文档的深色纸张方案覆盖。
+Step "主题优先级断言"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & $Python (Join-Path $repo "tests\check_theme_precedence.py")
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$themePrecedenceExit = $LASTEXITCODE
+Write-Host "  check_theme_precedence.py 退出码 = $themePrecedenceExit"
+
 Step "结束"
 if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $stateExit -eq 0 -and
     $toneExit -eq 0 -and $pageMapExit -eq 0 -and $renderSearchExit -eq 0 -and
     $fontExit -eq 0 -and $iconExit -eq 0 -and
-    $menuExit -eq 0 -and $themeExit -eq 0) {
+    $menuExit -eq 0 -and $themeExit -eq 0 -and $themePrecedenceExit -eq 0) {
     Write-Host "全部通过。" -ForegroundColor Green
 } else {
     Write-Host "存在失败用例。" -ForegroundColor Red
@@ -389,4 +400,5 @@ if ($renderSearchExit -ne 0) { exit $renderSearchExit }
 if ($fontExit -ne 0) { exit $fontExit }
 if ($iconExit -ne 0) { exit $iconExit }
 if ($menuExit -ne 0) { exit $menuExit }
-exit $themeExit
+if ($themeExit -ne 0) { exit $themeExit }
+exit $themePrecedenceExit

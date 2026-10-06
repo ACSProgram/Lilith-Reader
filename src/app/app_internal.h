@@ -210,8 +210,8 @@ inline HWND g_hwnd = nullptr;
 // ---- 主题调色板 ----
 // chrome 表现由两个正交维度决定（ADR-067/068）：
 //   · **界面主题**（浅/深/跟随系统）—— 用户偏好，管顶栏/菜单/设置窗的明暗；
-//   · **纸张方案**（原色/深色/暖色）—— 管页面，同时通过 g_tone 决定 chrome 的色调
-//     （深色方案强制深色 chrome，并把中性族旋到与暖黑纸面同色相；暖色方案旋到米黄纸面色相）。
+//   · **纸张方案**（原色/深色纸张/暖色）—— 管页面，同时通过 g_tone 决定 chrome 的色调
+//     （跟随系统时深色纸张还会令 chrome 变暗；暖色方案旋到米黄纸面色相）。
 // 这里只定义**两套中性底**（kPalLight / kPalDark）；实际用到的颜色由 g_tone 现场派生 ——
 // 手写 4~5 套相近调色板既难保持一致、又容易漏改某几个色，派生则天然同步，
 // 且"保持亮度/换强调色/保语义色"等规则集中在一处（见 tone.h）。
@@ -366,7 +366,7 @@ inline int  g_sidebar_tab_want = -1;
 
 // ---- 视图变换（0/90/180/270 与纸张方案）----
 inline int g_rotation = 0;
-inline int g_scheme = 0;            // 0 原色 / 1 深色 / 2 暖色（与 lr::PageScheme 同值）
+inline int g_scheme = 0;            // 0 原色 / 1 深色纸张 / 2 暖色（与 lr::PageScheme 同值）
 // 未旋转的逐页尺寸（点）；旋转 90/270 时交换宽高后再交给画布。
 inline std::vector<lr::PageSizePt> g_raw_sizes;
 inline lr::PageSizePt g_raw_default{ 595.0f, 842.0f };
@@ -687,7 +687,7 @@ void show_toast(std::string text);
 
 // ---- 全文搜索 ----
 void search_start();                 // 用 g_search_buf 发起检索（回车 / 按钮 / 防抖到点）
-void search_stop();                  // 停止在途检索，**保留**已找到的命中（「停止」按钮）
+void search_cancel();                // 取消当前检索，清空输入、结果与高亮
 void search_clear();                 // 清空检索状态与结果（关文档 / 清空关键字）
 void search_goto(int index);         // 跳到第 index 条命中并高亮
 void search_step_hit(int dir);       // 上一条 / 下一条

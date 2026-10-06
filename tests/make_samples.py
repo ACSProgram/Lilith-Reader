@@ -279,7 +279,7 @@ def _image_xobj(rgb, size=8):
 def pdf_image_and_text():
     """一页：顶部文字 + 下半部分**纯红色照片**。
 
-    供 doc_test 断言"配色只作用于纸墨层"：深色方案下纸面变深、而红图必须仍是红的
+    供 doc_test 断言"配色只作用于纸墨层"：深色纸张下纸面变深、而红图必须仍是红的
     （若被 LUT 一起变换，红会变成青蓝色调）。
     """
     content = (b"BT /F1 24 Tf 20 220 Td (page) Tj ET\n"
@@ -300,7 +300,7 @@ def pdf_image_and_text():
 def pdf_scan_only():
     """整页就是一张图（模拟扫描书）：没有文字、图像铺满整页。
 
-    供 doc_test 断言"整页扫描件回退"：深色方案下整页（含图）必须变深，
+    供 doc_test 断言"整页扫描件回退"：深色纸张下整页（含图）必须变深，
     否则扫描书开了深色模式仍是一整页白。
     """
     content = b"q 200 0 0 300 0 0 cm /Im1 Do Q"
@@ -375,7 +375,7 @@ def main():
     # 带两级目录的 PDF：供 doc_test 断言 outline() 的层级/页号解析
     write("outline.pdf", pdf_with_outline(3))
     # 配色分层渲染的两个样本（ADR-067）：
-    #   with_image.pdf 文字 + 红图 → 断言"深色方案下照片不变色"；
+    #   with_image.pdf 文字 + 红图 → 断言"深色纸张下照片不变色"；
     #   scan_only.pdf  整页一张图   → 断言"整页扫描件整体回退变换"；
     #   ink_black.pdf  一块纯黑     → 断言"墨色与纸面暖度一致"（LUT 两端等斜率）。
     write("with_image.pdf", pdf_image_and_text())

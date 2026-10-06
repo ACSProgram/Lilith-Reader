@@ -201,49 +201,6 @@ int main(int argc, char** argv) {
         else fail("real.pdf", "空关键字：不启动检索", "active 为真");
     }
 
-    // ---- 7) stop_search：只"收手"，不清进度/结果（UI「停止」按钮走的就是它）----
-    //
-    // 与 cancel_search 的分工必须钉死：cancel 是"作废"（换关键字 / 换文档，进度与结果都不要了），
-    // stop 是"收手"（用户不想再等，但已找到的结果还要能看、能跳）。
-    // 若两者共用一条实现，UI 在「停止」后会显示"已扫描 0 / M 页"—— 那是"从未搜过"的样子。
-    {
-        std::vector<lr::SearchHit> a;
-        r.start_search("page");
-        drain_search(r, a, 15.0);
-        const lr::SearchStatus before = r.search_status();
-
-        r.stop_search();
-        const lr::SearchStatus after = r.search_status();
-        char d[200];
-        std::snprintf(d, sizeof d,
-                      "stop 前 scanned %d/%d hits %d → 后 scanned %d/%d hits %d",
-                      before.scanned, before.total, before.hits,
-                      after.scanned, after.total, after.hits);
-        if (!after.active && after.scanned == before.scanned &&
-            after.hits == before.hits && after.scanned == after.total)
-            pass("real.pdf", "stop_search：保留进度与命中（不清零）");
-        else
-            fail("real.pdf", "stop_search：保留进度与命中（不清零）", d);
-
-        // 在途停止：active 必须立刻为假，且过一会儿也不会自己"复活"继续发布。
-        r.start_search("page");
-        r.stop_search();
-        std::this_thread::sleep_for(std::chrono::milliseconds(60));
-        const lr::SearchStatus st = r.search_status();
-        if (!st.active) pass("real.pdf", "stop_search：在途停止后保持静止");
-        else fail("real.pdf", "stop_search：在途停止后保持静止", "仍 active");
-
-        // 对照组：cancel 必须清零 —— 否则"换关键字"会残留旧查询的进度读数。
-        r.cancel_search();
-        const lr::SearchStatus c = r.search_status();
-        char dc[128];
-        std::snprintf(dc, sizeof dc, "cancel 后 scanned %d hits %d", c.scanned, c.hits);
-        if (!c.active && c.scanned == 0 && c.hits == 0)
-            pass("real.pdf", "cancel_search：进度清零（与 stop 语义区分）");
-        else
-            fail("real.pdf", "cancel_search：进度清零（与 stop 语义区分）", dc);
-    }
-
     std::printf("\n=== 结果：%d 通过 / %d 失败 ===\n", g_pass, g_fail);
     if (g_fail > 0) {
         std::printf("有失败用例，详见上面的 [FAIL] 行。\n");

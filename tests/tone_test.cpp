@@ -121,7 +121,7 @@ struct Scheme {
 };
 
 const Scheme kSchemes[] = {
-    { "深色", &kToneDarkPage, kDarkRoles },
+    { "深色纸张", &kToneDarkPage, kDarkRoles },
     { "暖色", &kToneWarmPage, kWarmRoles },
 };
 constexpr int kSchemeCount = 2;

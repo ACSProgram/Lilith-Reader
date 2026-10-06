@@ -69,7 +69,7 @@ const CmdDef kCmds[kCmdCount] = {
     // id 保持 Phase 5 的历史名（"ToggleInvert"/"ToggleSepia"）：它是 ini 的**稳定标识**，
     // 改名会让用户已自定义的 I / E 绑定找不到而退回默认值。语义已在 ADR-067 里改过，
     // 显示名（第三列）随之更新，标识不动。
-    { "ToggleInvert",   "视图", "深色",                      false, false, kb(ImGuiKey_I),              ImGuiKey_None },
+    { "ToggleInvert",   "视图", "深色纸张",                  false, false, kb(ImGuiKey_I),              ImGuiKey_None },
     { "ToggleSepia",    "视图", "暖色",                      false, false, kb(ImGuiKey_E),              ImGuiKey_None },
 
     { "ToggleSidebar",  "界面", "侧栏（目录 / 书签 / 缩略图）", false, false, kb(ImGuiKey_O),           ImGuiKey_None },
@@ -301,7 +301,7 @@ void set_rotation(int deg) {
 
 void rotate_view(int delta) { set_rotation(g_rotation + delta); }
 
-// 直接设定纸张方案（0 原色 / 1 深色 / 2 暖色）；按键 I/E 走 toggle。
+// 直接设定纸张方案（0 原色 / 1 深色纸张 / 2 暖色）；按键 I/E 走 toggle。
 void set_scheme(int mode) {
     if (g_scheme == mode) return;
     g_scheme = mode;
@@ -1506,14 +1506,11 @@ void search_start() {
     g_search_active = st.active;
 }
 
-void search_stop() {
-    g_search_pending = false;
-    g_search_edit_at = -1.0;
-    if (g_renderer != nullptr) g_renderer->stop_search();   // 收手：保留进度与已找到的命中
-    g_search_active = false;
-    // 已找到的命中**刻意保留**：用户按「停止」是想让长检索收手，不是想丢掉已找到的结果。
-    // 但扫描进度停在原处，所以 UI 不能再写"共 N 处"（那是"已扫完全文"的措辞）——
-    // 由 `g_search_scanned < g_search_total` 区分"扫完"与"中途停下"。
+void search_cancel() {
+    // 取消的产品语义是收场：输入框、在途任务、结果列表和画布高亮一起清掉。
+    std::memset(g_search_buf, 0, sizeof g_search_buf);
+    g_search_focus = false;
+    search_clear();
 }
 
 void search_goto(int index) {
