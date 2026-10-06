@@ -11,7 +11,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Probe   # 额外�
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # 复用已有 samples/
 ```
 
-- 退出码 = 任一测试失败即非零；已接入 CI（`.github/workflows/pr.yml`，PR 与推 `main` 触发，见 ADR-076）。
+- 退出码 = 任一测试失败即非零；已接入 CI（`.github/workflows/pr.yml`，PR 与推 `main` 触发，Debug/Release 矩阵 + 安装包门禁，见 ADR-076/084）。
 - `tests/samples/`、`tests/_build/` 为生成物，已 gitignore。
 
 ## 文件
@@ -33,6 +33,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # �
 | `check_theme_reset.py` | 主题重置断言（ADR-068）：`apply_theme_colors` 的两个分支必须先 `StyleColorsLight` / `StyleColorsDark` **整套重置**再逐项覆盖 —— 否则未覆盖的颜色项会带着上一个主题的值活过来（深色勾选框曾因此变成亮奶油色）。跨状态残留这类 bug 在代码里毫无痕迹，只能靠结构性约束挡住 |
 | `check_theme_precedence.py` | 外观契约断言：深色纸张只在“跟随系统”时额外令界面变暗，显式浅色/深色不被文档状态覆盖；同时检查菜单分组、统一标签表与设置项顺序 |
 | `check_menu_width.py` | 菜单文案宽度断言（ADR-067）：扫描 `src/app/ui.cpp` 的菜单字面量，显示宽度（CJK=2 列）不得超过 12 列 —— 弹出菜单的宽度由最长项决定，一条超长文案会把整张菜单撑宽。补充说明应改用悬停提示 |
+| `check_installer_size.py` | 安装包体积门禁（ADR-084）：断言 `installer/dist/` 的安装包 ≤ 35 MiB（依据 docs/05 §5）。CI 的 installer job 与本地均可跑：`python tests/check_installer_size.py installer\dist` |
 | `../assets/check_icons.py` | 图标资源断言（Phase 7，ADR-051）：每个 `.ico` 的帧集必须完整（17 帧），且每帧位图的**真实解码尺寸**必须等于目录项声明的尺寸 —— 防"小图塞进大槽位 / 只剩一帧"这类只在特定 DPI 下暴露的错 |
 | `run_tests.ps1` | 一键编译 + 运行；`cl.exe` 直调，链接配置独立于 `build.bat` 的 vcpkg，MuPDF 升级时需同步其库列表 |
 

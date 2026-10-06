@@ -18,8 +18,15 @@ defaults:
 
 jobs:
   build-and-test:
-    name: Windows build and tests
+    name: Windows build and tests (${{ matrix.configuration }})
     runs-on: windows-2025
+    strategy:
+      # Debug/Release 互不拖累：一个配置挂了另一个的结论仍然可见
+      fail-fast: false
+      matrix:
+        # Debug 只编不测（ADR-084）：run_tests.ps1 自带 cl.exe 编译、不消费主工程产物，
+        # 对 Debug 产物重跑回归没有信息增益；Debug 的价值在编译+链接期的断言与分支检查。
+        configuration: [Debug, Release]
 
     steps:
       - name: Check out source
@@ -127,7 +134,7 @@ jobs:
           }
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed with exit code $LASTEXITCODE" }
 
-      - name: Build Release application
+      - name: Build application
         run: |
           $msbuild = '${{ steps.tools.outputs.MSBUILD }}'
           $vcpkgRoot = '${{ steps.tools.outputs.VS_PATH }}\VC\vcpkg'
@@ -136,7 +143,7 @@ jobs:
             "$env:GITHUB_WORKSPACE\src\LilithReader.vcxproj" `
             /m `
             /nologo `
-            /p:Configuration=Release `
+            /p:Configuration=${{ matrix.configuration }} `
             /p:Platform=x64 `
             /p:PlatformToolset=${{ steps.tools.outputs.TOOLSET }} `
             /p:VcpkgEnableManifest=false `
@@ -145,7 +152,16 @@ jobs:
             "/p:VcpkgInstalledDir=$installRoot"
           if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE" }
 
+      - name: Upload Release executable for packaging
+        if: matrix.configuration == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-exe
+          path: bin/Release/LilithReader.exe
+          if-no-files-found: error
+
       - name: Run automated tests
+        if: matrix.configuration == 'Release'
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
             -File "$env:GITHUB_WORKSPACE\tests\run_tests.ps1" `
@@ -156,10 +172,46 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: pr-ci-diagnostics
+          # v4 不允许同名 artifact 重复上传，两个矩阵实例都失败时会撞名
+          name: pr-ci-diagnostics-${{ matrix.configuration }}
           if-no-files-found: ignore
           path: |
             tests/_build/**
             tests/samples/**
             build/**
             bin/**
+
+  installer:
+    name: Installer build and size gate
+    runs-on: windows-2025
+    needs: build-and-test
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Download Release executable
+        uses: actions/download-artifact@v4
+        with:
+          name: release-exe
+          path: bin/Release
+
+      - name: Build installer
+        run: |
+          # 复用仓库自带的打包脚本（ISCC 路径探测 + exe 存在检查都在里面），
+          # 不在 CI 内另写一套 ISCC 调用，避免打包定义漂移。
+          # runner 镜像预装 Inno Setup 6.7.1，落在 Program Files (x86)。
+          & "$env:GITHUB_WORKSPACE\installer\build_installer.bat"
+          if ($LASTEXITCODE -ne 0) { throw "Installer build failed with exit code $LASTEXITCODE" }
+
+      - name: Check installer size budget
+        run: |
+          & python "$env:GITHUB_WORKSPACE\tests\check_installer_size.py" `
+            "$env:GITHUB_WORKSPACE\installer\dist"
+          if ($LASTEXITCODE -ne 0) { throw "Installer size check failed" }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: installer/dist/*.exe
+          if-no-files-found: error
