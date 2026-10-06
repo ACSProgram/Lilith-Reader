@@ -277,10 +277,10 @@ void save_reading_state() {
     r.fit_width = g_canvas.state().fit_width;
     r.spread = g_canvas.state().spread;
     r.color_mode = g_color_mode;
-    // 身份随每次落盘刷新：将来换键方案时能按 last_path 重算，也能给管理窗口显示"上次在哪"
+    // 身份随每次落盘刷新：将来换键方案时能按位置重算，也能给管理窗口显示"上次在哪 / 还在哪"
     r.path_key = g_identity.path;
     r.page_count = g_identity.page_count;
-    r.last_path_u8 = g_identity.path_u8;
+    lr::remember_location(r, g_identity.path_u8);
     (void)lr::save_state(g_state_path, g_state);  // 书签在增删时已写入 g_state，这里不覆盖
 }
 
@@ -304,38 +304,62 @@ void resolve_document_identity(std::uint64_t content_fp) {
 
     // 命中：**先沿用**（绝不因为询问流程丢进度），再按设置决定要不要问一句。
     const lr::DocRecord& hit = g_state.docs[static_cast<std::size_t>(m.index)].second;
-    const std::string old_path = hit.last_path_u8;
+    const std::string old_path = lr::last_location(hit);
     const int old_page = hit.page;
     const int old_marks = static_cast<int>(hit.bookmarks.size());
     g_doc_key = lr::adopt(g_state, static_cast<std::size_t>(m.index), g_identity);
 
     if (m.relocated && g_prefs.smart_match == kSmartMatchAsk) {
-        char body[640];
-        std::snprintf(body, sizeof body,
-                      "这份文档与库中已有的一份阅读数据内容相同。\n"
-                      "原位置：%s\n"
-                      "已记录：第 %d 页，%d 个书签",
-                      old_path.empty() ? "(未知位置)" : old_path.c_str(),
-                      old_page + 1, old_marks);
-        request_confirm(ConfirmKind::Relocate, "沿用这份阅读数据？", body,
-                        "沿用进度", "从头开始", 0);
+        char logged[64];
+        std::snprintf(logged, sizeof logged, "第 %d 页 · %d 个书签", old_page + 1, old_marks);
+        request_confirm(ConfirmKind::Relocate, "沿用这份阅读数据？",
+                        "这份文档与库中已记录的一份内容相同。",
+                        { { "原位置", old_path.empty() ? "(未知位置)" : old_path },
+                          { "已记录", logged } },
+                        "沿用进度", "另起一份", 0);
     }
 }
 
-// 「从头开始」：只清"读到哪"与书签；视图参数（缩放/列数/配色）是通用偏好，保留。
-void reset_current_progress() {
-    if (g_doc_key == 0) return;
-    lr::DocRecord* r = nullptr;
-    for (auto& kv : g_state.docs)
-        if (kv.first == g_doc_key) { r = &kv.second; break; }
-    if (r == nullptr) return;
-    r->page = 0;
-    r->bookmarks.clear();
-    (void)lr::save_state(g_state_path, g_state);
-    if (g_doc.kind == UiDoc::Kind::Reading) {
-        g_restore_pending = false;      // 首帧待恢复的位置作废
-        request_jump_scroll(0, 0.0f);
+// 「另起一份」：把当前这份从共享的阅读数据里**摘出去**，两边各自独立记。
+//
+// 不能只把页码清零了事——记录是共享的，清零会把**另一处**的进度一起抹掉。
+// 摘出去后两边都退回"按路径认"：内容指纹一条记录只能挂一个，留着它下次打开又会
+// 因为"内容相同"再问一遍，成了甩不掉的循环。
+void detach_current_progress() {
+    if (g_doc_key == 0 || g_doc.kind != UiDoc::Kind::Reading) return;
+    const std::string me = g_identity.path_u8;
+
+    std::size_t idx = g_state.docs.size();
+    for (std::size_t i = 0; i < g_state.docs.size(); ++i)
+        if (g_state.docs[i].first == g_doc_key) { idx = i; break; }
+
+    if (idx < g_state.docs.size()) {
+        lr::DocRecord& r = g_state.docs[idx].second;
+        for (auto it = r.locations.begin(); it != r.locations.end(); ++it) {
+            if (*it == me) { r.locations.erase(it); break; }
+        }
+        if (r.locations.empty()) {
+            g_state.docs.erase(g_state.docs.begin() + static_cast<std::ptrdiff_t>(idx));
+        } else {
+            // 还有别的份：这条退回按"剩下那一处"的路径键认，腾出内容指纹
+            const std::uint64_t rk = lr::document_key(lr::utf8_to_wide(r.locations.front()));
+            if (rk != 0 && g_state.find(rk) == nullptr) (void)lr::rekey(g_state, idx, rk);
+        }
     }
+
+    // 当前这份：新起一条按路径键认的记录，从零开始
+    g_doc_key = g_identity.path;
+    if (g_doc_key != 0) {
+        lr::DocRecord& nr = g_state.upsert(g_doc_key);
+        nr.page = 0;
+        nr.bookmarks.clear();
+        nr.path_key = g_identity.path;
+        nr.page_count = g_identity.page_count;
+        lr::remember_location(nr, me);
+    }
+    (void)lr::save_state(g_state_path, g_state);
+    g_restore_pending = false;      // 首帧待恢复的位置作废
+    request_jump_scroll(0, 0.0f);
 }
 
 void clear_reading_data(std::uint64_t key) {
@@ -349,6 +373,30 @@ void clear_reading_data(std::uint64_t key) {
 void clear_all_reading_data() {
     g_state.docs.clear();
     g_doc_key = 0;
+    (void)lr::save_state(g_state_path, g_state);
+}
+
+int unknown_reading_data_count() {
+    int n = 0;
+    for (const auto& kv : g_state.docs)
+        if (kv.second.locations.empty()) ++n;
+    return n;
+}
+
+// 只清"位置未知"的那批：升级前的 v1 记录没存过路径，显示不出文档名，也永远认不出来
+// （除非再打开一次同一个文件让它按路径键命中）。它们对用户是没有信息的噪音，单独给个入口。
+void clear_unknown_reading_data() {
+    std::vector<std::pair<std::uint64_t, lr::DocRecord>> keep;
+    keep.reserve(g_state.docs.size());
+    for (auto& kv : g_state.docs) {
+        if (kv.second.locations.empty()) {
+            if (kv.first == g_doc_key) g_doc_key = 0;   // 正在读的那本被清掉：解除绑定
+            continue;
+        }
+        keep.push_back(std::move(kv));
+    }
+    if (keep.size() == g_state.docs.size()) return;     // 没有可清的
+    g_state.docs = std::move(keep);
     (void)lr::save_state(g_state_path, g_state);
 }
 

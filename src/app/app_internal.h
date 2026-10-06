@@ -169,6 +169,8 @@ inline constexpr const char* kIcBook       = "\xEE\xA0\xAD";  // U+E82D 双页/�
 inline constexpr const char* kIcDoc        = "\xEE\xA2\xA5";  // U+E8A5 单页
 inline constexpr const char* kIcOpenFile   = "\xEE\xA3\xA5";  // U+E8E5 打开文件
 inline constexpr const char* kIcSearch     = "\xEE\x9C\xA1";  // U+E721 搜索
+inline constexpr const char* kIcFolder     = "\xEE\xA2\xB7";  // U+E8B7 文件夹（阅读数据的位置行）
+inline constexpr const char* kIcTrash      = "\xEE\x9D\x8D";  // U+E74D 删除（阅读数据行尾）
 
 // ============================================================================
 // 平台层（platform.cpp）
@@ -407,11 +409,15 @@ void update_title();
 // ---- 阅读数据的身份解析与维护（ADR-062）----
 // 文档打开成功时调用：算出身份（工作线程给的指纹 + 路径键），分层定位记录并落定主键。
 void resolve_document_identity(std::uint64_t content_fp);
-// 「从头开始」：清掉当前文档的阅读位置与书签，跳回第 1 页（视图参数保留）。
-void reset_current_progress();
+// 「另起一份」：把当前文档从共享的阅读数据里摘出去（两边各自独立），跳回第 1 页。
+void detach_current_progress();
 // 删除一条阅读数据；若它是当前文档，同时解除本次会话的绑定（不再写入）。
 void clear_reading_data(std::uint64_t key);
 void clear_all_reading_data();
+// 只清"位置未知"的旧记录（升级前留下的、认不出是哪份文档的那批）。
+void clear_unknown_reading_data();
+// 位置未知的记录条数（管理窗口分两区显示用）。
+[[nodiscard]] int unknown_reading_data_count();
 
 void push_canvas_sizes();           // 逐页尺寸（含旋转折算）下发画布
 void apply_view_transform();        // 旋转/配色下发渲染层
@@ -513,20 +519,20 @@ inline bool g_show_settings = false;
 // ---- 通用确认弹窗（ADR-062）----
 // 一处弹窗、多处复用：① 智能匹配的"要不要沿用"询问；② 阅读数据删除 / 清空的二次确认。
 // 两个按钮都是动作：主按钮 = 推荐动作，次按钮 = 另一动作或取消。
-enum class ConfirmKind : int { None, Relocate, ClearOne, ClearAll };
+enum class ConfirmKind : int { None, Relocate, ClearOne, ClearAll, PruneUnknown };
 
 inline ConfirmKind   g_confirm_kind = ConfirmKind::None;
 inline bool          g_confirm_open = false;
-inline std::string   g_confirm_title;      // 标题
-inline std::string   g_confirm_body;       // 正文（可含换行，按窗口宽度折行）
+inline std::string   g_confirm_title;      // 标题（强调色，一行）
+inline std::string   g_confirm_body;       // 说明（可含换行，按宽度折行）
+// 「标签 → 值」明细行（如"原位置 → D:\书\a.pdf"）：标签次要色左对齐，值折行，
+// 让长路径不至于和说明文字糊成一团。
+inline std::vector<std::pair<std::string, std::string>> g_confirm_rows;
 inline std::string   g_confirm_ok;         // 主按钮文案
 inline std::string   g_confirm_alt;        // 次按钮文案
 inline std::uint64_t g_confirm_target = 0; // ClearOne：要删的那条记录的主键
-
-// ---- 阅读数据管理窗口（ADR-062）：列出全部记录，可删单条 / 清空全部 ----
-inline bool g_show_reading_data = false;
-// 打开设置时要求选中的分栏（0 界面 / 1 阅读 / 2 性能 / 3 按键）；-1 = 保持上次。
-// 由 OpenSettings（Ctrl+,）与 OpenKeys（F1）设置，绘制后立即复位。
+// ---- 设置窗口的分栏索引（draw_settings_window 消费后复位为 -1）----
+// 0 界面 / 1 阅读 / 2 性能 / 3 按键 / 4 阅读数据
 inline int g_settings_open_tab = -1;
 // 「键盘打开画布右键菜单」（Shift+F10 / 菜单键）：由 draw_shell 置位，
 // draw_canvas_context_menu 在画布窗口作用域内消费（与右键同一 ID 空间）。
@@ -565,11 +571,13 @@ void draw_debug_overlay();
 void draw_jump_popup();
 void draw_password_popup();
 void draw_confirm_popup();          // 通用确认弹窗（智能匹配询问 / 删除二次确认，ADR-062）
-void draw_reading_data_window();    // 阅读数据管理窗口（ADR-062）
 void draw_settings_window();
-// 打开确认弹窗（由 session 在需要用户拍板时调用）。kind 决定按钮动作的归属。
+void draw_settings_reading_data_tab();   // 设置 ·「阅读数据」分栏（清单 + 删单条 / 清空全部）
+// 打开确认弹窗（由 session / 管理窗口在需要用户拍板时调用）。kind 决定按钮动作的归属。
 void request_confirm(ConfirmKind kind, std::string title, std::string body,
-                     std::string ok_label, std::string alt_label, std::uint64_t target = 0);
+                     std::vector<std::pair<std::string, std::string>> rows,
+                     std::string ok_label, std::string alt_label,
+                     std::uint64_t target = 0);
 void update_toolbar_visibility();
 bool top_bar_should_show();
 float update_top_bar_height(float dt);   // 顶栏高度的滑入/滑出插值

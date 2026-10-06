@@ -512,14 +512,24 @@ ToggleAnim g_pwd_anim;
 
 // 弹窗统一的开合样式：以视口中心为不动点（pivot 0.5）做滑落，外加整体透明度。
 // 用 pivot 而不是自己算左上角，是因为弹窗是自动尺寸、开合首帧还不知道它多大。
+//
+// **透明度必须留一个下限（>0）**：ImGui 的 `Begin()` 里有一条
+//   `if (style.Alpha <= 0.0f) window->HiddenFramesCanSkipItems = 1;`
+// 于是收敛帧（动画值恰好为 0）弹窗会被判为 Hidden，`Begin()` 返回 false ——
+// 而"收敛后再 CloseCurrentPopup"恰恰写在 `if (BeginPopupModal(...))` 为真的分支里，
+// 结果就是**弹窗永远关不掉**：它已经看不见，却作为模态留在 OpenPopupStack 里，
+// 把整窗输入全部挡住（实测现象："点完按钮整页卡死，什么都不能操作"，ADR-064）。
+// 留 1/255 的透明度肉眼不可见，却让收敛帧仍是一个"真实帧"，关闭逻辑得以执行。
+constexpr float kPopupMinAlpha = 1.0f / 255.0f;
 void popup_anim_apply(const ToggleAnim& a) {
+    const float alpha = a.value < kPopupMinAlpha ? kPopupMinAlpha : a.value;
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(
         ImVec2(vp->Pos.x + vp->Size.x * 0.5f,
                vp->Pos.y + vp->Size.y * 0.5f + (1.0f - a.value) * px(kPopupSlidePx)),
         ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowBgAlpha(a.value);
-    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, a.value);
+    ImGui::SetNextWindowBgAlpha(alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
 }
 
 // ---------------- 弹窗：跳页 ----------------
@@ -1108,15 +1118,22 @@ ImVec2 centered_on_viewport(const ImGuiViewport* vp, const ImVec2& size) {
 // 一处弹窗、多处复用：① 智能匹配的"要不要沿用这份阅读数据"询问（主=沿用 / 次=从头开始）；
 // ② 阅读数据删除 / 清空的二次确认（主=删除 / 次=取消）。与跳页、密码弹窗同一套开合动效
 // （ADR-059）：逻辑关闭只把目标降到 0，等动画收敛后再真正销毁 popup。
+//
+// 版式（不用 ImGui 的标题栏，自己排版）：标题（强调色）→ 说明（折行）→ 明细行
+// （标签次要色 + 值折行）→ 分隔线 → 按钮**右对齐**（主按钮在最右，符合"确认在右"的惯例）。
+// 不用标题栏的原因：标题栏会把内部名"确认"显示出来、还带一个关闭按钮，既重复又容易误点；
+// 自绘版面后弹窗完全由内容决定尺寸，长路径折行也不会把窗口撑到屏幕外。
 ToggleAnim g_confirm_anim;
 
 void request_confirm(ConfirmKind kind, std::string title, std::string body,
+                     std::vector<std::pair<std::string, std::string>> rows,
                      std::string ok_label, std::string alt_label, std::uint64_t target) {
     // 已有确认在挂起时**不覆盖**：先到的那个才是用户该先处理的。
     if (g_confirm_open) return;
     g_confirm_kind = kind;
     g_confirm_title = std::move(title);
     g_confirm_body = std::move(body);
+    g_confirm_rows = std::move(rows);
     g_confirm_ok = std::move(ok_label);
     g_confirm_alt = std::move(alt_label);
     g_confirm_target = target;
@@ -1124,129 +1141,417 @@ void request_confirm(ConfirmKind kind, std::string title, std::string body,
 }
 
 void draw_confirm_popup() {
+    constexpr const char* kConfirmId = "确认##confirm";
     const bool alive = g_confirm_anim.step(ImGui::GetIO().DeltaTime, g_confirm_open, g_prefs.motion);
-    const bool is_open = ImGui::IsPopupOpen("确认");
+    const bool is_open = ImGui::IsPopupOpen(kConfirmId);
     if (!is_open && !g_confirm_open) return;   // 无弹窗、也无打开请求：不参与
-    if (!is_open) ImGui::OpenPopup("确认");
+    if (!is_open) ImGui::OpenPopup(kConfirmId);
     popup_anim_apply(g_confirm_anim);
-    if (ImGui::BeginPopupModal("确认", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+
+    if (ImGui::BeginPopupModal(kConfirmId, nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize |
+                               ImGuiWindowFlags_NoTitleBar |
+                               ImGuiWindowFlags_NoMove)) {
+        const ImVec4 dim = ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim);
+        const float wrap = px(420.0f);
+
+        // 标题（强调色）
+        ImGui::PushTextWrapPos(wrap);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(g_pal.accent));
         ImGui::TextUnformatted(g_confirm_title.c_str());
-        ImGui::Spacing();
-        ImGui::PushTextWrapPos(px(380.0f));   // 路径可能很长：按窗口宽度折行，不把弹窗撑爆
-        ImGui::TextUnformatted(g_confirm_body.c_str());
+        ImGui::PopStyleColor();
         ImGui::PopTextWrapPos();
         ImGui::Spacing();
+
+        // 说明
+        if (!g_confirm_body.empty()) {
+            ImGui::PushTextWrapPos(wrap);
+            ImGui::TextUnformatted(g_confirm_body.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::Spacing();
+        }
+
+        // 明细行：标签固定的左列 + 折行的值，长路径不再和正文糊在一起
+        if (!g_confirm_rows.empty()) {
+            const float label_w = px(72.0f);   // 容得下 3 个汉字标签（基准字号 20px）
+            for (const auto& kv : g_confirm_rows) {
+                ImGui::TextColored(dim, "%s", kv.first.c_str());
+                ImGui::SameLine(label_w);
+                ImGui::PushTextWrapPos(wrap);
+                ImGui::TextUnformatted(kv.second.c_str());
+                ImGui::PopTextWrapPos();
+            }
+            ImGui::Spacing();
+        }
+
+        ImGui::Separator();
+        ImGui::Spacing();
+
         ImGui::BeginDisabled(!g_confirm_open);   // 淡出中不再响应，避免重复触发
-        const bool ok = ImGui::Button(g_confirm_ok.c_str());
+        const ImGuiStyle& st = ImGui::GetStyle();
+        const float ok_w  = ImGui::CalcTextSize(g_confirm_ok.c_str()).x + st.FramePadding.x * 2.0f;
+        const float alt_w = ImGui::CalcTextSize(g_confirm_alt.c_str()).x + st.FramePadding.x * 2.0f;
+        const float min_w = px(88.0f);
+        const float bw_ok = ok_w > min_w ? ok_w : min_w;
+        const float bw_alt = alt_w > min_w ? alt_w : min_w;
+        // 右对齐：末按钮右缘距窗口右内边 = 标准内边距（首帧窗口尚未按内容定宽，故夹到左边距）
+        const float row_w = bw_ok + bw_alt + st.ItemSpacing.x;
+        const float x = ImGui::GetWindowWidth() - st.WindowPadding.x - row_w;
+        ImGui::SetCursorPosX(x > st.WindowPadding.x ? x : st.WindowPadding.x);
+        const bool alt = ImGui::Button(g_confirm_alt.c_str(), ImVec2(bw_alt, 0));
         ImGui::SameLine();
-        const bool alt = ImGui::Button(g_confirm_alt.c_str());
+        const bool ok = ImGui::Button(g_confirm_ok.c_str(), ImVec2(bw_ok, 0));
         ImGui::EndDisabled();
+
         if (ok || alt) {
             const ConfirmKind kind = g_confirm_kind;
             const std::uint64_t target = g_confirm_target;
             g_confirm_open = false;             // 逻辑关：动画收敛后再 CloseCurrentPopup
             g_confirm_kind = ConfirmKind::None;
             if (ok) {
-                // 主按钮：确认动作。Relocate 无需动作 —— 命中时已经沿用（adopt 过）了。
-                if (kind == ConfirmKind::ClearOne) clear_reading_data(target);
-                else if (kind == ConfirmKind::ClearAll) clear_all_reading_data();
+                // 主按钮 = 确认动作。Relocate 的主按钮无需动作 —— 命中时已经沿用（adopt 过）了。
+                if (kind == ConfirmKind::ClearOne)           clear_reading_data(target);
+                else if (kind == ConfirmKind::ClearAll)      clear_all_reading_data();
+                else if (kind == ConfirmKind::PruneUnknown)  clear_unknown_reading_data();
             } else if (kind == ConfirmKind::Relocate) {
-                reset_current_progress();       // 次按钮 = 从头开始
+                detach_current_progress();      // 次按钮 = 另起一份
             }
         }
-        if (!alive) { ImGui::CloseCurrentPopup(); g_confirm_target = 0; }
+        if (!alive) { ImGui::CloseCurrentPopup(); g_confirm_target = 0; g_confirm_rows.clear(); }
         ImGui::EndPopup();
     }
     ImGui::PopStyleVar();
 }
 
-// ---------------- 阅读数据管理窗口（ADR-062）----------------
+// ---------------- 设置 · 阅读数据分栏（ADR-062/063/065）----------------
 //
-// reader_state.bin 里每份文档一条（阅读位置 / 视图参数 / 书签）。以前这份数据只能"攒着"：
-// 文件删了、换电脑了、不想留痕迹了都没处清理。这里给出清单式入口：单条删除 + 全部清空，
-// 删除/清空都过一遍确认弹窗（复用上面的通用弹窗）。
+// 一条记录 = 一份**阅读数据**（读到哪 / 书签 / 视图参数）。同一份内容出现在多个位置时只占
+// 一条 —— 位置在卡片里列成"路径树"，这正是"一份数据、若干路径"的表达。此前一条记录只留
+// 最后一个路径，复制出来的第二份会把第一份顶掉，看不出这是同一份文档的两处副本。
+//
+// 版式：卡片（圆角底 + 悬停描边）= 标题行（文档名 + 行尾删除按钮）/ 统计行（第 N / M 页 ·
+// K 个书签 · J 个位置）/ 缩进的路径行（左侧一条竖导引线，把它们挂在标题下面）。
+//
+// 三个刻意的取舍：
+//   · **不用 TreeNode**：那会带一个三角与整行选中态，而路径是只读信息、不该看起来可点；
+//     一条安静的竖导引线更像"附属关系"，也更省横向空间。
+//   · **路径单行中间省略，不折行**：折行会让卡片高度参差，且长路径开头往往是同样的前缀，
+//     堆在一起看着像糊成一团；中间省略同时保住父目录与文件名，完整路径留给悬停提示。
+//   · **"位置未知"的旧记录单独成区**：v1 记录（升级前）没存过路径，硬摆在列表里就是一堆
+//     "未知文档"。它们挪到末尾、附一句解释，要么等再次打开那个文件时按路径键被认领，
+//     要么一键清掉。
 namespace {
 
-// 路径 → 文件名（UTF-8 进出）。记录里没有路径时退回"未知文档"。
-std::string record_display_name(const std::string& path_u8) {
-    if (path_u8.empty()) return "(未知文档)";
-    const std::wstring w = lr::utf8_to_wide(path_u8);
-    const std::string name = lr::wide_to_utf8(lr::file_name_of(w));
-    return name.empty() ? "(未知文档)" : name;
+// 路径 → 文件名（UTF-8 进出）；空路径返回空串。
+std::string file_name_of_u8(const std::string& path_u8) {
+    if (path_u8.empty()) return {};
+    return lr::wide_to_utf8(lr::file_name_of(lr::utf8_to_wide(path_u8)));
+}
+
+// UTF-8 每个字符的起始字节下标（末尾补 size）。截断必须切在字符边界上，
+// 否则半个汉字会被画成豆腐块。
+std::vector<std::size_t> utf8_char_offsets(const std::string& s) {
+    std::vector<std::size_t> v;
+    for (std::size_t i = 0; i < s.size();) {
+        v.push_back(i);
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        i += (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+    }
+    v.push_back(s.size());
+    return v;
+}
+
+// 放不下就加省略号（middle：掐中间，保留头 55% / 尾 45%；否则掐尾）。
+// 二分"最多留几个字符"，每步两次 CalcTextSize，与串长无关地收敛到 log(n)。
+std::string ellipsize(const std::string& s, float max_w, bool middle) {
+    if (s.empty()) return s;
+    if (ImGui::CalcTextSize(s.c_str()).x <= max_w) return s;
+    const char* kEll = "…";
+    const float budget = max_w - ImGui::CalcTextSize(kEll).x;
+    if (budget <= 0.0f) return kEll;
+
+    const std::vector<std::size_t> off = utf8_char_offsets(s);
+    const std::size_t chars = off.size() - 1;
+    const auto width_of = [&](std::size_t keep) {
+        const std::size_t head = middle ? keep * 55 / 100 : keep;
+        const std::size_t tail = middle ? keep - head : 0;
+        return ImGui::CalcTextSize(s.substr(0, off[head]).c_str()).x +
+               ImGui::CalcTextSize(s.substr(off[chars - tail]).c_str()).x;
+    };
+    std::size_t lo = 0, hi = chars;
+    while (lo < hi) {
+        const std::size_t mid = (lo + hi + 1) / 2;
+        if (width_of(mid) <= budget) lo = mid; else hi = mid - 1;
+    }
+    if (lo == 0) return kEll;
+    const std::size_t head = middle ? lo * 55 / 100 : lo;
+    const std::size_t tail = middle ? lo - head : 0;
+    return s.substr(0, off[head]) + kEll + s.substr(off[chars - tail]);
+}
+
+// 危险动作的按钮配色（无底色 → 悬停浮出红）：删除图标与"清空 / 清理"文字按钮共用。
+ImVec4 danger_ink() {
+    return g_dark_theme ? ImVec4(0.95f, 0.47f, 0.45f, 1.0f)
+                        : ImVec4(0.76f, 0.22f, 0.19f, 1.0f);
+}
+void push_danger_button(bool hovered) {
+    const ImVec4 red = danger_ink();
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(red.x, red.y, red.z, 0.14f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(red.x, red.y, red.z, 0.26f));
+    ImGui::PushStyleColor(ImGuiCol_Text, hovered ? red : col_dim());
+}
+inline void pop_danger_button() { ImGui::PopStyleColor(4); }
+
+// 行尾的删除按钮：默认无底色，悬停才浮出危险色。
+// 刻意不用 ImGui 的默认按钮——那在浅色主题下就是一块灰方块（人工反馈"按钮很丑"）。
+bool danger_icon_button(float x, float y, const char* tip) {
+    const float h = ImGui::GetFrameHeight();
+    const ImVec2 b0(x, y), b1(x + h, y + h);
+    const bool hov = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+                     ImGui::IsMouseHoveringRect(b0, b1);
+    push_danger_button(hov);
+    ImGui::SetCursorScreenPos(b0);
+    const bool clicked = ImGui::Button(g_icons_ok ? kIcTrash : "×", ImVec2(h, h));
+    pop_danger_button();
+    if (tip != nullptr && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("%s", tip);
+    return clicked;
+}
+
+// 破坏性动作的文字按钮（清空全部 / 清理旧记录）：同一套"无底色、悬停变红"的观感。
+bool danger_text_button(const char* label) {
+    const ImVec2 sz = ImGui::CalcTextSize(label);
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float w = sz.x + st.FramePadding.x * 2.0f;
+    const float h = sz.y + st.FramePadding.y * 2.0f;
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const bool hov = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+                     ImGui::IsMouseHoveringRect(p0, ImVec2(p0.x + w, p0.y + h));
+    push_danger_button(hov);
+    const bool clicked = ImGui::Button(label);
+    pop_danger_button();
+    return clicked;
+}
+
+// 一张文档卡：标题行 + 统计行 + 若干路径行。
+void draw_reading_data_card(std::size_t i) {
+    const std::uint64_t key = g_state.docs[i].first;
+    const lr::DocRecord& r = g_state.docs[i].second;
+
+    const float pad     = px(10.0f);
+    const float row_gap = px(5.0f);
+    const float line    = ImGui::GetTextLineHeight();
+    const float row_h   = line + px(2.0f);
+    const float indent  = px(16.0f);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+
+    constexpr std::size_t kMaxRows = 3;   // 最多铺 3 行路径，多出来的折成"还有 N 处…"
+    const bool more = r.locations.size() > kMaxRows;
+    const std::size_t shown = more ? kMaxRows : r.locations.size();
+    const std::size_t rows = shown + (more ? 1u : 0u);
+    const float card_h = pad * 2.0f + line * 2.0f + row_gap + px(6.0f) +
+                         static_cast<float>(rows) * row_h;
+    const ImVec2 p1(p0.x + w, p0.y + card_h);
+    const bool hov = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+                     ImGui::IsMouseHoveringRect(p0, p1);
+
+    ImGui::PushID(static_cast<int>(i));
+    ImGui::Dummy(ImVec2(w, card_h));   // 先占位撑开整张卡；后面的元素都按绝对坐标摆
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const bool dark = g_dark_theme;
+    dl->AddRectFilled(p0, p1, dark ? IM_COL32(255, 255, 255, hov ? 16 : 8)
+                                   : IM_COL32(0, 0, 0, hov ? 10 : 5), px(7.0f));
+    dl->AddRect(p0, p1,
+                hov ? g_pal.accent
+                    : (dark ? IM_COL32(255, 255, 255, 26) : IM_COL32(0, 0, 0, 18)),
+                px(7.0f), 0, px(1.0f));
+
+    const std::string title = file_name_of_u8(r.locations.front());
+    const float btn = ImGui::GetFrameHeight();
+
+    // 标题行：文档名（左） + 删除按钮（右，垂直居中于标题行）
+    ImGui::SetCursorScreenPos(ImVec2(p0.x + pad, p0.y + pad));
+    ImGui::TextColored(col_text(), "%s",
+                       ellipsize(title, w - pad * 2.0f - btn - px(8.0f), false).c_str());
+    if (danger_icon_button(p1.x - pad - btn, p0.y + pad + (line - btn) * 0.5f,
+                           "删除这份阅读数据")) {
+        request_confirm(ConfirmKind::ClearOne, "删除这份阅读数据？",
+                        "将删除它的阅读位置与书签，文档本身不受影响。",
+                        { { "文档", title }, { "最近位置", r.locations.front() } },
+                        "删除", "取消", key);
+    }
+
+    // 统计行
+    char meta[192];
+    std::size_t n = static_cast<std::size_t>(std::snprintf(
+        meta, sizeof meta, "第 %d 页", r.page + 1));
+    if (r.page_count > 0 && n < sizeof meta)
+        n += static_cast<std::size_t>(std::snprintf(
+            meta + n, sizeof meta - n, " / %d", r.page_count));
+    if (n < sizeof meta)
+        std::snprintf(meta + n, sizeof meta - n, " · %d 个书签 · %d 个位置",
+                      static_cast<int>(r.bookmarks.size()),
+                      static_cast<int>(r.locations.size()));
+    ImGui::SetCursorScreenPos(ImVec2(p0.x + pad, p0.y + pad + line + row_gap));
+    ImGui::TextColored(col_dim(), "%s", meta);
+
+    // 路径行：左侧一条竖导引线 + 每行一个短横，把若干位置挂在标题下面
+    const float x_rule = p0.x + pad + px(6.0f);
+    const float x_text = p0.x + pad + indent;
+    const float y0 = p0.y + pad + line * 2.0f + row_gap + px(6.0f);
+    const ImVec4 dim4 = col_dim();
+    const ImU32 rule = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(dim4.x, dim4.y, dim4.z, dim4.w * 0.40f));
+    if (rows >= 2)   // 只有一条位置时不画竖线，那一段零长度的线毫无意义
+        dl->AddLine(ImVec2(x_rule, y0 + row_h * 0.5f),
+                    ImVec2(x_rule, y0 + row_h * (static_cast<float>(rows) - 0.5f)),
+                    rule, px(1.0f));
+    for (std::size_t k = 0; k < shown; ++k) {
+        const float y = y0 + row_h * static_cast<float>(k);
+        dl->AddLine(ImVec2(x_rule, y + row_h * 0.5f),
+                    ImVec2(x_rule + px(6.0f), y + row_h * 0.5f), rule, px(1.0f));
+        ImGui::SetCursorScreenPos(ImVec2(x_text, y));
+        const std::string cut = ellipsize(r.locations[k], p1.x - pad - x_text, true);
+        ImGui::TextColored(col_dim(), "%s", cut.c_str());
+        // 被省略的完整路径给悬停提示（用鼠标位置判定，不依赖文本项有没有 id）
+        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        if (cut != r.locations[k] && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+            ImGui::IsMouseHoveringRect(a, b) && ImGui::IsMouseHoveringRect(p0, p1))
+            ImGui::SetTooltip("%s", r.locations[k].c_str());
+    }
+    if (more) {
+        ImGui::SetCursorScreenPos(ImVec2(x_text, y0 + row_h * static_cast<float>(shown)));
+        ImGui::TextColored(col_dim(), "还有 %d 处…",
+                           static_cast<int>(r.locations.size() - shown));
+        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+            ImGui::IsMouseHoveringRect(a, b) && ImGui::IsMouseHoveringRect(p0, p1)) {
+            std::string rest;
+            for (std::size_t k = shown; k < r.locations.size(); ++k) {
+                rest += r.locations[k];
+                rest += '\n';
+            }
+            if (!rest.empty()) rest.pop_back();
+            ImGui::SetTooltip("%s", rest.c_str());
+        }
+    }
+
+    ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + px(9.0f)));
+    ImGui::Dummy(ImVec2(1.0f, 0.0f));   // 收尾：让下一张卡从这里开始
+    ImGui::PopID();
+}
+
+// 位置未知的旧记录（升级前的 v1 记录没存过路径，永远显示不出文档名）单独成区：
+// 说清它们是什么、什么时候会被认领，并给一个只清这一类的入口。
+void draw_unknown_records(const std::vector<std::size_t>& idx) {
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextColored(col_text(), "位置未知的旧记录 · %d 条", static_cast<int>(idx.size()));
+    ImGui::TextColored(col_dim(), "%s", "升级前的记录没有保存过文件路径，认不出是哪份文档；");
+    ImGui::TextColored(col_dim(), "%s", "再次打开那个文件时，它会自动认领这里的一条。");
+    ImGui::Spacing();
+
+    const float line = ImGui::GetTextLineHeight();
+    const float btn = ImGui::GetFrameHeight();
+    const float h = line > btn ? line : btn;
+    const float w = ImGui::GetContentRegionAvail().x;
+    for (const std::size_t i : idx) {
+        const std::uint64_t key = g_state.docs[i].first;
+        const lr::DocRecord& r = g_state.docs[i].second;
+        ImGui::PushID(static_cast<int>(i));
+
+        char text[128];
+        if (r.page_count > 0)
+            std::snprintf(text, sizeof text, "第 %d / %d 页 · %d 个书签",
+                          r.page + 1, r.page_count, static_cast<int>(r.bookmarks.size()));
+        else
+            std::snprintf(text, sizeof text, "第 %d 页 · %d 个书签",
+                          r.page + 1, static_cast<int>(r.bookmarks.size()));
+
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(ImVec2(p0.x + px(6.0f), p0.y + (h - line) * 0.5f));
+        ImGui::TextColored(col_dim(), "%s", text);
+        if (danger_icon_button(p0.x + w - btn, p0.y, "删除这条旧记录")) {
+            request_confirm(ConfirmKind::ClearOne, "删除这条阅读数据？",
+                            "将删除它的阅读位置与书签，文档本身不受影响。",
+                            { { "记录", text } }, "删除", "取消", key);
+        }
+        ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + h + px(2.0f)));
+        ImGui::Dummy(ImVec2(1.0f, 0.0f));
+        ImGui::PopID();
+    }
+
+    ImGui::Spacing();
+    char label[64];
+    std::snprintf(label, sizeof label, "清理这 %d 条", static_cast<int>(idx.size()));
+    if (danger_text_button(label)) {
+        char body[224];
+        std::snprintf(body, sizeof body,
+                      "将删除这 %d 条认不出文档的记录（阅读位置与书签）。\n"
+                      "文档本身不受影响，其余记录也不受影响。",
+                      static_cast<int>(idx.size()));
+        request_confirm(ConfirmKind::PruneUnknown, "清理位置未知的旧记录？", body, {},
+                        "清理", "取消", 0);
+    }
 }
 
 }  // namespace
 
-void draw_reading_data_window() {
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const ImVec2 size = clamp_to_viewport(vp, ImVec2(px(520.0f), px(420.0f)));
-    ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(centered_on_viewport(vp, size), ImGuiCond_FirstUseEver);
+// 设置项表格的辅助函数定义在下面（分栏共用）；这里只是前置声明。
+bool settings_rows_begin(const char* id);
+void settings_rows_end();
+void settings_row(const char* label);
+void settings_note(const char* text);
 
-    bool keep = true;
-    if (ImGui::Begin("阅读数据##reading_data", &keep,
-                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
-        const float footer_h = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y * 2.0f;
-        const ImVec4 dim = ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim);
-
-        ImGui::BeginChild("##rd_list", ImVec2(0, -footer_h), false, ImGuiWindowFlags_NoNav);
-        if (g_state.docs.empty()) {
-            ImGui::TextDisabled("还没有记录任何阅读数据。");
-            ImGui::TextDisabled("读到哪、书签和视图参数会在关闭文档时自动记下。");
-        }
-        const float btn_w = ImGui::CalcTextSize("×").x + ImGui::GetStyle().FramePadding.x * 4.0f;
-        const float right = ImGui::GetContentRegionMax().x - btn_w;
-        for (std::size_t i = 0; i < g_state.docs.size(); ++i) {
-            const std::uint64_t key = g_state.docs[i].first;
-            const lr::DocRecord& r = g_state.docs[i].second;
-            ImGui::PushID(static_cast<int>(i));
-
-            const std::string name = record_display_name(r.last_path_u8);
-            ImGui::TextUnformatted(name.c_str());
-            ImGui::SameLine(right);
-            if (ImGui::Button("×", ImVec2(btn_w, 0))) {
-                char body[640];
-                std::snprintf(body, sizeof body,
-                              "《%s》\n%s\n\n将删除它的阅读位置与书签，文档本身不受影响。",
-                              name.c_str(),
-                              r.last_path_u8.empty() ? "(位置未知)" : r.last_path_u8.c_str());
-                request_confirm(ConfirmKind::ClearOne, "删除这条阅读数据？", body,
-                                "删除", "取消", key);
-            }
-            char line[256];
-            if (r.page_count > 0)
-                std::snprintf(line, sizeof line, "第 %d / %d 页 · %d 个书签",
-                              r.page + 1, r.page_count, static_cast<int>(r.bookmarks.size()));
-            else
-                std::snprintf(line, sizeof line, "第 %d 页 · %d 个书签",
-                              r.page + 1, static_cast<int>(r.bookmarks.size()));
-            ImGui::TextColored(dim, "%s", line);
-            if (!r.last_path_u8.empty()) {
-                ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x);
-                ImGui::TextColored(dim, "%s", r.last_path_u8.c_str());
-                ImGui::PopTextWrapPos();
-            }
-            ImGui::Spacing();
-            ImGui::PopID();
-        }
-        ImGui::EndChild();
-
-        ImGui::Separator();
-        ImGui::BeginDisabled(g_state.docs.empty());
-        if (ImGui::Button("清空全部")) {
-            char body[128];
-            std::snprintf(body, sizeof body,
-                          "将删除全部 %d 条阅读数据（阅读位置与书签）。\n文档本身不受影响。",
-                          static_cast<int>(g_state.docs.size()));
-            request_confirm(ConfirmKind::ClearAll, "清空全部阅读数据？", body, "清空", "取消", 0);
-        }
-        ImGui::EndDisabled();
-        const float close_w = ImGui::CalcTextSize("关闭").x + ImGui::GetStyle().FramePadding.x * 2.0f;
-        ImGui::SameLine(ImGui::GetWindowWidth() - close_w - ImGui::GetStyle().WindowPadding.x);
-        if (ImGui::Button("关闭")) g_show_reading_data = false;
+void draw_settings_reading_data_tab() {
+    // 顶部一行：智能匹配三态。它决定"文件换位置后要不要沿用同一份阅读数据"，
+    // 与这一栏是同一件事 —— 放这儿，免得「阅读」栏里再出现一句"见阅读数据分栏"。
+    if (settings_rows_begin("##set_rd_head")) {
+        settings_row("智能匹配");
+        const char* smart[] = { "关（只认路径）", "询问", "自动沿用" };
+        if (ImGui::Combo("##smart", &g_prefs.smart_match, smart, IM_ARRAYSIZE(smart)))
+            save_prefs();
+        settings_note("换位置后沿用同一份阅读数据");
+        settings_rows_end();
     }
-    ImGui::End();
-    if (!keep) g_show_reading_data = false;
+    ImGui::Spacing();
+
+    // 底部操作条**不参与滚动**：列表用负高度，剩下的一行留给「清空全部」+ 计数
+    const float footer_h = ImGui::GetFrameHeightWithSpacing();
+
+    std::vector<std::size_t> known, unknown;
+    for (std::size_t i = 0; i < g_state.docs.size(); ++i)
+        (g_state.docs[i].second.locations.empty() ? unknown : known).push_back(i);
+
+    ImGui::BeginChild("##rd_list", ImVec2(0, -footer_h),
+                      ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoNav);
+    if (g_state.docs.empty()) {
+        ImGui::TextColored(col_dim(), "%s", "还没有记录任何阅读数据。");
+        ImGui::TextColored(col_dim(), "%s", "读到哪、书签和视图参数会在关闭文档时自动记下。");
+    }
+    for (const std::size_t i : known) draw_reading_data_card(i);
+    if (!unknown.empty()) draw_unknown_records(unknown);
+    ImGui::EndChild();
+
+    char count[64];
+    std::snprintf(count, sizeof count, "共 %d 份文档", static_cast<int>(known.size()));
+    ImGui::BeginDisabled(g_state.docs.empty());
+    if (danger_text_button("清空全部")) {
+        char body[176];
+        std::snprintf(body, sizeof body,
+                      "将删除全部 %d 条阅读数据（阅读位置与书签）。\n文档本身不受影响。",
+                      static_cast<int>(g_state.docs.size()));
+        request_confirm(ConfirmKind::ClearAll, "清空全部阅读数据？", body, {},
+                        "清空", "取消", 0);
+    }
+    ImGui::EndDisabled();
+    const float cw = ImGui::CalcTextSize(count).x;
+    ImGui::SameLine(ImGui::GetWindowWidth() - cw - ImGui::GetStyle().WindowPadding.x);
+    ImGui::TextColored(col_dim(), "%s", count);
 }
 
 // ---- 设置窗口（分栏：界面 / 阅读 / 性能 / 按键） ----
@@ -1331,17 +1636,6 @@ void draw_settings_reading_tab() {
         int cm = g_color_mode;
         if (ImGui::Combo("##color", &cm, colors, IM_ARRAYSIZE(colors))) set_color_mode(cm);
         settings_note("快捷键见「按键」分栏");
-
-        settings_row("智能匹配");
-        const char* smart[] = { "关（只认路径）", "询问", "自动沿用" };
-        if (ImGui::Combo("##smart", &g_prefs.smart_match, smart, IM_ARRAYSIZE(smart)))
-            save_prefs();
-        ImGui::Spacing();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_pal.chrome_dim),
-                           "%s", "按内容指纹识别同一份文档：移动、复制、重新解压后仍能接着读");
-        settings_row("阅读数据");
-        if (ImGui::Button("管理…", ImVec2(px(90.0f), 0))) g_show_reading_data = true;
-        settings_note("查看并删除已记录的阅读位置与书签");
         settings_rows_end();
     }
 }
@@ -1521,6 +1815,11 @@ void draw_settings_window() {
                 draw_settings_keys_tab();
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("阅读数据", nullptr,
+                                    want_tab == 4 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                draw_settings_reading_data_tab();
+                ImGui::EndTabItem();
+            }
             ImGui::EndTabBar();
         }
         ImGui::EndChild();
@@ -1545,7 +1844,7 @@ namespace {
 // 有则**不派发全局命令**：一来避免 Esc 之类"既关弹窗又触发命令"（Esc 现已是可绑定键），
 // 二来对话框期间应用级快捷键本就不该抢输入。
 bool any_dialog_open() {
-    if (g_show_settings || g_open_jump || g_open_password || g_show_reading_data) return true;
+    if (g_show_settings || g_open_jump || g_open_password) return true;
     return ImGui::IsPopupOpen(nullptr,
                               ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
 }
@@ -1649,7 +1948,6 @@ void draw_shell() {
     draw_jump_popup();
     draw_password_popup();
     draw_confirm_popup();                                   // 智能匹配询问 / 删除二次确认
-    if (g_show_reading_data) draw_reading_data_window();
     draw_settings_window();
     update_key_capture();   // 在设置窗口绘制之后推进按键捕获（跳过"点按钮"那一帧的鼠标点击）
 
@@ -1667,8 +1965,6 @@ void draw_shell() {
             g_open_jump = false;
         } else if (g_show_settings) {
             g_show_settings = false;
-        } else if (g_show_reading_data) {
-            g_show_reading_data = false;
         } else if (g_confirm_open) {
             // 确认弹窗上按 Esc = 次按钮（"取消"）；智能匹配的次按钮是"从头开始"，
             // 那不是 Esc 该替用户做的决定，故这里只按"沿用"（已经沿用过了）关掉弹窗。

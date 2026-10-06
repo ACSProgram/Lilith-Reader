@@ -137,14 +137,20 @@ bool read_bookmarks(Reader& rd, DocRecord& r) noexcept {
     return !rd.bad;
 }
 
-// 记录体（v2：key 之后是身份三件套，再是阅读状态）
-bool read_record_v2(Reader& rd, std::uint64_t key, ReaderState& tmp) noexcept {
+// 记录体（v3：key 之后是身份 + 位置列表，再是阅读状态）
+bool read_record_v3(Reader& rd, std::uint64_t key, ReaderState& tmp) noexcept {
     DocRecord r;
     r.path_key = rd.u64();
     r.page_count = rd.i32();
-    const std::uint32_t plen = rd.u32();
-    r.last_path_u8 = rd.str(plen, kMaxPathBytes);
-    if (rd.bad) return false;
+    const std::uint32_t locs = rd.u32();
+    if (rd.bad || locs > kMaxLocations) return false;
+    r.locations.reserve(locs);
+    for (std::uint32_t j = 0; j < locs; ++j) {
+        const std::uint32_t len = rd.u32();
+        std::string p = rd.str(len, kMaxPathBytes);
+        if (rd.bad) return false;
+        if (!p.empty()) r.locations.push_back(std::move(p));
+    }
 
     r.page = rd.i32();
     r.zoom = rd.f32();
@@ -162,7 +168,33 @@ bool read_record_v2(Reader& rd, std::uint64_t key, ReaderState& tmp) noexcept {
     return true;
 }
 
-// 记录体（v1：只有阅读状态，key 本身即路径键 → 填进 path_key）
+// 记录体（v2：只有一条路径 → 迁进 locations[0]）
+bool read_record_v2(Reader& rd, std::uint64_t key, ReaderState& tmp) noexcept {
+    DocRecord r;
+    r.path_key = rd.u64();
+    r.page_count = rd.i32();
+    const std::uint32_t plen = rd.u32();
+    const std::string path = rd.str(plen, kMaxPathBytes);
+    if (rd.bad) return false;
+    if (!path.empty()) r.locations.push_back(path);
+
+    r.page = rd.i32();
+    r.zoom = rd.f32();
+    r.columns = rd.i32();
+    r.rotation = rd.i32();
+    const std::uint32_t flags = rd.u32();
+    r.color_mode = rd.i32();
+    r.fit_width = (flags & 1u) != 0;
+    r.spread = (flags & 2u) != 0;
+    if (rd.bad) return false;
+
+    if (!read_bookmarks(rd, r)) return false;
+    clamp_record(r);
+    if (key != 0) tmp.docs.emplace_back(key, std::move(r));
+    return true;
+}
+
+// 记录体（v1：只有阅读状态，key 本身即路径键 → 填进 path_key；位置无从还原，留空）
 bool read_record_v1(Reader& rd, std::uint64_t key, ReaderState& tmp) noexcept {
     DocRecord r;
     r.page = rd.i32();
@@ -204,6 +236,41 @@ bool ReaderState::erase(std::uint64_t key) noexcept {
     for (auto it = docs.begin(); it != docs.end(); ++it) {
         if (it->first == key) { docs.erase(it); return true; }
     }
+    return false;
+}
+
+bool rekey(ReaderState& s, std::size_t idx, std::uint64_t new_key) noexcept {
+    if (idx >= s.docs.size() || new_key == 0) return false;
+    for (std::size_t i = 0; i < s.docs.size(); ++i) {
+        if (i != idx && s.docs[i].first == new_key) return false;   // 已被占用
+    }
+    s.docs[idx].first = new_key;
+    return true;
+}
+
+// ---- 已知位置（ADR-065）----
+void remember_location(DocRecord& r, const std::string& path_u8) {
+    if (path_u8.empty()) return;
+    for (auto it = r.locations.begin(); it != r.locations.end(); ++it) {
+        if (*it == path_u8) {
+            if (it == r.locations.begin()) return;          // 已在最前，无事可做
+            r.locations.erase(it);                          // 挪到最前：最近打开的优先
+            break;
+        }
+    }
+    r.locations.insert(r.locations.begin(), path_u8);
+    if (r.locations.size() > kMaxLocations) r.locations.resize(kMaxLocations);
+}
+
+const std::string& last_location(const DocRecord& r) noexcept {
+    static const std::string kEmpty;
+    return r.locations.empty() ? kEmpty : r.locations.front();
+}
+
+bool has_location(const DocRecord& r, const std::string& path_u8) noexcept {
+    if (path_u8.empty()) return false;
+    for (const std::string& p : r.locations)
+        if (p == path_u8) return true;
     return false;
 }
 
@@ -258,7 +325,7 @@ DocMatch locate(const ReaderState& s, const DocIdentity& id, bool smart) noexcep
             const DocRecord& r = s.docs[i].second;
             if (!usable(r)) continue;
             m.index = static_cast<int>(i);
-            m.relocated = !r.last_path_u8.empty() && r.last_path_u8 != id.path_u8;
+            m.relocated = !r.locations.empty() && !has_location(r, id.path_u8);
             return m;
         }
     }
@@ -282,7 +349,7 @@ std::uint64_t adopt(ReaderState& s, std::size_t idx, const DocIdentity& id) noex
     DocRecord& r = s.docs[idx].second;
     r.path_key = id.path;
     r.page_count = id.page_count;
-    r.last_path_u8 = id.path_u8;
+    remember_location(r, id.path_u8);
     const std::uint64_t key = primary_key(id);
     if (key != 0) s.docs[idx].first = key;   // 改挂到内容指纹下：以后换位置也能直接命中
     return s.docs[idx].first;
@@ -293,7 +360,7 @@ std::uint64_t adopt(ReaderState& s, std::size_t idx, const DocIdentity& id) noex
 std::vector<std::uint8_t> encode_state(const ReaderState& s) {
     std::vector<std::uint8_t> b;
     b.reserve(64 + s.docs.size() * 64);
-    b.push_back('L'); b.push_back('R'); b.push_back('S'); b.push_back('2');
+    b.push_back('L'); b.push_back('R'); b.push_back('S'); b.push_back('3');
     put_u32(b, kStateVersion);
     put_u32(b, static_cast<std::uint32_t>(s.docs.size()));
 
@@ -302,11 +369,16 @@ std::vector<std::uint8_t> encode_state(const ReaderState& s) {
         put_u64(b, kv.first);
         put_u64(b, r.path_key);
         put_u32(b, static_cast<std::uint32_t>(r.page_count));
-        // 路径按上限截断（超长路径不进文件，宁可丢"上次在哪"也不让文件膨胀）
-        std::uint32_t plen = static_cast<std::uint32_t>(r.last_path_u8.size());
-        if (plen > kMaxPathBytes) plen = kMaxPathBytes;
-        put_u32(b, plen);
-        b.insert(b.end(), r.last_path_u8.begin(), r.last_path_u8.begin() + plen);
+        // 位置按上限截断（超长路径不进文件，宁可丢"上次在哪"也不让文件膨胀）
+        const std::size_t ln = r.locations.size() > kMaxLocations ? kMaxLocations
+                                                                  : r.locations.size();
+        put_u32(b, static_cast<std::uint32_t>(ln));
+        for (std::size_t i = 0; i < ln; ++i) {
+            std::uint32_t plen = static_cast<std::uint32_t>(r.locations[i].size());
+            if (plen > kMaxPathBytes) plen = kMaxPathBytes;
+            put_u32(b, plen);
+            b.insert(b.end(), r.locations[i].begin(), r.locations[i].begin() + plen);
+        }
 
         put_u32(b, static_cast<std::uint32_t>(r.page));
         put_u32(b, std::bit_cast<std::uint32_t>(r.zoom));
@@ -339,11 +411,12 @@ bool decode_state(const std::uint8_t* data, std::size_t size, ReaderState& out) 
     if (data == nullptr || size < 12) return false;
     Reader rd{ data, size, 0, false };
 
-    // magic 决定版本：LRS1 → v1（旧格式，key 即路径键），LRS2 → v2
+    // magic 决定版本：LRS1 → v1（旧格式，key 即路径键），LRS2 → v2（单路径），LRS3 → v3
     if (rd.p[0] != 'L' || rd.p[1] != 'R' || rd.p[2] != 'S') return false;
     int version = 0;
     if (rd.p[3] == '1')      version = 1;
     else if (rd.p[3] == '2') version = 2;
+    else if (rd.p[3] == '3') version = 3;
     else return false;
     rd.off = 4;
 
@@ -357,8 +430,12 @@ bool decode_state(const std::uint8_t* data, std::size_t size, ReaderState& out) 
     tmp.docs.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::uint64_t key = rd.u64();
-        const bool ok = (version == 2) ? read_record_v2(rd, key, tmp)
-                                       : read_record_v1(rd, key, tmp);
+        bool ok = false;
+        switch (version) {
+            case 3:  ok = read_record_v3(rd, key, tmp); break;
+            case 2:  ok = read_record_v2(rd, key, tmp); break;
+            default: ok = read_record_v1(rd, key, tmp); break;
+        }
         if (!ok) return false;
     }
     if (rd.bad) return false;

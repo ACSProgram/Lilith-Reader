@@ -13,7 +13,8 @@
 //     `relocated`（记录里记的路径与当前路径不同 = 文件被移动过，交给 UI 决定是否询问）。
 //   · **二进制格式带 magic + 版本号**：解析失败一律**安全拒绝**（返回空状态），
 //     绝不因损坏的状态文件而崩溃或丢文档——宁可丢掉阅读位置，也不能影响打开文档。
-//     版本 v1（`LRS1`）仍可解码并自动迁移（v1 的 key 就是路径键 → 填进 `path_key`）。
+//     旧版（`LRS1` / `LRS2`）都能解码并自动迁移：v2 的单条路径填进 locations[0]，
+//     v1 连路径都没存过（键里只有哈希）→ locations 为空 = "位置未知"。
 //   · **原子写入**：先写临时文件再 MoveFileExW 替换，杜绝写坏。
 //
 // 本模块**零项目内依赖**（只依赖标准库与 Win32），不 import document/canvas/render；
@@ -50,11 +51,27 @@ struct DocRecord {
     int   color_mode = 0;     // 0 正常 / 1 反色 / 2 护眼
     std::vector<Bookmark> bookmarks;
 
-    // ---- 身份（ADR-062）----
-    std::uint64_t path_key = 0;   // 记录时刻的"路径+大小+修改时间"键（v1 迁移 / 兜底命中用）
+    // ---- 身份（ADR-062 / ADR-065）----
+    std::uint64_t path_key = 0;   // 最近位置的"路径+大小+修改时间"键（v1 迁移 / 兜底命中用）
     int           page_count = 0; // 记录时刻的页数（0 = 未知，不参与继承校验）
-    std::string   last_path_u8;   // 最近一次打开的路径（UTF-8）；v1 记录为空 = 位置未知
+    // 已知位置（UTF-8），**最近打开的在前**。同一份内容在多个地方各有一份时，这里会有多条
+    // ——这正是"一份阅读数据、若干路径"的表达（管理窗口按它画路径树）。
+    // 空 = 位置未知（升级前的 v1 记录没存过路径，无从还原）。
+    std::vector<std::string> locations;
 };
+
+// 每份文档最多记多少个已知位置：超过就丢最旧的（防止"来回复制"把文件撑大）。
+inline constexpr std::size_t kMaxLocations = 8;
+
+// 记住一个位置：已记过的挪到最前，新的插到最前，超过 kMaxLocations 丢最旧的。
+// 空串忽略（位置未知时不往里塞空条目）。
+void remember_location(DocRecord& r, const std::string& path_u8);
+
+// 最近一次打开的位置；空串 = 位置未知。调用方拿到的引用在 r.locations 变动前有效。
+[[nodiscard]] const std::string& last_location(const DocRecord& r) noexcept;
+
+// 该位置是否已记过（判"换没换地方"用）。
+[[nodiscard]] bool has_location(const DocRecord& r, const std::string& path_u8) noexcept;
 
 // ---- 文档身份：打开时算一次，用来在库里定位记录 ----
 struct DocIdentity {
@@ -82,6 +99,11 @@ struct ReaderState {
     bool erase(std::uint64_t key) noexcept;
 };
 
+// 把第 idx 条记录改挂到 new_key（键本身变了，记录内容不动）。idx 越界、new_key 为 0、
+// 或 new_key 已被**别的**记录占用 → 返回 false 什么都不做。
+// 用途：把一份共享的阅读数据拆成两条各自独立的记录（ADR-065「另起一份」）。
+[[nodiscard]] bool rekey(ReaderState& s, std::size_t idx, std::uint64_t new_key) noexcept;
+
 // 文档键：路径（UTF-16 码元）+ 文件大小 + 修改时间 的 FNV-1a 64 位哈希（ADR-034 的旧键）。
 // 路径不存在/取不到属性时返回 0（视为无效键，不参与存取）。
 [[nodiscard]] std::uint64_t document_key(const std::wstring& path) noexcept;
@@ -92,25 +114,29 @@ struct ReaderState {
 // 分层定位记录：smart=true 时先按内容指纹找（文件被移动/复制/重新解压后仍能命中），
 // 再按路径键找（同一路径直接沿用，含 v1 记录迁移）。页数已知且与记录不符的跳过
 // —— 页数都变了就不是同一版，书签会错位。
+// `relocated` = 记录里**没有**当前这个位置（确实是换了个地方打开，值得问一句）；
+// 路径早就记过（比如同一份书在两处各存一份）就不算。
 [[nodiscard]] DocMatch locate(const ReaderState& s, const DocIdentity& id, bool smart) noexcept;
 
-// 让 idx 处的记录归属 id：主键改挂到 content（可用时），刷新 path_key / page_count /
-// last_path。返回落定后的主键（供调用方存为"当前文档键"）。
+// 让 idx 处的记录归属 id：主键改挂到 content（可用时），刷新 path_key / page_count，
+// 并把当前路径记进 locations。返回落定后的主键（供调用方存为"当前文档键"）。
 [[nodiscard]] std::uint64_t adopt(ReaderState& s, std::size_t idx,
                                   const DocIdentity& id) noexcept;
 
 // ---- 纯序列化（不碰磁盘，可单测） ----
 //
 // 格式（全部小端）：
-//   v2：magic 'L''R''S''2' | u32 version=2 | u32 doc_count
-//       每条记录： u64 key | u64 path_key | i32 page_count | u32 path_len | path bytes
+//   v3：magic 'L''R''S''3' | u32 version=3 | u32 doc_count
+//       每条记录： u64 key | u64 path_key | i32 page_count
+//                  | u32 loc_count | loc_count × (u32 len | bytes)
 //                  | i32 page | u32 zoom(bits) | i32 columns | i32 rotation
 //                  | u32 flags(bit0 fit_width, bit1 spread) | i32 color_mode
 //                  | u32 bookmark_count | 每个书签: i32 page | u32 label_len | label bytes
+//   v2：与 v3 同构，但"位置"只有一个（u32 len | bytes）→ 非空时填进 locations[0]。
 //   v1：magic 'L''R''S''1' | u32 version=1 | u32 doc_count
 //       每条记录： u64 key | i32 page | u32 zoom | i32 columns | i32 rotation
 //                  | u32 flags | i32 color_mode | u32 bookmark_count | 书签…
-//       解码时把 key 当作 path_key 填入（v1 的键就是路径键），page_count=0、last_path 为空。
+//       解码时把 key 当作 path_key 填入（v1 的键就是路径键），page_count=0、locations 为空。
 [[nodiscard]] std::vector<std::uint8_t> encode_state(const ReaderState& s);
 
 // 解析。magic/版本不符、数据截断、超限一律返回 false 且**不改动 out**。
@@ -127,8 +153,9 @@ struct ReaderState {
 inline constexpr std::uint32_t kMaxDocs = 4096;
 inline constexpr std::uint32_t kMaxBookmarksPerDoc = 1024;
 inline constexpr std::uint32_t kMaxLabelBytes = 512;
-inline constexpr std::uint32_t kMaxPathBytes = 1024;   // last_path 上限（超长路径会被截断）
-inline constexpr std::uint32_t kStateVersion = 2;
+inline constexpr std::uint32_t kMaxPathBytes = 1024;   // 单个位置的上限（超长路径会被截断）
+inline constexpr std::uint32_t kStateVersion = 3;
+inline constexpr std::uint32_t kStateVersionV2 = 2;
 inline constexpr std::uint32_t kStateVersionV1 = 1;
 
 }  // namespace lr
