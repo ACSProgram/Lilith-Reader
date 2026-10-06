@@ -11,23 +11,36 @@ permissions:
 
 defaults:
   run:
-    shell: powershell
+    # PowerShell 7, not Windows PowerShell 5.1: the `>> $env:GITHUB_OUTPUT` /
+    # `>> $env:GITHUB_ENV` writes below must be UTF-8. 5.1's redirection emits
+    # UTF-16LE and the runner would read the values back as garbage.
+    shell: pwsh
 
 jobs:
   build-and-test:
     name: Windows build and tests
     runs-on: windows-2025
 
-    env:
-      # The libmupdf port emits an unquoted /LIBPATH in one build step. Keep
-      # both vcpkg roots outside the repository checkout, whose name contains
-      # a space on this project.
-      VCPKG_INSTALL_ROOT: ${{ runner.temp }}\lilith-reader\vcpkg-installed
-      VCPKG_BINARY_CACHE: ${{ runner.temp }}\lilith-reader\vcpkg-binary-cache
-
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Resolve build paths
+        id: paths
+        run: |
+          # The libmupdf port emits an unquoted /LIBPATH in one build step. Keep
+          # both vcpkg roots outside the repository checkout, whose name contains
+          # a space on this project: the path would otherwise be split into two
+          # arguments (LNK1181).
+          #
+          # The `runner` context is not available in a job-level `env:` block, so
+          # the roots are resolved here and exported to later steps instead.
+          $root = Join-Path $env:RUNNER_TEMP 'lilith-reader'
+          $install = Join-Path $root 'vcpkg-installed'
+          $cache = Join-Path $root 'vcpkg-binary-cache'
+          "VCPKG_INSTALL_ROOT=$install" >> $env:GITHUB_ENV
+          "VCPKG_BINARY_CACHE=$cache" >> $env:GITHUB_ENV
+          "cache=$cache" >> $env:GITHUB_OUTPUT
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -73,7 +86,7 @@ jobs:
       - name: Cache vcpkg binaries
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}\lilith-reader\vcpkg-binary-cache
+          path: ${{ steps.paths.outputs.cache }}
           key: windows-vcpkg-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'overlay-ports/**') }}
           restore-keys: |
             windows-vcpkg-
