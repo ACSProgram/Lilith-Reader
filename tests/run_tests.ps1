@@ -25,6 +25,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Python 子进程的 stdio 编码不跟随下面的 [Console]::OutputEncoding：stdout 是管道时，
+# Python 用系统 ANSI 代码页编码输出（开发机 zh-CN = GBK 恰好能编中文，CI runner 的
+# cp1252 编不了，make_samples.py 打印第一行中文日志就抛 UnicodeEncodeError）。
+# PYTHONUTF8=1 让所有 Python 子进程（make_samples / check_*）一律 UTF-8，
+# 不依赖机器 locale。本脚本里所有文本读写均已显式 encoding，不受默认编码变化影响。
+$env:PYTHONUTF8 = "1"
 $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $tests = Join-Path $repo "tests"
 $samples = Join-Path $tests "samples"
