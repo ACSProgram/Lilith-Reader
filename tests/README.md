@@ -11,7 +11,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Probe   # 额外�
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # 复用已有 samples/
 ```
 
-- 退出码 = 任一测试失败即非零，可直接接入 CI。
+- 退出码 = 任一测试失败即非零；已接入 CI（`.github/workflows/pr.yml`，PR 与推 `main` 触发，见 ADR-076）。
 - `tests/samples/`、`tests/_build/` 为生成物，已 gitignore。
 
 ## 文件

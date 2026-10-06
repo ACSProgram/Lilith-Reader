@@ -1,5 +1,7 @@
 # Lilith Reader
 
+[![PR CI](https://github.com/ACSProgram/Lilith-Reader/actions/workflows/pr.yml/badge.svg)](https://github.com/ACSProgram/Lilith-Reader/actions/workflows/pr.yml)
+
 从 [Lilith](F:\programs\Lilith) 主项目分离出来的轻量级文档阅读器。目标：**单 exe、零外部依赖、极致效率、体面美观、长期稳定**。
 
 ## 目标特性
@@ -96,6 +98,8 @@
   （经 [ADR-072](docs/03-决策记录.md) 的 overlay port 裁剪罕用字体）
 - MSVC `/MT`（静态 CRT）+ `/O2` + `/utf-8`
 - 构建：VS 打开 `LilithReader.slnx` 直接 F5，或命令行运行 `build.bat`
+- **持续集成**：`.github/workflows/pr.yml` 在 PR 与推 `main` 时于 `windows-2025` runner 上自动跑
+  Release 构建 + `tests/run_tests.ps1` 全量回归（[ADR-076](docs/03-决策记录.md)）
 - 产出：`bin\Release\LilithReader.exe`（约 38 MiB / 39,909,888 字节，静态 CRT，仅依赖系统组件 DLL）
 - **若 MSBuild 报 `MSB6001`（"CL.exe 的命令行开关无效 / 字典中的关键字 "Path"**）：
   这是环境问题而非工程问题 —— 当前进程的环境块里同时有 `Path` 与 `PATH`（大小写重复），

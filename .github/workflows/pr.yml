@@ -1,0 +1,140 @@
+name: PR CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  build-and-test:
+    name: Windows build and tests
+    runs-on: windows-2025
+
+    env:
+      # The libmupdf port emits an unquoted /LIBPATH in one build step. Keep
+      # both vcpkg roots outside the repository checkout, whose name contains
+      # a space on this project.
+      VCPKG_INSTALL_ROOT: ${{ runner.temp }}\lilith-reader\vcpkg-installed
+      VCPKG_BINARY_CACHE: ${{ runner.temp }}\lilith-reader\vcpkg-binary-cache
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Python test dependencies
+        run: python -m pip install --disable-pip-version-check pillow fonttools pymupdf
+
+      - name: Locate Visual Studio and vcpkg
+        id: tools
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe was not found"
+          }
+
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) {
+            throw "No Visual Studio installation with the C++ toolset was found"
+          }
+
+          $msbuild = Join-Path $vsPath 'MSBuild\Current\Bin\MSBuild.exe'
+          $vcpkg = Join-Path $vsPath 'VC\vcpkg\vcpkg.exe'
+          if (-not (Test-Path $msbuild)) { throw "MSBuild was not found at $msbuild" }
+          if (-not (Test-Path $vcpkg)) { throw "vcpkg was not found at $vcpkg" }
+
+          $toolset = 'v145'
+          $msvcRoot = Join-Path $vsPath 'VC\Tools\MSVC'
+          if (-not (Get-ChildItem $msvcRoot -Directory -Filter '14.5*' -ErrorAction SilentlyContinue)) {
+            $toolset = 'v143'
+          }
+
+          "VS_PATH=$vsPath" >> $env:GITHUB_OUTPUT
+          "MSBUILD=$msbuild" >> $env:GITHUB_OUTPUT
+          "VCPKG=$vcpkg" >> $env:GITHUB_OUTPUT
+          "TOOLSET=$toolset" >> $env:GITHUB_OUTPUT
+          Write-Host "Visual Studio: $vsPath"
+          Write-Host "MSBuild: $msbuild"
+          Write-Host "vcpkg: $vcpkg"
+          Write-Host "PlatformToolset: $toolset"
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\lilith-reader\vcpkg-binary-cache
+          key: windows-vcpkg-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'overlay-ports/**') }}
+          restore-keys: |
+            windows-vcpkg-
+
+      - name: Install C++ dependencies
+        run: |
+          $manifestRoot = Join-Path $env:RUNNER_TEMP 'lilith-reader\manifest'
+          New-Item -ItemType Directory -Force -Path $manifestRoot, $env:VCPKG_INSTALL_ROOT, $env:VCPKG_BINARY_CACHE | Out-Null
+
+          # The checked-in manifest predates vcpkg's mandatory baseline field.
+          # Keep that compatibility detail in CI without changing project files
+          # that are also edited by the UI work in progress.
+          $manifest = Get-Content "$env:GITHUB_WORKSPACE\vcpkg.json" -Raw | ConvertFrom-Json
+          $manifest | Add-Member -NotePropertyName 'builtin-baseline' -NotePropertyValue 'a0400024711b283056538ac19ced80b91a83c24c' -Force
+          $manifest | ConvertTo-Json -Depth 20 | Set-Content "$manifestRoot\vcpkg.json" -Encoding utf8
+
+          Push-Location $manifestRoot
+          try {
+            & '${{ steps.tools.outputs.VCPKG }}' install `
+              --x-install-root "$env:VCPKG_INSTALL_ROOT" `
+              --triplet x64-windows-static `
+              --overlay-ports "$env:GITHUB_WORKSPACE\overlay-ports" `
+              --binarysource "clear;files,$env:VCPKG_BINARY_CACHE,readwrite"
+          } finally {
+            Pop-Location
+          }
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed with exit code $LASTEXITCODE" }
+
+      - name: Build Release application
+        run: |
+          $msbuild = '${{ steps.tools.outputs.MSBUILD }}'
+          $vcpkgRoot = '${{ steps.tools.outputs.VS_PATH }}\VC\vcpkg'
+          $installRoot = $env:VCPKG_INSTALL_ROOT
+          & '${{ steps.tools.outputs.MSBUILD }}' `
+            "$env:GITHUB_WORKSPACE\src\LilithReader.vcxproj" `
+            /m `
+            /nologo `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:PlatformToolset=${{ steps.tools.outputs.TOOLSET }} `
+            /p:VcpkgEnableManifest=false `
+            /p:VcpkgEnableClassic=true `
+            "/p:VcpkgRoot=$vcpkgRoot" `
+            "/p:VcpkgInstalledDir=$installRoot"
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE" }
+
+      - name: Run automated tests
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File "$env:GITHUB_WORKSPACE\tests\run_tests.ps1" `
+            -VcpkgRoot "$env:VCPKG_INSTALL_ROOT"
+          if ($LASTEXITCODE -ne 0) { throw "Automated tests failed with exit code $LASTEXITCODE" }
+
+      - name: Upload test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-ci-diagnostics
+          if-no-files-found: ignore
+          path: |
+            tests/_build/**
+            tests/samples/**
+            build/**
+            bin/**
