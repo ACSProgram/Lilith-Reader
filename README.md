@@ -143,9 +143,6 @@ installer\build_installer.bat        :: 需 Inno Setup 6；先跑过 build.bat
 - **最大化状态下退出全屏有一次可见抖动**：窗口先向左上收缩一下再归位。普通窗口无此现象。
   已排除帧内命令时机、Win32 调用顺序、swapchain 重建时机三个方向，剩余疑点在
   `SetWindowPlacement(SW_SHOWMAXIMIZED)` 的内部中间态。
-- **Windows Defender 可能误报**：未签名 + 静态链接的 exe 容易被启发式引擎误判。
-  本机把 `bin\` 加入排除项，或[向微软上报误报](https://www.microsoft.com/en-us/wdsi/filesubmission)；
-  彻底解决需要代码签名证书。
 - **不做 OCR**：纯扫描件没有文字层，既选不中也搜不到。
 - **MOBI 只支持未压缩与 PalmDOC 两种压缩**：Kindle 生成的 MOBI 多用 HUFF/CDIC 压缩，
   MuPDF 没有实现这条路径，这类 `.mobi` 会提示"暂不支持的格式"（其余 MOBI 正常打开）。
