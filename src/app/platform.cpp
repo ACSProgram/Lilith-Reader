@@ -3,7 +3,7 @@
 // 职责（不感知文档/阅读状态，只提供"外壳运行所需的底座"）：
 //   · D3D11 设备与交换链（RAII）
 //   · ImGui 上下文与后端引导、中文字体 + 图标字形合并
-//   · DPI / 界面缩放（g_dpi_scale × g_user_scale）
+//   · DPI / 界面缩放（g_app.dpi_scale × g_app.user_scale）
 //   · 主题（浅/深/跟随系统）与纸张方案派生出的 chrome 明暗/暖化
 //   · 用户偏好持久化（exe 同目录 LilithReader.ini）
 //   · 输入法关联切换（ADR-028/040）与全屏
@@ -29,7 +29,7 @@ namespace lr::app {
 // 字形编码在 Unicode 私用区（PUA），故以 UTF-8 字面量写死，逐个标注码位便于核对
 // （码位对照表见 docs/03-决策记录.md ADR-045）。**只列本项目实际用到的字形**：多烘一个
 // 字形就多一份图集体积与一处校验点，无用的码位不应留在表里。
-// 该字体缺失（或任一码位无字形）时 g_icons_ok = false，所有按钮退化为文字标签。
+// 该字体缺失（或任一码位无字形）时 g_app.icons_ok = false，所有按钮退化为文字标签。
 constexpr const char* kIconGlyphs =
     "\xEE\x9C\x80\xEE\xA2\xA0\xEE\xA2\xA3\xEE\x9C\x9F\xEE\x9D\x80\xEE\x87\x99"  // E700 E8A0 E8A3 E71F E740 E1D9
     "\xEE\x9C\xB4\xEE\x9C\x93\xEE\xA2\x97\xEE\x9E\xAD\xEE\x9C\x91\xEE\x9D\x8B"  // E734 E713 E897 E7AD E711 E74B
@@ -101,16 +101,16 @@ void apply_ui_scale() {
     ImGuiStyle& st = ImGui::GetStyle();
     st = g_base_style;
     st.ScaleAllSizes(ui_scale());      // 内边距/间距/圆角/滚动条（不含字体）
-    st.FontScaleMain = g_user_scale;   // 字体：主缩放（来自「设置 → 界面缩放」）
-    st.FontScaleDpi = g_dpi_scale;     // 字体：DPI 缩放（自动）
-    if (g_theme_applied) apply_theme_colors();  // 覆盖 g_base_style 里的浅色配色
+    st.FontScaleMain = g_app.user_scale;   // 字体：主缩放（来自「设置 → 界面缩放」）
+    st.FontScaleDpi = g_app.dpi_scale;     // 字体：DPI 缩放（自动）
+    if (g_app.theme_applied) apply_theme_colors();  // 覆盖 g_base_style 里的浅色配色
 }
 
 void refresh_dpi_scale() {
-    if (!g_hwnd) return;
-    const float dpi = ImGui_ImplWin32_GetDpiScaleForHwnd(g_hwnd);
-    if (dpi > 0.0f && std::fabs(dpi - g_dpi_scale) > 0.001f) {
-        g_dpi_scale = dpi;
+    if (!g_app.hwnd) return;
+    const float dpi = ImGui_ImplWin32_GetDpiScaleForHwnd(g_app.hwnd);
+    if (dpi > 0.0f && std::fabs(dpi - g_app.dpi_scale) > 0.001f) {
+        g_app.dpi_scale = dpi;
         apply_ui_scale();
     }
 }
@@ -192,20 +192,20 @@ constexpr Tone kToneWarmPage{ true, 40.0f, 0.155f, 0.87f, 0.70f, 0.25f,
 }  // namespace
 
 ImVec4 tone_apply(ImVec4 c) {
-    if (!g_tone.active) return c;
-    const Rgb o = lr::app::tone_apply(Rgb{ c.x, c.y, c.z }, g_tone);
+    if (!g_app.tone.active) return c;
+    const Rgb o = lr::app::tone_apply(Rgb{ c.x, c.y, c.z }, g_app.tone);
     return ImVec4(o.r, o.g, o.b, c.w);
 }
 
 ImU32 tone_apply(ImU32 c) {
-    if (!g_tone.active) return c;
+    if (!g_app.tone.active) return c;
     return ImGui::ColorConvertFloat4ToU32(tone_apply(ImGui::ColorConvertU32ToFloat4(c)));
 }
 
 // 由中性底派生当前方案的调色板。半透明色（页面投影、页面描边）只换 RGB，alpha 原样 ——
 // 它们本来就是"叠在画布上的一层黑/白"，改透明度会连叠出来的效果一起变。
 Palette tone_palette(const Palette& base) {
-    if (!g_tone.active) return base;
+    if (!g_app.tone.active) return base;
     Palette p;
     p.backdrop            = tone_apply(base.backdrop);
     p.chrome              = tone_apply(base.chrome);
@@ -233,7 +233,7 @@ Palette tone_palette(const Palette& base) {
 void apply_theme_colors() {
     ImGuiStyle& st = ImGui::GetStyle();
     ImVec4* c = st.Colors;
-    if (g_dark_theme) {
+    if (g_app.dark_theme) {
         ImGui::StyleColorsDark(&st);
         c[ImGuiCol_Text]                  = ImVec4(0.85f, 0.86f, 0.88f, 1.00f);
         c[ImGuiCol_TextDisabled]          = ImVec4(0.50f, 0.53f, 0.57f, 1.00f);
@@ -302,8 +302,8 @@ void apply_theme_colors() {
         c[ImGuiCol_TabSelectedOverline]   = ImVec4(0.23f, 0.49f, 0.85f, 1.00f);
     }
     // 纸张方案下，控件配色的**全部**条目统一过一遍色调映射 —— 逐条手写变体既难保持一致，
-    // 也必然漏改某几个（ADR-068）。原色方案下 g_tone.active 为假，这一步是空操作。
-    if (g_tone.active) {
+    // 也必然漏改某几个（ADR-068）。原色方案下 g_app.tone.active 为假，这一步是空操作。
+    if (g_app.tone.active) {
         for (int i = 0; i < ImGuiCol_COUNT; ++i) c[i] = tone_apply(c[i]);
     }
 }
@@ -316,19 +316,19 @@ void apply_theme_colors() {
 //   · 色调来自**纸张方案**：中性表面族旋到与纸面同色相，强调色换成该方案的强调色。
 // 这样"页面暖、周围冷""页面暖、按钮冷"两个不协调从源头消失 —— 两侧走同一条映射。
 void sync_theme(int scheme) {
-    const bool follows_system = g_prefs.theme == 0;
-    const bool want_dark = (g_prefs.theme == 2) ||
+    const bool follows_system = g_app.prefs.theme == 0;
+    const bool want_dark = (g_app.prefs.theme == 2) ||
                            (follows_system &&
                             (system_prefers_dark_cached() || scheme == 1));
     const Tone& want_tone = (scheme == 1) ? kToneDarkPage
                           : (scheme == 2) ? kToneWarmPage
                                           : kToneOriginal;
-    if (g_theme_applied && want_dark == g_dark_theme && tone_same(want_tone, g_tone)) return;
-    g_dark_theme = want_dark;
-    g_tone = want_tone;
-    g_pal = tone_palette(want_dark ? kPalDark : kPalLight);
+    if (g_app.theme_applied && want_dark == g_app.dark_theme && tone_same(want_tone, g_app.tone)) return;
+    g_app.dark_theme = want_dark;
+    g_app.tone = want_tone;
+    g_app.pal = tone_palette(want_dark ? kPalDark : kPalLight);
     apply_theme_colors();
-    g_theme_applied = true;
+    g_app.theme_applied = true;
 }
 
 // ---------------- D3D11 ----------------
@@ -575,18 +575,18 @@ void ImGuiRaii::initialize(HWND hwnd) {
         //  · GlyphOffset.y：消掉 MDL2 与微软雅黑的基线差异（实测图标光学中心偏高约 6px @30px 有效字号）。
         ic.GlyphMinAdvanceX = kUiFontBasePx;
         ic.GlyphOffset = ImVec2(0.0f, kIconGlyphOffsetY);
-        g_icons_ok = io.Fonts->AddFontFromFileTTF(
+        g_app.icons_ok = io.Fonts->AddFontFromFileTTF(
                          "C:\\Windows\\Fonts\\segmdl2.ttf", kUiFontBasePx,
                          &ic, icon_ranges.Data) != nullptr;
     }
 
     win32 = ImGui_ImplWin32_Init(hwnd);
-    dx11 = ImGui_ImplDX11_Init(g_gfx.device, g_gfx.context);
+    dx11 = ImGui_ImplDX11_Init(g_app.gfx.device, g_app.gfx.context);
     if (!win32) lr::log::error("platform", "ImGui_ImplWin32_Init failed");
     if (!dx11) lr::log::error("platform", "ImGui_ImplDX11_Init failed");
     if (!ui_font_ok)
         lr::log::warn("platform", "embedded ui font unavailable, fell back to system font");
-    if (!g_icons_ok) lr::log::info("platform", "icon glyphs unavailable, text labels only");
+    if (!g_app.icons_ok) lr::log::info("platform", "icon glyphs unavailable, text labels only");
 
     // DPI：按窗口所在显示器缩放字体与界面度量（100% 时为 1.0，等价于旧行为）
     refresh_dpi_scale();
@@ -609,48 +609,48 @@ void ImGuiRaii::shutdown() {
 
 // 读：缺键/非法值走默认，读后一律钳制到合法区间（手改 ini 也不致于把界面弄坏）。
 void load_prefs() {
-    g_prefs.ui_scale = std::clamp(
-        lr::read_ini_float_ex(g_ini_path, L"ui", L"UiScale", 1.0f), 0.8f, 1.5f);
-    g_prefs.theme = std::clamp(lr::read_ini_int_ex(g_ini_path, L"ui", L"Theme", 0), 0, 2);
-    g_prefs.auto_hide_toolbar =
-        lr::read_ini_int_ex(g_ini_path, L"ui", L"AutoHideToolbar", 1) != 0;
-    g_prefs.motion = lr::read_ini_int_ex(g_ini_path, L"ui", L"Motion", 1) != 0;
-    g_prefs.gap_percent = std::clamp(
-        lr::read_ini_float_ex(g_ini_path, L"ui", L"GapPercent", 1.3f), 0.0f, 6.0f);
+    g_app.prefs.ui_scale = std::clamp(
+        lr::read_ini_float_ex(g_app.ini_path, L"ui", L"UiScale", 1.0f), 0.8f, 1.5f);
+    g_app.prefs.theme = std::clamp(lr::read_ini_int_ex(g_app.ini_path, L"ui", L"Theme", 0), 0, 2);
+    g_app.prefs.auto_hide_toolbar =
+        lr::read_ini_int_ex(g_app.ini_path, L"ui", L"AutoHideToolbar", 1) != 0;
+    g_app.prefs.motion = lr::read_ini_int_ex(g_app.ini_path, L"ui", L"Motion", 1) != 0;
+    g_app.prefs.gap_percent = std::clamp(
+        lr::read_ini_float_ex(g_app.ini_path, L"ui", L"GapPercent", 1.3f), 0.0f, 6.0f);
     // 资源档位是缓存预算、tile 单边和 worker 并发的唯一入口。
     // 旧版 BudgetMB 只用于一次性兼容映射，避免升级后突然改变用户的资源策略。
-    const int old_mb = lr::read_ini_int_ex(g_ini_path, L"cache", L"BudgetMB", -1);
-    const int old_tier = lr::read_ini_int_ex(g_ini_path, L"cache", L"ResourceTier", -1);
+    const int old_mb = lr::read_ini_int_ex(g_app.ini_path, L"cache", L"BudgetMB", -1);
+    const int old_tier = lr::read_ini_int_ex(g_app.ini_path, L"cache", L"ResourceTier", -1);
     if (old_tier >= 0) {
-        g_prefs.resource_tier = std::clamp(old_tier, 0, 2);
+        g_app.prefs.resource_tier = std::clamp(old_tier, 0, 2);
     } else if (old_mb >= 0) {
-        g_prefs.resource_tier = old_mb < 384 ? 0 : (old_mb < 640 ? 1 : 2);
+        g_app.prefs.resource_tier = old_mb < 384 ? 0 : (old_mb < 640 ? 1 : 2);
     } else {
-        g_prefs.resource_tier = 1;
+        g_app.prefs.resource_tier = 1;
     }
     if (old_tier < 0 && old_mb >= 0)
-        lr::write_ini_int(g_ini_path, L"cache", L"ResourceTier", g_prefs.resource_tier);
-    g_prefs.smart_match = std::clamp(
-        lr::read_ini_int_ex(g_ini_path, L"reading", L"SmartMatch", kSmartMatchAsk),
+        lr::write_ini_int(g_app.ini_path, L"cache", L"ResourceTier", g_app.prefs.resource_tier);
+    g_app.prefs.smart_match = std::clamp(
+        lr::read_ini_int_ex(g_app.ini_path, L"reading", L"SmartMatch", kSmartMatchAsk),
         kSmartMatchOff, kSmartMatchAuto);
-    g_user_scale = g_prefs.ui_scale;
+    g_app.user_scale = g_app.prefs.ui_scale;
 
     // 启动时把生效的偏好记一行：用户报"设置没生效 / 数字不对"时，这一行就能定性。
-    lr::log::info("platform", "prefs " + lr::log::kv("ui_scale", static_cast<double>(g_prefs.ui_scale)) +
-                                  " " + lr::log::kv("theme", g_prefs.theme) + " " +
-                                  lr::log::kv("resource_tier", g_prefs.resource_tier) + " " +
-                                  lr::log::kv("motion", g_prefs.motion ? 1 : 0) + " " +
-                                  lr::log::kv("smart_match", g_prefs.smart_match));
+    lr::log::info("platform", "prefs " + lr::log::kv("ui_scale", static_cast<double>(g_app.prefs.ui_scale)) +
+                                  " " + lr::log::kv("theme", g_app.prefs.theme) + " " +
+                                  lr::log::kv("resource_tier", g_app.prefs.resource_tier) + " " +
+                                  lr::log::kv("motion", g_app.prefs.motion ? 1 : 0) + " " +
+                                  lr::log::kv("smart_match", g_app.prefs.smart_match));
 }
 
 void save_prefs() {
-    lr::write_ini_float(g_ini_path, L"ui", L"UiScale", g_prefs.ui_scale);
-    lr::write_ini_int(g_ini_path, L"ui", L"Theme", g_prefs.theme);
-    lr::write_ini_int(g_ini_path, L"ui", L"AutoHideToolbar", g_prefs.auto_hide_toolbar ? 1 : 0);
-    lr::write_ini_int(g_ini_path, L"ui", L"Motion", g_prefs.motion ? 1 : 0);
-    lr::write_ini_float(g_ini_path, L"ui", L"GapPercent", g_prefs.gap_percent);
-    lr::write_ini_int(g_ini_path, L"cache", L"ResourceTier", g_prefs.resource_tier);
-    lr::write_ini_int(g_ini_path, L"reading", L"SmartMatch", g_prefs.smart_match);
+    lr::write_ini_float(g_app.ini_path, L"ui", L"UiScale", g_app.prefs.ui_scale);
+    lr::write_ini_int(g_app.ini_path, L"ui", L"Theme", g_app.prefs.theme);
+    lr::write_ini_int(g_app.ini_path, L"ui", L"AutoHideToolbar", g_app.prefs.auto_hide_toolbar ? 1 : 0);
+    lr::write_ini_int(g_app.ini_path, L"ui", L"Motion", g_app.prefs.motion ? 1 : 0);
+    lr::write_ini_float(g_app.ini_path, L"ui", L"GapPercent", g_app.prefs.gap_percent);
+    lr::write_ini_int(g_app.ini_path, L"cache", L"ResourceTier", g_app.prefs.resource_tier);
+    lr::write_ini_int(g_app.ini_path, L"reading", L"SmartMatch", g_app.prefs.smart_match);
 }
 
 // ---------------- 按键绑定持久化（[keys] 节，ADR-054） ----------------
@@ -663,25 +663,25 @@ void load_binds() {
     reset_binds_to_default();
     for (int i = 0; i < kCmdCount; ++i) {
         const std::wstring wkey = lr::utf8_to_wide(kCmds[i].id);
-        const std::wstring wval = lr::read_ini_string_ex(g_ini_path, L"keys", wkey.c_str(), L"");
+        const std::wstring wval = lr::read_ini_string_ex(g_app.ini_path, L"keys", wkey.c_str(), L"");
         if (wval.empty()) continue;   // 无记录：保留默认
         const std::string v = lr::wide_to_utf8(wval);
         const std::size_t bar = v.find('|');
         const std::string a = (bar == std::string::npos) ? v : v.substr(0, bar);
         const std::string b = (bar == std::string::npos) ? std::string() : v.substr(bar + 1);
-        g_binds[i][0] = chord_from_string(a);
-        g_binds[i][1] = chord_from_string(b);
+        g_app.binds[i][0] = chord_from_string(a);
+        g_app.binds[i][1] = chord_from_string(b);
     }
 }
 
 void save_binds() {
     for (int i = 0; i < kCmdCount; ++i) {
-        std::string v = chord_to_string(g_binds[i][0]);
+        std::string v = chord_to_string(g_app.binds[i][0]);
         v += '|';
-        v += chord_to_string(g_binds[i][1]);
+        v += chord_to_string(g_app.binds[i][1]);
         const std::wstring wkey = lr::utf8_to_wide(kCmds[i].id);
         const std::wstring wval = lr::utf8_to_wide(v);
-        lr::write_ini_string(g_ini_path, L"keys", wkey.c_str(), wval.c_str());
+        lr::write_ini_string(g_app.ini_path, L"keys", wkey.c_str(), wval.c_str());
     }
 }
 
@@ -691,26 +691,26 @@ void save_binds() {
 // 否则中文打不进去（落实 ADR-028 的后续要求）。
 void update_ime_association() {
     const bool want = ImGui::GetIO().WantTextInput;
-    if (want == g_ime_attached) return;
-    g_ime_attached = want;
-    ImmAssociateContext(g_hwnd, want ? g_saved_ime : nullptr);
+    if (want == g_app.ime_attached) return;
+    g_app.ime_attached = want;
+    ImmAssociateContext(g_app.hwnd, want ? g_app.saved_ime : nullptr);
 }
 
 // ---------------- 全屏 ----------------
 
 void toggle_fullscreen() {
-    if (!g_hwnd) return;
-    if (!g_fullscreen) {
-        GetWindowPlacement(g_hwnd, &g_prev_placement);
+    if (!g_app.hwnd) return;
+    if (!g_app.fullscreen) {
+        GetWindowPlacement(g_app.hwnd, &g_app.prev_placement);
         MONITORINFO mi{ sizeof(mi) };
-        if (!GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
-        SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-        SetWindowPos(g_hwnd, nullptr,
+        if (!GetMonitorInfoW(MonitorFromWindow(g_app.hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
+        SetWindowLongPtrW(g_app.hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(g_app.hwnd, nullptr,
                      mi.rcMonitor.left, mi.rcMonitor.top,
                      mi.rcMonitor.right - mi.rcMonitor.left,
                      mi.rcMonitor.bottom - mi.rcMonitor.top,
                      SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
-        g_fullscreen = true;
+        g_app.fullscreen = true;
     } else {
         // 退出全屏：**先提交新样式（FRAMECHANGED），再落位**。
         // 反过来（原实现：先 SetWindowPlacement 再补 FRAMECHANGED）会出问题：
@@ -719,11 +719,11 @@ void toggle_fullscreen() {
         // 这里先让样式在**全屏矩形上**生效（NOMOVE|NOSIZE，几何不动、无可见中间态），
         // 再用 SetWindowPlacement 一次落位：几何只变一次，且工作区坐标换算交给系统
         // （rcNormalPosition 是工作区坐标，手工 SetWindowPos 在多显示器下会偏）。
-        SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
-        SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+        SetWindowLongPtrW(g_app.hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPos(g_app.hwnd, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        SetWindowPlacement(g_hwnd, &g_prev_placement);
-        g_fullscreen = false;
+        SetWindowPlacement(g_app.hwnd, &g_app.prev_placement);
+        g_app.fullscreen = false;
     }
 }
 
@@ -755,7 +755,7 @@ bool set_clipboard_text(const std::string& utf8) {
     // 重试几次再放弃 —— 实践中多数占用只有几十毫秒。
     bool ok = false;
     for (int attempt = 0; attempt < 5 && !ok; ++attempt) {
-        if (!OpenClipboard(g_hwnd)) {
+        if (!OpenClipboard(g_app.hwnd)) {
             Sleep(10);
             continue;
         }
@@ -819,7 +819,7 @@ bool set_clipboard_image_rgba(int w, int h, const std::uint8_t* rgba) {
 
     bool ok = false;
     for (int attempt = 0; attempt < 5 && !ok; ++attempt) {
-        if (!OpenClipboard(g_hwnd)) {
+        if (!OpenClipboard(g_app.hwnd)) {
             Sleep(10);
             continue;
         }

@@ -24,7 +24,7 @@ def main() -> int:
         return 1
 
     failed = False
-    if re.search(r"const bool follows_system\s*=\s*g_prefs\.theme\s*==\s*0", body):
+    if re.search(r"const bool follows_system\s*=\s*g_app\.prefs\.theme\s*==\s*0", body):
         print("  [PASS] 深色纸张联动只在跟随系统时启用")
     else:
         print("  [FAIL] sync_theme 缺少 follows_system 守门变量")

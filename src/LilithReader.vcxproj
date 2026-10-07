@@ -120,10 +120,15 @@
   <ItemGroup>
     <!-- Phase 6：应用图标资源（exe/窗口/任务栏图标） -->
     <ResourceCompile Include="app\app.rc" />
-    <!-- 应用层：入口 / 平台地基 / 会话状态 / 绘制（共享声明见 app\app_internal.h） -->
+    <!-- 应用层：入口 / 平台地基 / 会话状态 / 交互切片 / 绘制（共享声明见 app\app_internal.h） -->
     <ClCompile Include="app\main.cpp" />
     <ClCompile Include="app\platform.cpp" />
     <ClCompile Include="app\session.cpp" />
+    <!-- 应用层切片（ADR-087）：会话侧各控制器独立 TU，经 app_internal.h 互调 -->
+    <ClCompile Include="app\input_bindings.cpp" />
+    <ClCompile Include="app\view_motion.cpp" />
+    <ClCompile Include="app\text_interaction.cpp" />
+    <ClCompile Include="app\search.cpp" />
     <ClCompile Include="app\ui.cpp" />
     <!-- Phase 7 稳定性：进程级崩溃防线（set_terminate / SEH / MiniDump） -->
     <ClCompile Include="app\crash.cpp" />

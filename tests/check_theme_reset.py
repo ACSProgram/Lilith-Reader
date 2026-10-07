@@ -34,8 +34,8 @@ def main() -> int:
 
     body = src.split("void apply_theme_colors()", 1)[1]
     try:
-        dark = body.split("if (g_dark_theme) {", 1)[1].split("} else {", 1)[0]
-        light = body.split("} else {", 1)[1].split("if (g_tone.active)", 1)[0]
+        dark = body.split("if (g_app.dark_theme) {", 1)[1].split("} else {", 1)[0]
+        light = body.split("} else {", 1)[1].split("if (g_app.tone.active)", 1)[0]
     except IndexError:
         print("apply_theme_colors() 结构与预期不符（找不到深色/浅色分支）", file=sys.stderr)
         return 1

@@ -62,19 +62,19 @@ bool placement_usable(const lr::WindowState& s) {
 // 帧与帧之间调用：模态文件对话框自带消息循环，绝不能在 ImGui 一帧中途调用
 // （否则窗口消息会在半帧状态下被后端处理）。
 void open_file_dialog_now() {
-    g_open_path_buf[0] = L'\0';
+    g_app.open_path_buf[0] = L'\0';
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof ofn;
-    ofn.hwndOwner = g_hwnd;
+    ofn.hwndOwner = g_app.hwnd;
     ofn.lpstrFilter =
         L"支持的文档\0*.pdf;*.epub;*.mobi;*.fb2;*.cbz;*.xps;*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.tif;*.tiff\0"
         L"PDF\0*.pdf\0电子书\0*.epub;*.mobi;*.fb2\0压缩图集\0*.cbz\0图片\0*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.tif;*.tiff\0"
         L"所有文件\0*.*\0";
-    ofn.lpstrFile = g_open_path_buf;
-    ofn.nMaxFile = ARRAYSIZE(g_open_path_buf);
+    ofn.lpstrFile = g_app.open_path_buf;
+    ofn.nMaxFile = ARRAYSIZE(g_app.open_path_buf);
     ofn.lpstrTitle = L"打开文档";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if (GetOpenFileNameW(&ofn)) request_open_document(g_open_path_buf);
+    if (GetOpenFileNameW(&ofn)) request_open_document(g_app.open_path_buf);
 }
 
 namespace {
@@ -84,24 +84,24 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     // 把 ImmAssociateContext(hwnd, nullptr) 的脱离顶掉 —— 这里按当前状态再脱/再关联一次。
     // 必须放在 ImGui 后端处理器**之前**：后端会消费 WM_INPUTLANGCHANGE 并 return 1。
     if (msg == WM_INPUTLANGCHANGE)
-        ImmAssociateContext(hwnd, g_ime_attached ? g_saved_ime : nullptr);
+        ImmAssociateContext(hwnd, g_app.ime_attached ? g_app.saved_ime : nullptr);
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return 1;
     switch (msg) {
     case WM_SIZE:
         if (wp == SIZE_MINIMIZED) {
             // 最小化：客户区为 0，既不能重建 swapchain，也不能继续渲染 —— 置标记让主循环
             // 整帧跳过（否则 0 尺寸视口下 ImGui 什么都画不出，整帧只剩清屏色，在收起动画里闪一下）。
-            g_minimized = true;
+            g_app.minimized = true;
             return 0;
         }
-        g_minimized = false;
+        g_app.minimized = false;
         // 只记录待处理尺寸，**不**在消息里直接重建 swapchain：WM_SIZE 会在
         // SetWindowPos / SetWindowPlacement 过程中同步到达（可能在 ImGui 一帧中途），
         // 当场 ResizeBuffers 会让"按旧尺寸排布的本帧绘制数据"被画进新尺寸后备缓冲，
         // 呈现为一帧拉伸/闪烁。改由帧首统一应用（见 main 循环）。
-        g_resize_pending = true;
-        g_resize_w = LOWORD(lp);
-        g_resize_h = HIWORD(lp);
+        g_app.resize_pending = true;
+        g_app.resize_w = LOWORD(lp);
+        g_app.resize_h = HIWORD(lp);
         return 0;
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
@@ -131,9 +131,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                          SWP_NOZORDER | SWP_NOACTIVATE);
         return 0;
     case WM_DESTROY: {
-        save_reading_state();                 // 更新 g_state 快照（书签已实时更新）
-        if (g_persist) g_persist->flush();    // 退出前把在途快照写完（ADR-082）
-        if (!g_fullscreen) {   // 全屏态不覆盖保存的正常态矩形
+        save_reading_state();                 // 更新 g_app.session.state 快照（书签已实时更新）
+        if (g_app.session.persist) g_app.session.persist->flush();    // 退出前把在途快照写完（ADR-082）
+        if (!g_app.fullscreen) {   // 全屏态不覆盖保存的正常态矩形
             WINDOWPLACEMENT placement{ sizeof(placement) };
             if (GetWindowPlacement(hwnd, &placement)) {
                 lr::WindowState s;
@@ -143,7 +143,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 s.h = placement.rcNormalPosition.bottom - placement.rcNormalPosition.top;
                 s.maximized = (placement.showCmd == SW_SHOWMAXIMIZED);
                 s.valid = true;
-                lr::save_window_state(g_ini_path, s);
+                lr::save_window_state(g_app.ini_path, s);
             }
         }
         PostQuitMessage(0);
@@ -177,7 +177,7 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
     // 上次异常退出：只提示一次，交给确认弹窗展示。
     if (had_last_crash) {
         lr::log::warn("app", "previous run ended abnormally; see crash\\last_crash.txt");
-        g_last_crash_summary = crash_summary_head(crash_summary);
+        g_app.last_crash_summary = crash_summary_head(crash_summary);
     }
 
     // 命令行解析：LilithReader.exe <文档路径>（wWinMain 的 cmd_line 不含程序名）
@@ -190,13 +190,13 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
         }
     }
 
-    g_ini_path = lr::exe_dir() + L"LilithReader.ini";
-    g_state_path = lr::exe_dir() + L"reader_state.bin";
-    g_state = lr::load_state(g_state_path);  // 阅读位置/书签（损坏则安全忽略为空）
+    g_app.ini_path = lr::exe_dir() + L"LilithReader.ini";
+    g_app.state_path = lr::exe_dir() + L"reader_state.bin";
+    g_app.session.state = lr::load_state(g_app.state_path);  // 阅读位置/书签（损坏则安全忽略为空）
     load_prefs();  // 用户偏好（界面缩放/主题/动效/间距/缓存预算）
-    // 异步持久化服务（ADR-082）：在载入 g_state 之后创建；写盘在工作线程，
+    // 异步持久化服务（ADR-082）：在载入 g_app.session.state 之后创建；写盘在工作线程，
     // UI 线程只产快照。退出路径经 flush 保证写入（见 WM_DESTROY 与下面的 shutdown）。
-    g_persist = std::make_unique<lr::PersistService>(g_state_path);
+    g_app.session.persist = std::make_unique<lr::PersistService>(g_app.state_path);
 
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -214,47 +214,47 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
     wc.lpszClassName = kWindowClass;
     RegisterClassExW(&wc);
 
-    const lr::WindowState saved = lr::load_window_state(g_ini_path);
+    const lr::WindowState saved = lr::load_window_state(g_app.ini_path);
     int x = CW_USEDEFAULT, y = CW_USEDEFAULT, w = 1280, h = 800;
     if (saved.valid && placement_usable(saved)) {
         x = saved.x; y = saved.y; w = saved.w; h = saved.h;
     }
 
-    g_hwnd = CreateWindowExW(0, kWindowClass, kWindowTitle, WS_OVERLAPPEDWINDOW,
+    g_app.hwnd = CreateWindowExW(0, kWindowClass, kWindowTitle, WS_OVERLAPPEDWINDOW,
                              x, y, w, h, nullptr, nullptr, inst, nullptr);
-    if (!g_hwnd || !g_gfx.initialize(g_hwnd)) return 1;
+    if (!g_app.hwnd || !g_app.gfx.initialize(g_app.hwnd)) return 1;
 
-    g_renderer = std::make_unique<lr::Renderer>(g_gfx.device);
+    g_app.renderer = std::make_unique<lr::Renderer>(g_app.gfx.device);
 
-    g_renderer->set_resource_tier(static_cast<lr::ResourceTier>(g_prefs.resource_tier));
+    g_app.renderer->set_resource_tier(static_cast<lr::ResourceTier>(g_app.prefs.resource_tier));
 
-    g_ui.initialize(g_hwnd);
+    g_app.ui.initialize(g_app.hwnd);
     load_binds();  // 按键绑定（[keys] 节）：需在 ImGui 上下文建立后（按名反查键码）
-    DragAcceptFiles(g_hwnd, TRUE);
+    DragAcceptFiles(g_app.hwnd, TRUE);
 
     // 让阅读窗口脱离输入法（ADR-028）：输入法启用时 Windows 会把字母/数字键的
     // WM_KEYDOWN 换成 VK_PROCESSKEY(0xE5)，ImGui 后端不映射该键码 → 这些键完全不置位，
     // 所有字母/数字快捷键（1~4 切列、F 回 fit-width、G 跳页…）静默失效。
     // 这里保存默认输入法上下文，平时脱离；仅在文本输入激活（密码框等）时关联回来，
     // 使中文可输入（见 update_ime_association，落实 ADR-028 的后续要求）。
-    g_saved_ime = ImmAssociateContext(g_hwnd, nullptr);
-    g_ime_attached = false;
+    g_app.saved_ime = ImmAssociateContext(g_app.hwnd, nullptr);
+    g_app.ime_attached = false;
 
     if (!doc_path.empty()) request_open_document(std::move(doc_path));
 
-    ShowWindow(g_hwnd, (saved.valid && saved.maximized) ? SW_MAXIMIZE : show);
-    UpdateWindow(g_hwnd);
+    ShowWindow(g_app.hwnd, (saved.valid && saved.maximized) ? SW_MAXIMIZE : show);
+    UpdateWindow(g_app.hwnd);
 
     // 上次异常退出的提示：复用既有的通用确认弹窗（ADR-063），不新增界面类型。
     // 主按钮直接打开报告目录 —— 用户"看得到、点得动"，而不是只收到一句看不见的日志。
-    if (!g_last_crash_summary.empty()) {
+    if (!g_app.last_crash_summary.empty()) {
         request_confirm(ConfirmKind::CrashNotice,
                         std::string("上次运行异常退出"),
-                        g_last_crash_summary +
+                        g_app.last_crash_summary +
                             "\n\n完整摘要（含转储文件名与日志尾部）在报告目录的 last_crash.txt 里。",
                         { { "报告目录", lr::wide_to_utf8(crash::report_dir()) } },
                         std::string("打开报告文件夹"), std::string("忽略"));
-        g_last_crash_summary.clear();
+        g_app.last_crash_summary.clear();
     }
 
     crash::set_phase("frame");
@@ -268,7 +268,7 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
         }
         // 最小化期间整帧不渲染（见 WM_SIZE）：既省 CPU/GPU，也避免"0 尺寸视口 → 整帧清屏色"
         // 在最小化的收起动画里闪一下。消息照常泵，恢复时下一条 WM_SIZE 会清掉标记。
-        if (g_minimized) {
+        if (g_app.minimized) {
             Sleep(10);
             continue;
         }
@@ -276,16 +276,16 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
         // 必须排在尺寸应用**之前**。放在帧首而不是命令派发处，是为了让"几何变更 →
         // swapchain 重建 → ImGui 视口"三者在同一帧内一致：否则本帧会用旧尺寸的绘制数据
         // 去填充新几何的窗口，被 DWM 拉伸成可见的闪烁（ADR-058）。
-        if (g_request_fullscreen_toggle) {
-            g_request_fullscreen_toggle = false;
+        if (g_app.request_fullscreen_toggle) {
+            g_app.request_fullscreen_toggle = false;
             toggle_fullscreen();
         }
         // 应用待处理的窗口尺寸：与 ImGui 视口尺寸同帧一致，且多次 WM_SIZE 合并为一次重建。
-        if (g_resize_pending) {
-            g_resize_pending = false;
-            g_gfx.resize(g_resize_w, g_resize_h);
+        if (g_app.resize_pending) {
+            g_app.resize_pending = false;
+            g_app.gfx.resize(g_app.resize_w, g_app.resize_h);
         }
-        g_ui.new_frame();
+        g_app.ui.new_frame();
 
         // ---- 帧级异常边界（ADR-078）----
         //  1) 先记下 ImGui 各栈的基线（官方 ErrorRecoveryStoreState，专为"异常后恢复"设计）；
@@ -323,20 +323,20 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
         ImGui::Render();
         // 帧被异常截断时不提交绘制数据：窗口保留上一帧画面，胜过闪一帧半成品。
         // （ImGui 帧已经在上面正常收口，故跳过一次 Present 不会留下不完整状态。）
-        if (frame_ok) g_gfx.render_frame();
+        if (frame_ok) g_app.gfx.render_frame();
 
         // 「打开文档…」：模态文件对话框放到帧与帧之间执行（见 open_file_dialog_now 注释）。
-        if (g_request_open_dialog) {
-            g_request_open_dialog = false;
+        if (g_app.request_open_dialog) {
+            g_app.request_open_dialog = false;
             open_file_dialog_now();
         }
     }
 quit:
     crash::set_phase("shutdown");
-    g_renderer.reset();  // 必须先于 gfx 释放：纹理依赖 D3D11 设备
-    g_ui.shutdown();
-    g_gfx.shutdown();
-    g_persist.reset();   // 析构即 flush；须在 log::shutdown 之前（写失败要能记日志）
+    g_app.renderer.reset();  // 必须先于 gfx 释放：纹理依赖 D3D11 设备
+    g_app.ui.shutdown();
+    g_app.gfx.shutdown();
+    g_app.session.persist.reset();   // 析构即 flush；须在 log::shutdown 之前（写失败要能记日志）
     lr::log::info("app", "clean exit");
     crash::mark_clean_exit();   // 正常退出：清掉"运行中"标记，下次启动不误报
     lr::log::shutdown();

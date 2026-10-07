@@ -32,13 +32,13 @@
 | 任务 | 必读 | 代码起点 |
 | --- | --- | --- |
 | 下一步做什么、某个需求排在哪 | [计划](01-计划.md)、[架构加固路线图](06-架构加固路线图.md) | 该批次列出的文件 |
-| 总体架构、模块边界、线程模型 | [架构设计 §1/§3](02-架构设计.md) | `src/app/app_internal.h`（应用层四 TU 分区）、各 `src/*/*.ixx` |
+| 总体架构、模块边界、线程模型 | [架构设计 §1/§3](02-架构设计.md) | `src/app/app_internal.h`（应用层 TU 分区）、各 `src/*/*.ixx` |
 | 画布布局（缩放/滚动/网格/阅读游标） | [架构设计 §2](02-架构设计.md) | `src/canvas/canvas.ixx`、`tests/canvas_test.cpp` |
 | 渲染调度、纹理生命周期、页状态机 | [架构设计 §3](02-架构设计.md) | `src/render/render.ixx`、`render.cpp` |
 | MuPDF 封装、错误码、格式识别 | [架构设计 §3](02-架构设计.md)、[决策记录 ADR-009~017](03-决策记录.md) | `src/document/document.ixx`、`document.cpp` |
-| 输入映射、命令表与按键自定义排查 | [架构设计 §2.2](02-架构设计.md)、[决策记录 ADR-054/066](03-决策记录.md) | `src/app/session.cpp`（`kCmds`/`cmd_pressed`）、`src/app/ui.cpp`（按键分栏） |
+| 输入映射、命令表与按键自定义排查 | [架构设计 §2.2](02-架构设计.md)、[决策记录 ADR-054/066](03-决策记录.md) | `src/app/input_bindings.cpp`（`kCmds`/`cmd_pressed`）、`src/app/ui.cpp`（按键分栏） |
 | 阅读功能（阅读位置/目录/书签/缩略图/旋转/对开/配色/密码） | [架构设计 §6](02-架构设计.md)、[决策记录 ADR-034~044](03-决策记录.md) | `src/app/session.cpp`、`src/app/ui.cpp`、`src/state/reader_state.ixx` |
-| 文本交互与检索（选择/复制 · 图片复制 · 超链接 · 全文搜索） | [架构设计 §10](02-架构设计.md)、[决策记录 ADR-069~071](03-决策记录.md) | `src/document/document.ixx`、`src/render/render.ixx`、`src/app/session.cpp`、`src/app/page_map.h` |
+| 文本交互与检索（选择/复制 · 图片复制 · 超链接 · 全文搜索） | [架构设计 §10](02-架构设计.md)、[决策记录 ADR-069~071](03-决策记录.md) | `src/document/document.ixx`、`src/render/render.ixx`、`src/app/text_interaction.cpp`、`src/app/search.cpp`、`src/app/page_map.h` |
 | 屏幕↔页面坐标折算（含旋转） | [架构设计 §10.1](02-架构设计.md) | `src/app/page_map.h`、`tests/page_map_test.cpp` |
 | 界面外壳（顶栏/主菜单/右键菜单/设置/按键/主题/图标/动效） | [架构设计 §7](02-架构设计.md)、[决策记录 ADR-045/054~056/059/061/066](03-决策记录.md) | `src/app/ui.cpp`、`src/app/platform.cpp`、`src/app/app.rc` |
 | 窗口尺寸/全屏/最小化（swapchain 重建、闪烁） | [架构设计 §7.1](02-架构设计.md)、[决策记录 ADR-057/058/060/061](03-决策记录.md) | `src/app/main.cpp`、`src/app/platform.cpp` |
