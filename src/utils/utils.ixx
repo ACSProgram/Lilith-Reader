@@ -153,10 +153,15 @@ inline std::uint64_t file_fingerprint(const std::wstring& path) noexcept {
 }
 
 inline std::wstring to_absolute(const std::wstring& path) {
-    wchar_t buf[32768]{};
-    if (GetFullPathNameW(path.c_str(), 32768, buf, nullptr) && buf[0])
-        return buf;
-    return path;
+    // 用堆缓冲而非 wchar_t[32768]：后者是 64 KiB 栈帧（/analyze C6262 命中），
+    // 与同文件的 exe_dir() 保持一致改为堆分配。
+    std::wstring buf(32768, L'\0');
+    const DWORD n = GetFullPathNameW(path.c_str(), static_cast<DWORD>(buf.size()),
+                                     buf.data(), nullptr);
+    if (n == 0 || n >= buf.size() || buf[0] == L'\0')
+        return path;
+    buf.resize(n);
+    return buf;
 }
 
 inline std::string wide_to_utf8(std::wstring_view w) {

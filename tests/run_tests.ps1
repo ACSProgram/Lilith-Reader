@@ -14,6 +14,13 @@
 #   powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1
 #   powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Probe
 #   powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -VcpkgRoot D:\vcpkg-roots\LilithReader
+#   powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Asan          # ASan 插桩回归（较慢）
+#   powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Perf -PerfCorpus <目录>
+#
+# -Asan：用 /fsanitize=address 编译并运行同一套用例，抓真实的内存错误（越界/释放后使用/
+#   重复释放），报告精确到"文件:行号"。注意 Windows 平台的 ASan **不支持泄漏检测**
+#   （detect_leaks 不可用），泄漏不在覆盖范围内。链接的第三方静态库（MuPDF 等）未被插桩，
+#   其**内部**的内存错误查不到；但跨边界的内存释放后使用仍会被捕获。
 #
 # vcpkg 安装根不在此写死：解析顺序见下方「vcpkg 安装根解析」，与仓库 Directory.Build.props 一致。
 
@@ -24,7 +31,8 @@ param(
     [switch]$Probe,
     [switch]$NoRegenerate,
     [switch]$Perf,
-    [string]$PerfCorpus = ""
+    [string]$PerfCorpus = "",
+    [switch]$Asan
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,6 +76,18 @@ $sdkVer = $sdkVerDir.Name
 Write-Host "  VS      : $vsPath"
 Write-Host "  MSVC    : $($msvc.Name)"
 Write-Host "  SDK     : $sdkVer"
+
+# -Asan：AddressSanitizer 插桩回归（用途与边界见 tests/README.md）。
+# MSVC 的 ASan 运行时是**动态库**（clang_rt.asan_dynamic-x86_64.dll），即便用 /MT 静态 CRT
+# 也必须在运行期能找到它；该 DLL 随工具集放在 cl.exe 同目录，故把该目录前置到 PATH。
+if ($Asan) {
+    $asanDir = Join-Path $msvc.FullName "bin\Hostx64\x64"
+    if (-not (Test-Path (Join-Path $asanDir "clang_rt.asan_dynamic-x86_64.dll"))) {
+        Die "未找到 ASan 运行时：$asanDir\clang_rt.asan_dynamic-x86_64.dll（该工具集未随附 ASan？）"
+    }
+    $env:PATH = "$asanDir;$env:PATH"
+    Write-Host "  ASan    : 开启（运行时取自 $asanDir）"
+}
 
 # vcpkg 安装根解析：与仓库 Directory.Build.props 的取值优先级一致，避免机器路径写死。
 #   1) -VcpkgRoot 参数   2) 环境变量 LilithVcpkgRoot
@@ -134,6 +154,11 @@ New-Item -ItemType Directory -Force -Path $out | Out-Null
 $src = Join-Path $repo "src"
 $defs = @("/nologo", "/std:c++20", "/EHsc", "/MT", "/O2", "/utf-8",
           "/D_MT", "/D_WINDOWS", "/D_CRT_SECURE_NO_WARNINGS")
+if ($Asan) {
+    # ASan 需要未优化代码与调试信息（报告里的"文件:行号"才准），故 /O2 → /Od 并加 /Zi
+    $defs = $defs | ForEach-Object { if ($_ -eq "/O2") { "/Od" } else { $_ } }
+    $defs += @("/fsanitize=address", "/Zi")
+}
 $incs = @("/I$inc",
           "/I$(Join-Path $msvc.FullName 'include')",
           "/I$(Join-Path $sdkInc $sdkVer)\ucrt",
@@ -274,6 +299,10 @@ $libs = @("libmupdf.lib", "freetype.lib", "harfbuzz.lib", "jbig2dec.lib", "jpeg.
 $libdirs = @("/LIBPATH:$lib", "/LIBPATH:$(Join-Path $msvc.FullName 'lib\x64')",
              "/LIBPATH:$(Join-Path $sdkLib $sdkVer)\ucrt\x64",
              "/LIBPATH:$(Join-Path $sdkLib $sdkVer)\um\x64")
+# /fsanitize=address 必须**同时传给链接器**，否则报未解析的 __asan_* 符号。
+# /DEBUG 也在这里补：缺它时链接器报 LNK4302，ASan 出错报告的调用栈将不带符号。
+# $libdirs 是唯一出现在每一条链接命令里的数组，故开关挂在这里。
+if ($Asan) { $libdirs += @("/fsanitize=address", "/DEBUG") }
 if ($Perf) {
     Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\perf_baseline.exe", "$out\perf_baseline.obj",
         "$out\document.obj", "/link", "psapi.lib") + $libdirs + $libs) "链接 perf_baseline.exe"

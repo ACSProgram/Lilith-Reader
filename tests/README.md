@@ -9,10 +9,29 @@
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(72) + canvas_test(126) + page_cache_test(32) + page_state_test(54) + reader_state_test(110) + persist_test(7) + tone_test(113) + page_map_test(26) + text_hit_test(14) + render_search_test(10) + render_fault_test(7) + imgui_raii_test(8) + 菜单文案宽度 + 主题重置 / 优先级 + 资源断言（字体子集 / 图标帧集）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Probe   # 额外跑 MuPDF 诊断探针（打印 FZ_META_FORMAT 等）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # 复用已有 samples/
+powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Asan -NoRegenerate   # ASan 插桩回归（较慢）
 ```
 
 - 退出码 = 任一测试失败即非零；已接入 CI（`.github/workflows/pr.yml`，PR 与推 `main` 触发，Debug/Release 矩阵 + 安装包门禁，见 ADR-076/084）。
 - `tests/samples/`、`tests/_build/` 为生成物，已 gitignore。
+
+### `-Asan`：AddressSanitizer 插桩回归
+
+同一套用例改用 `/fsanitize=address` 编译并运行，抓**真实发生**的内存错误——堆/栈缓冲区越界、
+释放后使用、重复释放——报告精确到"文件:行号"。它不替代常规回归，而是发布前（或升级 MuPDF、
+大改渲染/持久化之后）的加严复核。
+
+三个必须知道的边界：
+
+1. **不支持泄漏检测**：Windows 平台的 MSVC ASan 没有 LeakSanitizer，`detect_leaks` 会直接报
+   `not supported on this platform`。**堆泄漏不在覆盖范围内**。
+2. **第三方静态库未被插桩**：MuPDF / FreeType 等以预编译静态库链接，其**内部**的内存错误查不到；
+   但 ASan 全局接管分配器，故"MuPDF 分配、本项目代码越界访问/释放后使用"这类**跨边界**错误仍会被捕获。
+3. **运行时是动态 DLL**：即便 `/MT` 静态 CRT，ASan 运行时也是 `clang_rt.asan_dynamic-x86_64.dll`。
+   脚本会自动把工具集的 `bin\Hostx64\x64`（该 DLL 所在目录）前置到 `PATH`，手工运行时需自己处理。
+
+插桩会关掉 `/O2`（改 `/Od` 并加 `/Zi`）并给链接器补 `/DEBUG`，以保证报告里的"文件:行号"
+与调用栈符号准确（缺 `/DEBUG` 时链接器报 LNK4302），故整体比常规回归慢。
 
 ## 文件
 
