@@ -93,6 +93,36 @@ void update_save_failure_notice() {
     g_app.persist_failed = failed;
 }
 
+// 帧首节流（kAutoSaveSec）：阅读位置除退出时 flush 外，进程内也定期落一次盘 —— 此前位置
+// **只在退出时写**（main.cpp 的 WM_DESTROY），一旦程序异常结束（崩溃 / 被强杀），从上次退出
+// 到崩溃之间的阅读进度会全部丢失。位置签名（含 doc_key，故换书即变）相同则跳过，避免空闲时
+// 反复序列化；真正的写盘由 PersistService 的防抖窗口合并，UI 线程只做一次便宜的序列化。
+void maybe_autosave_reading_state() {
+    if (g_app.session.doc_key == 0 || g_app.session.doc.kind != UiDoc::Kind::Reading) return;
+    const double now = ImGui::GetTime();
+    if (now - g_app.session.autosave_t < kAutoSaveSec) return;
+    g_app.session.autosave_t = now;
+
+    std::uint64_t h = 1469598103934665603ull;   // FNV-1a：把位置各分量揉成一个签名
+    auto mix = [&](long long v) {
+        h ^= static_cast<std::uint64_t>(v);
+        h *= 1099511628211ull;
+    };
+    const auto cs = g_app.canvas.state();
+    mix(static_cast<long long>(g_app.session.doc_key));
+    mix(g_app.canvas.current_page());
+    mix(static_cast<long long>(cs.zoom * 1000.0f + (cs.zoom >= 0.0f ? 0.5f : -0.5f)));
+    mix(cs.columns);
+    mix(g_app.session.rotation);
+    mix(cs.fit_width ? 1 : 0);
+    mix(cs.spread ? 1 : 0);
+    mix(g_app.session.scheme);
+    const long long sig = static_cast<long long>(h);
+    if (sig == g_app.session.autosave_sig) return;
+    g_app.session.autosave_sig = sig;
+    save_reading_state();
+}
+
 void SessionController::save() {
     if (g_app.session.doc_key == 0 || g_app.session.doc.kind != UiDoc::Kind::Reading) return;
     lr::DocRecord& r = g_app.session.state.upsert(g_app.session.doc_key);

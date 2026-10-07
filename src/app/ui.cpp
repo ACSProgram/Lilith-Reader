@@ -1616,6 +1616,7 @@ bool any_dialog_open() {
 void draw_shell() {
     poll_document();
     update_save_failure_notice();  // 帧首：采样落盘失败（ADR-089）
+    maybe_autosave_reading_state();  // 帧首节流：位置有变则进程内落盘（防异常结束丢进度）
     g_app.renderer->drain_retired();  // 帧首：释放上一帧退役的纹理
     update_clipboard_results();   // 帧首：取走复制结果并写剪贴板
     update_search();              // 帧首：取走检索的新命中 + 执行待办跳转

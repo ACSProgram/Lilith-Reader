@@ -136,8 +136,13 @@ def source_chars() -> tuple[set[str], dict[str, list[str]]]:
     for root in roots:
         if not root.is_dir():
             continue
+        # 各根目录的扫描后缀不同：src/ 与 assets/ 按 SRC_SUFFIXES，**tests/ 只取 .cpp**
+        # （与模块 docstring 一致）。测试脚本（.py/.ps1）产出的是控制台输出与**样本数据**，
+        # 不是界面自述文字 —— 与下面跳过 `_build` 同理，把它们算进硬约束只会给"多语种样本"
+        # 这类**文档内容**制造假失败（样本由 MuPDF 渲染，不依赖界面字体）。
+        suffixes = {".cpp"} if root.name == "tests" else SRC_SUFFIXES
         for path in sorted(root.rglob("*")):
-            if not path.is_file() or path.suffix.lower() not in SRC_SUFFIXES:
+            if not path.is_file() or path.suffix.lower() not in suffixes:
                 continue
             if path.resolve() == Path(__file__).resolve():
                 continue

@@ -1622,6 +1622,35 @@ DocError Document::image_at(int index, float x, float y, ImageData& out) noexcep
     return DocError::Ok;
 }
 
+namespace {
+
+// 命中框裁剪用的一行文字外接框（未旋转 pt）。
+struct HitLineBand { float x0, y0, x1, y1; };
+
+// 把命中矩形的纵向裁进"行距"以内（居中）：重排文本（EPUB）里 fz_stext_char 的 quad 纵向是
+// **整行行框（ascent+descent）**，常大于实际行距 —— 直接拿它当命中框会偏高、相邻两行的命中
+// 会上下重叠。行距 = 与**横向有交叠**的最近邻行的中心距（多列版面靠横向交叠区分，并排行带
+// 本可重叠，不能当行距）。
+// 与 app 层选区高亮（text_interaction.cpp 的 clamp_rect_to_pitch / line_pitch）是同一规则、
+// 同一根源问题；两处各自实现，是因为命中框在 document 层产生、选区框在 app 层产生，数据源不同。
+void trim_hit_to_line_pitch(float& y0, float& y1, float x0, float x1,
+                            const std::vector<HitLineBand>& lines) {
+    if (lines.empty()) return;
+    const float cy = (y0 + y1) * 0.5f;
+    float pitch = 0.0f;
+    for (const HitLineBand& L : lines) {
+        if (L.x1 <= x0 || L.x0 >= x1) continue;   // 横向无交叠 = 另一列，跳过
+        float d = (L.y0 + L.y1) * 0.5f - cy;
+        if (d < 0.0f) d = -d;
+        if (d > 0.0f && (pitch == 0.0f || d < pitch)) pitch = d;
+    }
+    if (pitch <= 0.0f || (y1 - y0) <= pitch) return;
+    y0 = cy - pitch * 0.5f;
+    y1 = cy + pitch * 0.5f;
+}
+
+}  // namespace
+
 DocError Document::search_page(int index, std::string_view utf8_needle, int max_hits,
                                std::vector<SearchHit>& out) noexcept {
     out.clear();
@@ -1669,6 +1698,14 @@ DocError Document::search_page(int index, std::string_view utf8_needle, int max_
     if (n < 0) n = 0;
     if (n > max_hits) n = max_hits;
 
+    // 收集本页行框：把每个命中框裁进行距（见 trim_hit_to_line_pitch）。
+    std::vector<HitLineBand> lines;
+    for (fz_stext_block* b = st->first_block; b != nullptr; b = b->next) {
+        if (b->type != FZ_STEXT_BLOCK_TEXT) continue;
+        for (fz_stext_line* ln = b->u.t.first_line; ln != nullptr; ln = ln->next)
+            lines.push_back(HitLineBand{ ln->bbox.x0, ln->bbox.y0, ln->bbox.x1, ln->bbox.y1 });
+    }
+
     out.reserve(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) {
         const fz_quad& q = quads[i];
@@ -1678,6 +1715,7 @@ DocError Document::search_page(int index, std::string_view utf8_needle, int max_
         h.y0 = std::min(std::min(q.ul.y, q.ur.y), std::min(q.ll.y, q.lr.y));
         h.x1 = std::max(std::max(q.ul.x, q.ur.x), std::max(q.ll.x, q.lr.x));
         h.y1 = std::max(std::max(q.ul.y, q.ur.y), std::max(q.ll.y, q.lr.y));
+        trim_hit_to_line_pitch(h.y0, h.y1, h.x0, h.x1, lines);
         line_snippet(s.ctx, st, q, h.snippet);
         out.push_back(std::move(h));
     }

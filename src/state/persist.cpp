@@ -63,10 +63,13 @@ struct PersistService::Impl {
             const std::uint64_t v = version;
             flush_requested = false;
             std::vector<std::uint8_t> bytes = buf;   // 复制快照（解锁后 buf 可能被覆盖）
+            const bool was_failed = failed;          // 上一次落盘是否失败（锁内读）
             lk.unlock();
 
             const bool ok = write_state_bytes(path, bytes);
-            if (!ok)
+            // 持续失败（如 reader_state.bin 只读 / 被占用）时不要每次写盘都刷日志：只在"由成功
+            // 转入失败"的首条记一次。进程内自动落盘会让写盘隔几秒就重试，否则日志会被同一条错误灌满。
+            if (!ok && !was_failed)
                 lr::log::error("state", "persist write failed " + lr::log::kv("path", path));
 
             lk.lock();

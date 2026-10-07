@@ -32,6 +32,40 @@ float sel_point_y(const lr::TextQuad& q) {
     return (q.uly + q.ury + q.lly + q.lry) * 0.25f;
 }
 
+// 一行的"行距"：与**横向有交叠**的最近邻行的中心距。
+// 为什么需要：重排文本（EPUB）里 fz_stext_char 的 quad 纵向是**整行行框（ascent+descent）**，
+// 可能大于实际行距 —— 实测正文行框高 16.17pt、而相邻行行距仅 13.20pt，于是逐行并集直接画
+// 高亮会让相邻两行上下**重叠 2.97pt**（PDF 行距通常 ≥ 行框，故无此现象）。
+// 横向过滤是必要的：并排的多列（两栏）行带本就纵向重叠，不能拿来当行距。
+// 返回 0 = 没有可比的邻行（整页只剩这一行）。
+float line_pitch(const std::vector<lr::TextLine>& lines, int idx) {
+    if (idx < 0 || idx >= static_cast<int>(lines.size())) return 0.0f;
+    const lr::TextLine& L = lines[static_cast<std::size_t>(idx)];
+    const float cy = (L.y0 + L.y1) * 0.5f;
+    float best = 0.0f;
+    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
+        if (i == idx) continue;
+        const lr::TextLine& M = lines[static_cast<std::size_t>(i)];
+        if (M.x1 <= L.x0 || M.x0 >= L.x1) continue;   // 横向无交叠 = 另一列，跳过
+        float d = (M.y0 + M.y1) * 0.5f - cy;
+        if (d < 0.0f) d = -d;
+        if (d > 0.0f && (best == 0.0f || d < best)) best = d;
+    }
+    return best;
+}
+
+// 把一行高亮矩形的纵向裁进"行距"以内（**居中**），避免与相邻行的高亮重叠。
+// 只在行框高于行距时才裁 —— 常规 PDF 行距 ≥ 行框，此处是空操作，行为与旧实现逐位一致，
+// 不会动到已通过验证的 PDF 选择观感。
+void clamp_rect_to_pitch(SelRect& r, const std::vector<lr::TextLine>& lines, int line) {
+    const float pitch = line_pitch(lines, line);
+    if (pitch <= 0.0f) return;
+    if ((r.y1 - r.y0) <= pitch) return;
+    const float cy = (r.y0 + r.y1) * 0.5f;
+    r.y0 = cy - pitch * 0.5f;
+    r.y1 = cy + pitch * 0.5f;
+}
+
 // 由当前内容快照重算选区几何（复制端点 + 按行合并的高亮矩形），并**冻结**进 g_app.sel。
 // 冻结的理由见 app_internal.h 的 Selection 注释。
 void selection_rebuild() {
@@ -52,8 +86,15 @@ void selection_rebuild() {
 
     // 按行合并：逐字符画四边形会因相邻框重叠而出现"深一块浅一块"，看着像马赛克。
     // 同一行内取并集，得到"一行一段"的干净色块（与桌面阅读器的观感一致）。
+    // 每行收口时把纵向裁进"行距"（见 clamp_rect_to_pitch）：重排文本的行框高于行距时，
+    // 不裁会让相邻两行的高亮上下重叠（EPUB 实测 16.17pt 行框 vs 13.20pt 行距）。
     int     line = -1;
     SelRect acc{};
+    auto flush_line = [&]() {
+        if (line < 0) return;
+        clamp_rect_to_pitch(acc, g_app.content.lines, line);
+        g_app.sel.rects.push_back(acc);
+    };
     for (int i = lo; i <= hi; ++i) {
         const lr::TextQuad& q = g_app.content.chars[static_cast<std::size_t>(i)].quad;
         const int cl = g_app.content.chars[static_cast<std::size_t>(i)].line;
@@ -62,7 +103,7 @@ void selection_rebuild() {
         const float y0 = std::min(std::min(q.uly, q.ury), std::min(q.lly, q.lry));
         const float y1 = std::max(std::max(q.uly, q.ury), std::max(q.lly, q.lry));
         if (cl != line) {
-            if (line >= 0) g_app.sel.rects.push_back(acc);
+            flush_line();
             line = cl;
             acc = SelRect{ x0, y0, x1, y1 };
         } else {
@@ -72,7 +113,7 @@ void selection_rebuild() {
             acc.y1 = std::max(acc.y1, y1);
         }
     }
-    if (line >= 0) g_app.sel.rects.push_back(acc);
+    flush_line();
 }
 
 // 打开一个链接：内部跳转 → 翻页；外部 URL → 交系统默认浏览器。

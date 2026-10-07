@@ -356,6 +356,22 @@ quit:
     g_app.renderer.reset();  // 必须先于 gfx 释放：纹理依赖 D3D11 设备
     g_app.ui.shutdown();
     g_app.gfx.shutdown();
+    // 落盘失败的用户可见兜底（ADR-089 补充）：退出时最后一次写盘若失败（reader_state.bin
+    // 只读 / 被占用等），此刻 ImGui 已销毁、也没有后续帧，帧内的 toast 与状态栏告警**永远
+    // 来不及出现**（实测：失败恰恰发生在退出 flush，界面只剩几十毫秒就退出）。这种情况下
+    // 只能用原生弹窗如实告知 —— 否则"阅读进度没有保存"会完全无声地发生。
+    // 先显式 flush 并采样失败位，再销毁服务（析构的 flush 此时已是空操作）。
+    if (g_app.session.persist) {
+        g_app.session.persist->flush();
+        if (g_app.session.persist->last_save_failed()) {
+            lr::log::error("app", "persist failed on shutdown; notifying user");
+            MessageBoxW(nullptr,
+                        L"阅读数据保存失败：无法写入 reader_state.bin。\n"
+                        L"本次阅读位置 / 书签等进度未能保存（文件可能为只读，或被其他程序占用）。\n\n"
+                        L"详情见程序目录下 logs 里的日志。",
+                        L"Lilith Reader", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+        }
+    }
     g_app.session.persist.reset();   // 析构即 flush；须在 log::shutdown 之前（写失败要能记日志）
     lr::log::info("app", "clean exit");
     crash::mark_clean_exit();   // 正常退出：清掉"运行中"标记，下次启动不误报

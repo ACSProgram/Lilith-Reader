@@ -117,6 +117,9 @@ inline constexpr float  kSelectAlpha = 0.34f;
 inline constexpr float  kFindAlpha   = 0.30f;
 // 状态栏提示（toast）的显示时长（秒）。
 inline constexpr double kToastSec = 2.6;
+// 进程内自动落盘阅读位置的节拍（秒）：位置除退出时 flush 外，进程内也定期落一次，
+// 否则程序异常结束（崩溃 / 被强杀）会丢掉整段阅读进度。异常结束最多丢这么多。
+inline constexpr double kAutoSaveSec = 2.0;
 // 搜索的**输入防抖**：停止打字多久后自动发起检索（秒）。
 // 为什么不逐键检索、也不无限等回车：逐键检索在千页文档上会把渲染线程持续占满；
 // 只认回车则中文输入法下"第一次回车是上屏"会让人以为搜索没反应（用户实测）。
@@ -455,6 +458,10 @@ struct SessionController {
     // 异步持久化服务（ADR-082）：写盘在工作线程完成，UI 线程只产快照（不碰磁盘）。
     // 由入口在载入 state 之后创建；退出路径经 flush() 保证写入（见 main.cpp 的 WM_DESTROY）。
     std::unique_ptr<lr::PersistService> persist;
+    // 进程内自动落盘（见 maybe_autosave_reading_state）：节拍计时 + 上次落盘的位置签名。
+    // 位置若只在退出时写，异常结束会丢进度，故进程内每 kAutoSaveSec 秒检查一次、变了才写。
+    double    autosave_t = 0.0;
+    long long autosave_sig = 0;
 
     // ---- 阅读位置恢复 / 视图变换 / 逐页尺寸 / 目录 ----
     // 打开后待恢复的阅读位置（首帧视口就绪后再应用，否则 fit-width 派生 zoom 尚未成立）
@@ -770,6 +777,7 @@ void request_open_document(std::wstring path);
 void close_document();
 void poll_document();               // 帧首接收后台打开/认证结果
 void update_save_failure_notice();  // 帧首采样落盘失败状态（ADR-089）
+void maybe_autosave_reading_state();  // 帧首节流：位置有变则进程内落盘（防异常结束丢进度）
 void submit_password();
 void update_title();
 
