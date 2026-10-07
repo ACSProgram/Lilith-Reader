@@ -29,7 +29,7 @@
 #define MyAppVersionNumeric "1.0.0.0"
 #define MyAppPublisher "Lilith"
 #define MyAppExeName "LilithReader.exe"
-#define MyAppDescription "轻量级文档阅读器：PDF / EPUB / MOBI / FB2 / CBZ / XPS，单文件、零依赖、极致效率"
+#define MyAppDescription "轻量高效的文档阅读器：PDF / EPUB / MOBI / FB2 / CBZ / XPS 与常见图片格式，单文件、无需额外运行库"
 ; 固定 AppId：升级/卸载识别的唯一凭据，发布后不得更改
 #define MyAppId "{A6E4B7C2-9F31-4D08-B7A5-3C8E1D2F4A90}"
 
@@ -85,7 +85,7 @@ Name: "chinesesimplified"; MessagesFile: "lang\ChineseSimplified.isl"
 
 [Messages]
 WelcomeLabel1=欢迎使用 [name] 安装向导
-WelcomeLabel2=[name] 是一个轻量的文档阅读器，支持 PDF / EPUB / MOBI / FB2 / CBZ / XPS 与常见图片格式，单文件、零依赖。%n%n即将在你的计算机上安装 [name] [ver]，点击"下一步"继续。
+WelcomeLabel2=[name] 是一个轻量高效的文档阅读器，支持 PDF / EPUB / MOBI / FB2 / CBZ / XPS 与常见图片格式，单文件、无需额外运行库。%n%n即将在你的计算机上安装 [name] [ver]，点击"下一步"继续。
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
