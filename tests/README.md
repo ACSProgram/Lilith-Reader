@@ -37,7 +37,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Asan -NoRegenerate
 
 | 文件 | 作用 |
 |---|---|
-| `make_samples.py` | 合成 31 个常规样本（合法/改名/归档冒充/损坏，含**异构页尺寸** `mixed_size.pdf`、**带两级目录** `outline.pdf`、**文字+红图** `with_image.pdf`、**整页一张图** `scan_only.pdf`、**一块纯黑** `ink_black.pdf`）+ 3 个加密 PDF（需 PyMuPDF：`pip install pymupdf`，未装则跳过加密例） |
+| `make_samples.py` | 合成 38 个常规样本（合法/改名/归档冒充/损坏，含**异构页尺寸** `mixed_size.pdf`、**带两级目录** `outline.pdf`、**文字+红图** `with_image.pdf`、**整页一张图** `scan_only.pdf`、**一块纯黑** `ink_black.pdf`、**超大页触发页级渲染失败** `renderfail_toobig_tall.pdf` / `renderfail_toobig_square.pdf`）+ 3 个加密 PDF（需 PyMuPDF：`pip install pymupdf`，未装则跳过加密例） |
 | `doc_test.cpp` | 72 例断言表：合法格式、改名放行、归档冒充拒绝、加密三态、扩展名闸门、**逐页尺寸**（形变防线）、**目录解析**（顺序/层级/页号）、**旋转渲染**（0°/180° 尺寸不变、90° 宽高互换）、**纸张方案配色**（深色纸张背景为深暖灰且保留 alpha、暖色 R>B）、**配色分层**（ADR-067：`with_image.pdf` 深色纸张下照片仍是红的、纸面仍变深；`scan_only.pdf` 整页扫描件整体变深；`ink_black.pdf` 正文（纯黑）映射为浅暖灰、**并与纸面暖度一致**——LUT 两端等斜率）、**文本层**（Phase 8，ADR-069/070：`page_content` 抽到字符与行、码点拼回词、`copy_text` 的**选区端点约定**（字符框中心朝外偏 30%，用中心点会少一个字）、`search_page` 命中 / 大小写不敏感 / 无匹配为空表、**自洽检索**（把抽到的**同一行**前 4 个字符拼成关键字再搜自己 —— PDF/EPUB/FB2 通用，不依赖样本文案） |
 | `canvas_test.cpp` | 131 例断言：fit-width 派生、固定缩放居中、内容尺寸、滚动钳制、以鼠标为锚的缩放定点不变性、命中测试、可见范围、列切换锚定、非均匀页尺寸、缩放钳制、空文档、**视口变化保持阅读位置**（ADR-095，视口宽高变化前后视口中心的文档坐标不变、游标不跳页）、**翻页游标**（矮页视口不卡住 / 多列按行推进 / 与手动滚动同步）、**页间距随缩放**（ADR-029）、**双页对开**（ADR-038：封面单独居中 / 对开分列 / 按行推进 / `spread=false` 回归守卫 / 切换锚定 / **对开与列数同层级互斥**：切列退出对开、`columns` 值保留） |
 | `page_cache_test.cpp` | 32 例断言：预算钳制（0/下限/上限/SIZE_MAX）、自动重试上限与 `should_render_failed`、**LRU 逐出**（最久未用先出、pinned 保护、同序号按下标定序、恰好达标即停、未驻留页跳过、按字节累计）（Phase 4，ADR-030/031） |

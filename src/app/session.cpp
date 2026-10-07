@@ -85,8 +85,80 @@ void request_state_save() {
     if (g_app.session.persist) g_app.session.persist->request_save(g_app.session.state);
 }
 
-// 帧首采样"阅读数据落盘是否失败"（ADR-089）：失败首次出现时弹一次 toast 提醒（常驻告警在状态栏，
-// 由 draw_status_bar 读 g_app.persist_failed 呈现）。服务本身已在失败时写日志，这里只负责让用户看得见。
+// ---------------- 统一通知体系（ADR-100）----------------
+//
+// 模型与规则见 app_internal.h 的说明。这里只做两件事：维护常驻告警集合、每帧从应用状态投影。
+
+void set_notice(NoticeId id, std::string text) {
+    g_app.notices[static_cast<int>(id)] = std::move(text);
+}
+
+void clear_notice(NoticeId id) {
+    g_app.notices[static_cast<int>(id)].clear();
+}
+
+std::string notice_text(NoticeId id) {
+    return g_app.notices[static_cast<int>(id)];
+}
+
+bool any_notice_active() {
+    for (int i = 0; i < kNoticeCount; ++i)
+        if (!g_app.notices[i].empty()) return true;
+    return false;
+}
+
+bool any_message_active() {
+    return any_notice_active() || !toast_text().empty();
+}
+
+// 帧首投影：把"当前应用状态里用户该知道的事"写成活动告警集合。**幂等** —— 条件成立即置位、
+// 消失即撤下，不在 UI 侧保留任何"曾经出现过"的记忆（那是 toast 的职责）。
+void update_notices() {
+    // 1) 落盘失败（ADR-089/098）：由 update_save_failure_notice 采样的 persist_failed 投影而来。
+    set_notice(NoticeId::SaveFailed,
+               g_app.persist_failed ? std::string("阅读数据保存失败，详见 logs 日志") : std::string{});
+
+    // 2) 打开失败 / 被拒绝（文档作用域）：原因行与画布引导页**同源**（describe），不各自写文案。
+    {
+        std::string t;
+        const UiDoc::Kind k = g_app.session.doc.kind;
+        if (k == UiDoc::Kind::Failed || k == UiDoc::Kind::Rejected) {
+            t = std::string(lr::describe(g_app.session.doc.error));
+            if (!g_app.session.doc.name_u8.empty()) {
+                t += "：";
+                t += g_app.session.doc.name_u8;
+            }
+        }
+        set_notice(NoticeId::OpenFailed, std::move(t));
+    }
+
+    // 3) 当前页渲染失败（页作用域）：**两种形态都要说** ——
+    //    · 从未渲染成功（画布显示"渲染失败"小标）：直接说失败 + 可点击重试；
+    //    · 曾成功渲染过、本次重渲失败而**保留旧纹理**（ADR-031）：画布**不**显示小标
+    //      （保留的旧图仍有内容，盖标记反而更糟），但**必须说明"为什么画面变糊"** ——
+    //      否则用户只看到画面变模糊、无从解释（人工反馈）。
+    //    原因一律取 `describe(slot.error)`（如"页面尺寸超出渲染上限"），不写死，保证如实。
+    {
+        std::string t;
+        if (g_app.session.doc.kind == UiDoc::Kind::Reading) {
+            const int p = g_app.canvas.current_page();
+            const int n = g_app.canvas.page_count();
+            if (p >= 0 && p < n) {
+                const lr::PageSlot s = g_app.renderer->slot(p);
+                if (s.status == lr::PageStatus::Failed) {
+                    const bool has_old = (s.texture != nullptr || !s.tiles.empty());
+                    t = "第 " + std::to_string(p + 1) + " 页：" + std::string(lr::describe(s.error));
+                    t += has_old ? "，当前显示低清版本 · 点击该页重试" : " · 点击该页重试";
+                }
+            }
+        }
+        set_notice(NoticeId::PageRenderFailed, std::move(t));
+    }
+}
+
+// 帧首采样"阅读数据落盘是否失败"（ADR-089）：失败首次出现时弹一次 toast 提醒；常驻告警由
+// update_notices() 据此投影为 NoticeId::SaveFailed，在状态栏左侧呈现（ADR-100）。
+// 服务本身已在失败时写日志，这里只负责让用户看得见。
 void update_save_failure_notice() {
     const bool failed = g_app.session.persist && g_app.session.persist->last_save_failed();
     if (failed && !g_app.persist_failed) show_toast("阅读数据保存失败，详见 logs 日志");

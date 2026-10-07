@@ -2,7 +2,7 @@
 //
 // 职责：把会话状态（session.cpp）与偏好（platform.cpp）表现为 ImGui 界面。分五块：
 //   · 外壳：顶栏 + 画布（可选侧栏）+ 状态栏三段（draw_shell 为帧入口）
-//   · 阅读视图：画布区域、页占位/失败重试、滚动指示条、右键菜单
+//   · 阅读视图：画布区域、页占位/失败标记（点击重试）、滚动指示条、右键菜单
 //   · 侧栏：目录 / 书签 / 缩略图
 //   · 弹窗：跳页、密码、设置、帮助、调试浮层
 //   · 引导页：拖放引导 / 打开中 / 失败 / 被拒绝
@@ -10,6 +10,10 @@
 // 设计原则（ADR-045）：**命令集中、按钮克制**——可点控件只出现在顶栏一簇与各种菜单里；
 // 状态栏只放只读信息；视图类命令都是带勾选的语义项。本文件不直接触碰渲染层，只经
 // session 层暴露的操作（open/close/rotate/...）；只读快照（slot/thumb_slot）例外。
+//
+// 呈现契约（ADR-100，统一通知体系）：**状态栏是唯一的文案面**（左 = 页码/chip/常驻告警，
+// 中 = 瞬时 toast，右 = 格式），画布只留"作用域标记"（渲染失败页 = 淡填充 + 描边 + 左上角小标；
+// 打开失败的引导页原因行与状态栏同源）。全屏下只要有活动消息，底栏强制滑出。
 //
 // 依赖：platform（px/主题/偏好）+ session（操作与状态）；共享声明见 app_internal.h。
 
@@ -242,15 +246,46 @@ void draw_scroll_bar(ImDrawList* dl, const ScrollBarGeom& g) {
     dl->AddRectFilled(g.thumb_min, g.thumb_max, col, r);
 }
 
+namespace {
+
+// 换掉颜色的 alpha（保留 RGB）
+inline ImU32 with_alpha(ImU32 c, float a) {
+    const float cl = a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
+    return (c & 0x00FFFFFFu) | (static_cast<ImU32>(std::lround(cl * 255.0f)) << 24);
+}
+
+}  // namespace
+
+// 失败页的**左上角小标**（ADR-100）：锚在**页角**而不是页面中心 —— 页面可能远大于视口
+// （4-5 的竖长页 / 超大页），居中的文字会落到视口外，用户只看到一块色块。
+// 小标本身就是"点击重试"的提示；命中区仍是**整页**（见 draw_canvas_area 的命中测试）。
+void draw_page_badge(ImDrawList* dl, const ImVec2& pmin, const char* text) {
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const ImVec2 pad(px(9.0f), px(5.0f));
+    const ImVec2 a(pmin.x + px(12.0f), pmin.y + px(12.0f));
+    const ImVec2 b(a.x + ts.x + pad.x * 2.0f, a.y + ts.y + pad.y * 2.0f);
+    dl->AddRectFilled(a, b, g_app.pal.chrome, px(3.0f));
+    dl->AddRect(a, b, g_app.pal.failed_border, px(3.0f), 0, px(1.5f));
+    dl->AddText(ImVec2(a.x + pad.x, a.y + pad.y),
+                ImGui::ColorConvertFloat4ToU32(col_warn()), text);
+}
+
+// 页占位（渲染状态机的呈现，ADR-031；呈现契约见 ADR-100）。
+// · 载入中：整页浅色填充 + 居中"载入中…"（瞬态，尺寸正常时可见）；
+// · 渲染失败：**克制标记** —— 极淡填充 + 醒目描边 + 左上角小标。此前是"满屏失败色 +
+//   居中文字"，页面远大于视口时文字落到视口外、整屏色块观感也过重（人工反馈）。
 void draw_page_placeholder(ImDrawList* dl, const ImVec2& pmin, const ImVec2& pmax,
                            const lr::PageSlot& s) {
-    const bool failed = (s.status == lr::PageStatus::Failed);
-    dl->AddRectFilled(pmin, pmax, failed ? g_app.pal.failed : g_app.pal.placeholder);
-    dl->AddRect(pmin, pmax, failed ? g_app.pal.failed_border : g_app.pal.placeholder_border);
-    // 失败占位提示"点击重试"（ADR-031）：命中测试在 draw_canvas_area 里做
-    const char* txt = failed ? "渲染失败 · 点击重试"
-                             : (s.status == lr::PageStatus::Loading ? "载入中…" : "");
-    if (txt[0] != '\0') {
+    if (s.status == lr::PageStatus::Failed) {
+        dl->AddRectFilled(pmin, pmax, with_alpha(g_app.pal.failed, 0.40f));
+        dl->AddRect(pmin, pmax, g_app.pal.failed_border, 0.0f, 0, px(2.0f));
+        draw_page_badge(dl, pmin, "渲染失败 · 点击重试");
+        return;
+    }
+    dl->AddRectFilled(pmin, pmax, g_app.pal.placeholder);
+    dl->AddRect(pmin, pmax, g_app.pal.placeholder_border);
+    if (s.status == lr::PageStatus::Loading) {
+        const char* txt = "载入中…";
         const ImVec2 ts = ImGui::CalcTextSize(txt);
         dl->AddText(ImVec2((pmin.x + pmax.x - ts.x) * 0.5f, (pmin.y + pmax.y - ts.y) * 0.5f),
                     g_app.pal.placeholder_text, txt);
@@ -260,12 +295,6 @@ void draw_page_placeholder(ImDrawList* dl, const ImVec2& pmin, const ImVec2& pma
 // ---------------- 页内叠加层：选区 / 搜索命中 / 链接悬停 ----------------
 
 namespace {
-
-// 换掉颜色的 alpha（保留 RGB）
-inline ImU32 with_alpha(ImU32 c, float a) {
-    const float cl = a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
-    return (c & 0x00FFFFFFu) | (static_cast<ImU32>(std::lround(cl * 255.0f)) << 24);
-}
 
 // 把一个"未旋转页面 pt 矩形"画到屏幕上。
 // 90° 的整数倍旋转把轴对齐矩形映成轴对齐矩形，故只需换算**两个对角点**再归一化 ——
@@ -537,14 +566,16 @@ void draw_status_bar(float reveal) {
     if (g_app.session.rotation != 0) chip("旋转 %d°", g_app.session.rotation);
     if (g_app.session.scheme != 0) chip("%s", page_scheme_name(g_app.session.scheme));
     if (current_page_has_bookmark()) chip("已加书签");
-    // 落盘失败告警（ADR-089）：只读状态里唯一"需要用户知道"的异常，用告警色常驻显示，
-    // 直到下一次写盘成功（persist 服务会把 failed 标记复位）。它不计入"非默认视图状态"，
-    // 用告警色与普通 chip 区分。
-    if (g_app.persist_failed) {
+    // 常驻告警（ADR-100）：状态栏左侧、页码与视图 chip 之后。所有需要"读一句话"的异常
+    // （落盘失败 / 打开失败 / 当前页渲染失败）都走这一条通道，用告警色显示，不再各处就地写死。
+    // 它不计入"非默认视图状态"，与普通 chip 以颜色区分。文案与判据见 update_notices()。
+    for (int i = 0; i < kNoticeCount; ++i) {
+        const std::string& nt = g_app.notices[i];
+        if (nt.empty()) continue;
         ImGui::SameLine();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_app.pal.chrome_dim), "·");
         ImGui::SameLine();
-        ImGui::TextColored(col_warn(), "阅读数据保存失败");
+        ImGui::TextColored(col_warn(), "%s", nt.c_str());
     }
 
     // 操作提示：居中显示"已复制 / 此处没有图片"这类一次性反馈。
@@ -1616,6 +1647,7 @@ bool any_dialog_open() {
 void draw_shell() {
     poll_document();
     update_save_failure_notice();  // 帧首：采样落盘失败（ADR-089）
+    update_notices();             // 帧首：投影为活动告警集合（ADR-100，供状态栏与全屏弹出判定）
     maybe_autosave_reading_state();  // 帧首节流：位置有变则进程内落盘（防异常结束丢进度）
     g_app.renderer->drain_retired();  // 帧首：释放上一帧退役的纹理
     update_clipboard_results();   // 帧首：取走复制结果并写剪贴板
@@ -1662,12 +1694,14 @@ void draw_shell() {
     const float top_h = update_top_bar_height(dt);
     const bool top_overlay = top_bar_overlays_canvas();
 
-    // 底栏：全屏时是**覆盖层**（默认不占画布高度），鼠标靠近窗口底端才滑入/淡入；
-    // 普通窗口常驻底部、正常占位。step() 与 prefs.motion 联动（关动效即直切）。
+    // 底栏：全屏时是**覆盖层**（默认不占画布高度）。全屏下弹出条件 = 鼠标贴近窗口底端
+    // **或**有活动消息（ADR-100）—— 有告警/提示时即使沉浸阅读也强制滑出，否则"统一文案面"
+    // 在恰恰最需要它的场合看不见。普通窗口常驻底部、正常占位。step() 与 prefs.motion 联动。
     const float status_full_h = px(kStatusBarH);
     const float status_h = g_app.fullscreen ? 0.0f : status_full_h;
-    const bool status_alive =
-        g_app.status_popup_anim.step(dt, fullscreen_status_popup_visible(client_h), g_app.prefs.motion);
+    const bool status_want =
+        g_app.fullscreen && (fullscreen_status_popup_visible(client_h) || any_message_active());
+    const bool status_alive = g_app.status_popup_anim.step(dt, status_want, g_app.prefs.motion);
     const float status_reveal = g_app.fullscreen ? g_app.status_popup_anim.value : 1.0f;
 
     // 顶栏覆盖时**画布不让位**（顶栏压在画布上），于是顶栏滑入/滑出不再改动画布视口 ——

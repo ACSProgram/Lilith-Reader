@@ -10,8 +10,12 @@
 
 注意：
   - empty.pdf / truncated.pdf / random.pdf / mobi_huffcdic.mobi 已存在，无需重建。
-  - 「单页渲染失败」的静态 PDF 造不出来：实测 MuPDF 对内容流 / 资源 / MediaBox 的破坏都只记
-    日志、不抛异常，故本脚本不再生成 corrupt_page.pdf（曾造出的那个渲染成空白页，会误导）。
+  - 「单页渲染失败」的静态 PDF **能造**，但触发点**不在 MuPDF**：实测 MuPDF 对内容流 / 资源 /
+    MediaBox 的破坏都只记日志、不抛异常（故本脚本仍不生成 corrupt_page.pdf —— 那个会渲染成
+    空白页，会误导）。真正能确定性触发的是 **app 自己的渲染前像素闸门**：`render_one_impl`
+    先算"页尺寸(pt) × 倍率"的输出像素，超过 `kMaxOutputPixels`（2^28）即 `mark_failed(TooLarge)`。
+    对应样本由 make_samples.py 的「8. 页级渲染失败」一节生成（renderfail_toobig_tall /
+    renderfail_toobig_square），呈现契约见 ADR-100。
   - 16-1（落盘失败）不是文件样本，是运行期权限条件，见同目录 make_state_readonly.ps1。
 """
 

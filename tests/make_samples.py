@@ -5,6 +5,7 @@
 #   2. 改名可读：图片、epub、xps、fb2 改名成别的受支持扩展名（应打开，仅提示不符）
 #   3. 归档冒充：zip 图集/文档集改名 .epub/.pdf/.fb2/.cbz（应拒绝，ADR-016）
 #   4. 加密与损坏：AES 加密 PDF、截断、空文件、纯文本改名、需修复的 PDF
+#   5. 压力样本：1200 页 / A0 幅面；超大页：触发 app 渲染前像素闸门 → 页级渲染失败（ADR-100）
 #
 # 加密样本依赖 PyMuPDF（anaconda 自带，import fitz）。缺库时**跳过加密样本**并提示，
 # 其余样本照常生成 —— doc_test.cpp 对缺失的加密样本报 SKIP 而不是 FAIL。
@@ -26,11 +27,13 @@ OWNER_PW = "owner"
 
 # ---------------------------------------------------------------- 基础构造
 
-def minimal_pdf(pages=1, mediabox="0 0 200 300", mediaboxes=None):
+def minimal_pdf(pages=1, mediabox="0 0 200 300", mediaboxes=None, contents=None):
     """结构合法、xref 正确的多页最小 PDF。
 
     mediaboxes 给出时按页指定 MediaBox（用于构造**异构页尺寸**样本）；
     否则所有页用同一个 mediabox。
+    contents 给出时按页指定内容流（bytes）；否则每页写一句 "page"。
+    两者都是为了构造"只有具体几何/内容才成立"的边界样本。
 
     对象编号约定（务必与下面的 append 顺序一致）：
       1 Catalog / 2 Pages / 3 Resources / 4 Font
@@ -38,6 +41,8 @@ def minimal_pdf(pages=1, mediabox="0 0 200 300", mediaboxes=None):
     """
     if mediaboxes is not None:
         assert len(mediaboxes) == pages
+    if contents is not None:
+        assert len(contents) == pages
     objs = []
     kids = " ".join(f"{5 + 2 * i} 0 R" for i in range(pages))
     objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
@@ -50,7 +55,7 @@ def minimal_pdf(pages=1, mediabox="0 0 200 300", mediaboxes=None):
             f"<< /Type /Page /Parent 2 0 R /MediaBox [ {mb} ] "
             f"/Resources 3 0 R /Contents {6 + 2 * i} 0 R >>".encode()
         )
-        stream = b"BT /F1 24 Tf 20 150 Td (page) Tj ET"
+        stream = contents[i] if contents is not None else b"BT /F1 24 Tf 20 150 Td (page) Tj ET"
         objs.append(b"<< /Length " + str(len(stream)).encode()
                     + b" >>\nstream\n" + stream + b"\nendstream")
 
@@ -68,6 +73,40 @@ def minimal_pdf(pages=1, mediabox="0 0 200 300", mediaboxes=None):
         out.write(f"{off:010d} 00000 n \n".encode())
     out.write(f"trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
     return out.getvalue()
+
+
+# ---- 超大页的内容流（页级渲染失败样本，见 main() 的「8.」一节）----------------
+#
+# 为什么内容要**看得见**：这两页的用途是人工判断"渲染成功 / 保留旧纹理被拉伸变糊"。
+# 纯白页看不出任何差别（曾用纯白方形页，人工反馈"始终是白色，没什么特别之处"）；
+# 竖长页曾把文字放在最底部 —— 视口在页面顶部，渲染成功后也看不到，同样白费。
+
+TALL_W, TALL_H = 200, 600000        # 竖长页：fit-width 下输出高约 6.2e6 px，远超像素上限
+SQUARE_SIDE = 20000                 # 方形页：fit-width 正常，放大到约 75% 以上才超限
+
+
+def tall_page_content():
+    """竖长页内容：顶部蓝条 + 红条 + 文字（缩放恢复后应能看到这三样）。"""
+    return b"\n".join([
+        b"q 0 0 1 rg 0 %d %d 100 re f Q" % (TALL_H - 100, TALL_W),
+        b"q 1 0 0 rg 0 %d %d 100 re f Q" % (TALL_H - 300, TALL_W),
+        b"BT /F1 60 Tf 0 0 0 rg 20 %d Td (TOP OF TALL PAGE) Tj ET" % (TALL_H - 480),
+    ])
+
+
+def square_page_content():
+    """方形大页内容：边框 + 网格 + 红块 + 大字（放大超限后应整体变糊）。"""
+    s = SQUARE_SIDE
+    parts = [b"q 0 0 0 RG 60 w 100 100 %d %d re S Q" % (s - 200, s - 200),
+             b"q 0 0 0 RG 25 w"]
+    for i in range(1, s // 2000):
+        c = i * 2000
+        parts.append(b" %d 100 m %d %d l S" % (c, c, s - 100))
+        parts.append(b" 100 %d m %d %d l S" % (c, s - 100, c))
+    parts.append(b"Q")
+    parts.append(b"q 1 0 0 rg 12000 12000 4000 4000 re f Q")
+    parts.append(b"BT /F1 1400 Tf 0 0 0 rg 700 17200 Td (BIG PAGE 20000x20000) Tj ET")
+    return b"\n".join(parts)
 
 
 def pdf_with_outline(pages=3):
@@ -467,6 +506,23 @@ def main():
     log("== 7. 压力样本（Phase 7） ==")
     write("stress_1200p.pdf", minimal_pdf(pages=1200))
     write("poster_a0.pdf", minimal_pdf(pages=1, mediabox="0 0 2384 3370"))
+
+    # 页级渲染失败的样本（呈现契约见 ADR-100；人工验证 4-5 用）。
+    #
+    # 触发点是 **app 自己的渲染前闸门**，不是 MuPDF、也与分块渲染无关：`render_one_impl`
+    # 在调用 MuPDF **之前**先算"页尺寸(pt) × 倍率"的输出像素，超过 `kMaxOutputPixels`
+    # （2^28 ≈ 2.68 亿）就直接 `mark_failed(TooLarge)`。
+    #   · tall  ：竖长页，**默认 fit-width 即失败** → 走"从未渲染成功"路径（画布小标 + 状态栏）；
+    #   · square：方形大页，默认 fit-width 正常、**放大到约 75% 以上才失败** → 走"保留旧纹理"路径。
+    #
+    # 为什么不用损坏样本：truncated/random/empty 都是**打开即失败**（到不了页渲染）；改坏内容流
+    # 也不行 —— MuPDF 对内容流解码错误只打印日志、照样出图（实测，见 generate_samples.py）。
+    log("== 8. 页级渲染失败（超大页触发渲染前像素闸门，ADR-100 / 4-5） ==")
+    write("renderfail_toobig_tall.pdf",
+          minimal_pdf(1, mediabox=f"0 0 {TALL_W} {TALL_H}", contents=[tall_page_content()]))
+    write("renderfail_toobig_square.pdf",
+          minimal_pdf(1, mediabox=f"0 0 {SQUARE_SIDE} {SQUARE_SIDE}",
+                      contents=[square_page_content()]))
 
     with open(os.path.join(out_dir, "_manifest.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
