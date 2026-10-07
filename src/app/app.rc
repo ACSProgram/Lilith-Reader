@@ -16,9 +16,13 @@ IDI_APPICON ICON "../../assets/icon.ico"
 // 生成方式见 assets/make_font_subset.py；覆盖范围由 tests 里的 check_font_coverage.py 断言。
 IDR_UIFONT RCDATA "../../assets/ui_font_subset.otf"
 
+// 版本资源。注意 PE 的 FILEVERSION/PRODUCTVERSION 必须是 4 段纯数字，无法承载
+// "1.0-rc.1" 这类预发布后缀：数字版本固定为 1,0,0,0，人类可读的版本串写进
+// FileVersion/ProductVersion 字符串值。installer 的编译期校验比对的是**数字版本**
+// （见 installer/LilithReader.iss 的 MyAppVersionNumeric），故两者需同步。
 1 VERSIONINFO
-FILEVERSION 0,6,0,0
-PRODUCTVERSION 0,6,0,0
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
 FILEOS 0x40004L
 FILETYPE 0x1L
 BEGIN
@@ -27,9 +31,9 @@ BEGIN
     BLOCK "040904b0"
     BEGIN
       VALUE "FileDescription", "Lilith Reader"
-      VALUE "FileVersion", "0.6.0"
+      VALUE "FileVersion", "1.0-rc.1"
       VALUE "ProductName", "Lilith Reader"
-      VALUE "ProductVersion", "0.6.0"
+      VALUE "ProductVersion", "1.0-rc.1"
       VALUE "OriginalFilename", "LilithReader.exe"
     END
   END

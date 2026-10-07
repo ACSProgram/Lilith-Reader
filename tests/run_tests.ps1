@@ -14,6 +14,8 @@
 #   powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1
 #   powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Probe
 #   powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -VcpkgRoot D:\vcpkg-roots\LilithReader
+#
+# vcpkg 安装根不在此写死：解析顺序见下方「vcpkg 安装根解析」，与仓库 Directory.Build.props 一致。
 
 [CmdletBinding()]
 param(
@@ -21,7 +23,8 @@ param(
     [string]$Python = "",
     [switch]$Probe,
     [switch]$NoRegenerate,
-    [switch]$Perf
+    [switch]$Perf,
+    [string]$PerfCorpus = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,12 +69,28 @@ Write-Host "  VS      : $vsPath"
 Write-Host "  MSVC    : $($msvc.Name)"
 Write-Host "  SDK     : $sdkVer"
 
-# vcpkg 安装根：优先参数，其次从 vcxproj 里读（避免两处硬编码漂移）
+# vcpkg 安装根解析：与仓库 Directory.Build.props 的取值优先级一致，避免机器路径写死。
+#   1) -VcpkgRoot 参数   2) 环境变量 LilithVcpkgRoot
+#   3) Directory.Build.props.local（本机覆盖文件，不入库）
+#   4) vcxproj 里的默认值 $(LilithVcpkgRoot)（展开其中的 $(LOCALAPPDATA)）
+if (-not $VcpkgRoot) { $VcpkgRoot = $env:LilithVcpkgRoot }
 if (-not $VcpkgRoot) {
-    $line = Select-String -Path $vcxproj -Pattern "<VcpkgInstalledDir>(.+?)</VcpkgInstalledDir>" |
-        Select-Object -First 1
-    if (-not $line) { Die "vcxproj 里找不到 VcpkgInstalledDir，请用 -VcpkgRoot 指定" }
-    $VcpkgRoot = $line.Matches[0].Groups[1].Value.Trim()
+    $localProps = Join-Path $repo "Directory.Build.props.local"
+    if (Test-Path $localProps) {
+        # 先剥掉 XML 注释再匹配：该文件头部有模板示例，直接正则会先命中注释里的示例值。
+        $text = [regex]::Replace((Get-Content -Raw $localProps), '<!--.*?-->', '', 'Singleline')
+        $m = [regex]::Match($text, '<LilithVcpkgRoot>(.+?)</LilithVcpkgRoot>')
+        if ($m.Success) { $VcpkgRoot = $m.Groups[1].Value.Trim() }
+    }
+}
+if (-not $VcpkgRoot) {
+    $text = [regex]::Replace((Get-Content -Raw $vcxproj), '<!--.*?-->', '', 'Singleline')
+    $line = [regex]::Match($text, '<VcpkgInstalledDir>(.+?)</VcpkgInstalledDir>')
+    if ($line.Success) { $VcpkgRoot = $line.Groups[1].Value.Trim() }
+    $VcpkgRoot = $VcpkgRoot -replace '\$\(LOCALAPPDATA\)', $env:LOCALAPPDATA
+    if ($VcpkgRoot -like '*$(*') {
+        Die "无法解析 vcpkg 安装根（vcxproj 里是：$VcpkgRoot）。请设环境变量 LilithVcpkgRoot 或用 -VcpkgRoot 指定。"
+    }
 }
 $tripletLine = Select-String -Path $vcxproj -Pattern "<VcpkgTriplet>(.+?)</VcpkgTriplet>" |
     Select-Object -First 1
@@ -147,7 +166,7 @@ Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\utils.ifc",
     "/reference", "$out\document.ifc", "/Fo$out\doc_test.obj",
     (Join-Path $tests "doc_test.cpp"))) "编译 doc_test.cpp"
 
-# 性能基线：默认不运行；-Perf 时对生成样本和 Downloads\documents 中的代表性文档
+# 性能基线：默认不运行；-Perf 时对生成样本（可用 -PerfCorpus 追加真实文档语料目录）
 # 输出稳定的 CSV（QPC + 工作集），不启动阅读器。
 if ($Perf) {
     Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\document.ifc",
@@ -341,7 +360,13 @@ Write-Host "  doc_test.exe 退出码 = $testExit"
 
 if ($Perf) {
     Step "运行性能基线"
-    & "$out\perf_baseline.exe" $samples "C:\Users\ACSProgram\Downloads\documents"
+    # 语料目录不写死：默认只跑生成的样本；如需真实文档语料，用 -PerfCorpus 指定目录。
+    $perfArgs = @($samples)
+    if ($PerfCorpus) {
+        if (-not (Test-Path $PerfCorpus)) { Die "性能基线语料目录不存在：$PerfCorpus" }
+        $perfArgs += $PerfCorpus
+    }
+    & "$out\perf_baseline.exe" @perfArgs
     if ($LASTEXITCODE -ne 0) { Die "性能基线失败" }
 }
 

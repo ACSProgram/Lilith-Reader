@@ -1,0 +1,63 @@
+Lilith Reader
+Copyright (C) 2026 ACSProgram
+
+本产品采用 GNU Affero 通用公共许可证第 3 版（AGPL-3.0）授权，全文见同目录 LICENSE。
+AGPL-3.0 是强著佐权（copyleft）许可：以本程序为基础的分发与**通过网络提供服务**，
+均须以同样的许可向接收者提供完整对应源码。
+
+选择 AGPL-3.0 的直接原因是：本程序静态链接了 MuPDF，而 MuPDF 以 AGPL-3.0 分发
+（另有商业许可可选）。两相结合，本项目的分发许可只能是 AGPL-3.0 或更严格的兼容许可。
+
+--------------------------------------------------------------------------------
+第三方组件
+
+本程序在编译期静态链接下列组件，其代码与资源被一并编入 LilithReader.exe。
+各组件版权归其各自作者所有，按各自许可授权。以下清单按"是否直接编入最终产物"分组，
+版本号以构建时 vcpkg 解析结果为准。
+
+一、直接编入（源码随仓库提交，见 third_party/）
+
+  Dear ImGui (ocornut/imgui)
+    许可：MIT
+    版权：Copyright (c) 2014-2025 Omar Cornut
+    说明：界面自绘库；本产品使用其核心 + Win32/DX11 后端 + FreeType 字体装载器。
+    许可全文：third_party/imgui/LICENSE.txt
+
+二、经 vcpkg 静态链接（x64-windows-static）
+
+  MuPDF (Artifex Software)          许可：AGPL-3.0（或商业许可）
+  FreeType                          许可：FreeType License / GPLv2 双许可
+  HarfBuzz                          许可：MIT
+  zlib                              许可：zlib
+  libpng                            许可：libpng
+  libjpeg-turbo                     许可：IJG / BSD-3-Clause / zlib
+  OpenJPEG                          许可：BSD-2-Clause
+  jbig2dec                          许可：AGPL-3.0 / GPLv2
+  Brotli                            许可：MIT
+  bzip2                             许可：BSD-4-Clause 型
+  Gumbo (HTML5 解析)                许可：Apache-2.0
+
+三、编入的字体资源（随 MuPDF 内置兜底字体，或本项目内嵌的界面字体子集）
+
+  Source Han Serif (思源宋体)        许可：SIL Open Font License 1.1
+  Noto 系列（Emoji / Symbols / Math 等） 许可：SIL Open Font License 1.1
+  URW Base35 / Charis SIL            许可：AFPL / GPL 例外 / SIL OFL
+  界面字体子集（assets/ui_font_subset.otf）  由思源黑体等系统/开源字体子集化生成，
+    许可随其源字体（SIL OFL 1.1）
+
+完整、逐版本的依赖树与许可文件由 vcpkg 在构建时解析；本地安装根的
+share/<端口>/copyright 下可查各组件许可全文。
+
+--------------------------------------------------------------------------------
+字体与商标
+
+"Lilith" 与 "Lilith Reader" 为本项目名称。文中提及的其它产品名、公司名与商标
+归其各自所有者所有，仅为标识用途。
+
+--------------------------------------------------------------------------------
+源码获取
+
+本项目源码：https://github.com/ACSProgram/Lilith-Reader
+
+AGPL-3.0 第 13 条要求：若你通过网络与本程序交互，应能获取其对应源码。本项目为
+本地桌面程序，不提供网络服务；如需源码，请访问上述仓库。

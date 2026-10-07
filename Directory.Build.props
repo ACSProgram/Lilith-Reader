@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Directory.Build.props —— 机器相关构建配置入口（MSBuild 自动向上查找并导入）。
+
+  这里只放"因机器而异、但需要被工程文件消费"的值。当前仅一项：vcpkg 依赖安装根
+  LilithVcpkgRoot。
+
+  为什么不能写死在 src/LilithReader.vcxproj 里：该路径是**机器级状态**（依赖装在本机
+  哪个目录），写死会让别人克隆后构建失败。
+  为什么不能放在仓库内：项目路径含空格，会触发上游 meson 端口的链接命令行截断
+  （LNK1181，ADR-010），故安装根必须在仓库之外。
+
+  取值优先级（自低到高，高者覆盖低者）：
+    1) 本文件的默认值：%LOCALAPPDATA%\vcpkg-roots\LilithReader
+    2) 环境变量 LilithVcpkgRoot
+    3) 同目录的 Directory.Build.props.local（本机文件，不入库；见 .gitignore）
+    4) 命令行 /p:LilithVcpkgRoot=...（MSBuild 全局属性，工程文件不可覆盖）
+
+  约束（ADR-010）：安装根路径**不得含空格、不得含 triplet 名**。
+  实际生效路径 = $(LilithVcpkgRoot)\$(VcpkgTriplet)。
+-->
+<Project>
+  <!-- 本机覆盖文件：存在即导入，用于钉住本机的安装根，不随仓库分发 -->
+  <Import Project="Directory.Build.props.local" Condition="Exists('Directory.Build.props.local')" />
+
+  <PropertyGroup>
+    <LilithVcpkgRoot Condition="'$(LilithVcpkgRoot)' == ''">$(LOCALAPPDATA)\vcpkg-roots\LilithReader</LilithVcpkgRoot>
+  </PropertyGroup>
+</Project>

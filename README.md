@@ -2,7 +2,7 @@
 
 [![PR CI](https://github.com/ACSProgram/Lilith-Reader/actions/workflows/pr.yml/badge.svg)](https://github.com/ACSProgram/Lilith-Reader/actions/workflows/pr.yml)
 
-Windows 上的桌面文档阅读器，从 [Lilith](F:\programs\Lilith) 主项目分离出来的独立应用。
+Windows 上的桌面文档阅读器，从 Lilith 主项目分离出来的独立应用。
 单个 exe，静态链接，除 Windows 系统组件外不依赖任何运行时，复制到任意目录即可运行。
 
 文档解析用 MuPDF，界面用 ImGui + Direct3D 11 自绘，页面画布自研。关注点是阅读本身：
@@ -169,3 +169,17 @@ installer\build_installer.bat        :: 需 Inno Setup 6；先跑过 build.bat
 - [文档导航](docs/README.md) —— 按任务选择上下文
 - [归档索引](docs/archive/README.md) —— 已完成批次的过程记录与验证结论
 - [AGENTS.md](AGENTS.md) —— 协作规则与文档纪律
+- [贡献指南](CONTRIBUTING.md) —— 环境搭建、提交格式、自检清单
+- [安全策略](SECURITY.md) —— 漏洞报告渠道与处理流程
+- [行为准则](CODE_OF_CONDUCT.md) —— 社区参与规范
+- [第三方组件与许可](NOTICE) —— 静态链接的组件及其许可
+
+## 许可证
+
+本项目以 **GNU Affero 通用公共许可证第 3 版（AGPL-3.0）** 授权，全文见 [LICENSE](LICENSE)。
+
+选择 AGPL-3.0 的原因是：本程序静态链接了以 AGPL-3.0 分发的 MuPDF（另有商业许可可选），
+两相结合，分发许可只能是 AGPL-3.0 或更严格的兼容许可。静态链接的第三方组件清单、
+版权与许可见 [NOTICE](NOTICE)。
+
+Copyright (C) 2026 ACSProgram

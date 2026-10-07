@@ -2,9 +2,9 @@
 """check_installer_size.py — 安装包体积门禁（ADR-084）
 
 断言 installer/dist/ 下的安装包不超过体积上限，超限非零退出。
-上限依据 docs/05-体积预算.md §5：0.6.0 打包实测 24.9 MiB（对应裁剪前 40 MiB exe），
-字体裁剪后 exe 38.06 MiB、预计安装包约 23 MiB；35 MiB 的余量专防"字体意外回到
-全量"一类大回归（lzma2 后约 40 MiB 会触发），日常微膨胀不报警。
+上限依据 docs/05-体积预算.md §5：1.0-rc.1 打包实测 24.04 MiB（对应 exe 38.13 MiB），
+35 MiB 的余量专防"字体意外回到全量"一类大回归（lzma2 后约 40 MiB 会触发），
+日常微膨胀不报警。
 
 用法：python tests/check_installer_size.py <installer/dist 目录>
 仅用标准库（CI 的 installer job 不装任何依赖）；本地亦可直接运行。

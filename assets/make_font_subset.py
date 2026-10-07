@@ -26,19 +26,25 @@ Noto Sans SC Regular（OFL 1.1，思源黑体同源；可自由嵌入分发）�
 用法
 ----
     python assets/make_font_subset.py                 # 生成 assets/ui_font_subset.otf
-    python assets/make_font_subset.py --source <路径>  # 指定源字体（默认取缓存目录）
+    python assets/make_font_subset.py --source <路径>  # 指定源字体
+环境变量 LILITH_FONT_SOURCE 可覆盖默认源字体路径（默认取本机缓存目录）。
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import unicodedata
 from pathlib import Path
 
 SOURCE_URL = ("https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/"
               "Sans/SubsetOTF/SC/NotoSansSC-Regular.otf")
-DEFAULT_SOURCE = Path(r"F:\programs\.Environment\fonts-src\NotoSansSC-Regular.otf")
+# 源字体路径不写死机器路径：优先环境变量 LILITH_FONT_SOURCE，否则落在本机缓存目录
+# %LOCALAPPDATA%\LilithReader\fonts-src\（源字体不入库，只提交生成物）。
+DEFAULT_SOURCE = Path(os.environ.get("LILITH_FONT_SOURCE") or
+                      Path(os.environ.get("LOCALAPPDATA") or Path.home()) /
+                      "LilithReader" / "fonts-src" / "NotoSansSC-Regular.otf")
 OUT_NAME = "ui_font_subset.otf"
 
 REPO = Path(__file__).resolve().parent.parent

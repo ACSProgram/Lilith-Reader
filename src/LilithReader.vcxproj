@@ -53,14 +53,17 @@
     <VcpkgEnableManifest>true</VcpkgEnableManifest>
     <VcpkgTriplet>x64-windows-static</VcpkgTriplet>
     <VcpkgUseStatic>true</VcpkgUseStatic>
-    <!-- 依赖安装根目录（不含 triplet），必须满足两个条件，理由见 ADR-010：
+    <!-- 依赖安装根目录（不含 triplet）。**不在此写死机器路径** —— 由仓库根的
+         Directory.Build.props 经 LilithVcpkgRoot 注入（默认 %LOCALAPPDATA%\vcpkg-roots\
+         LilithReader，可被环境变量 / Directory.Build.props.local / /p: 覆盖）。
+         该路径必须满足两个条件，理由见 ADR-010：
          1) 路径不含空格 —— meson 端口（harfbuzz）生成的链接命令行未给 /libpath:
             加引号，路径含空格会被截断成两个参数，导致 LNK1181。
          2) 不含 triplet —— vcpkg 的 MSBuild 集成把它当作安装根传给 vcpkg
             （vcpkg 内部再拼一次 triplet），同时又在 _ZVcpkgCurrentInstalledDir
             里再拼一次；写含 triplet 的路径会导致 include/lib 双重目录、找不到头文件。
          实际生效路径 = $(VcpkgInstalledDir)\$(VcpkgTriplet)。 -->
-    <VcpkgInstalledDir>F:\programs\.Environment\vcpkg-roots\LilithReader</VcpkgInstalledDir>
+    <VcpkgInstalledDir>$(LilithVcpkgRoot)</VcpkgInstalledDir>
   </PropertyGroup>
   <!-- MuPDF 兼容宏：vcpkg 的 libmupdf 端口把这些 FZ_ENABLE_ 开头的宏作为私有编译
        定义传给库（见其 CMakeLists.txt），不会传播给消费方。因此本项目必须镜像

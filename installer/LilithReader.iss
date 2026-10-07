@@ -22,17 +22,21 @@
 ; ──────────────────────────────────────────────────────────────────────────────
 
 #define MyAppName "Lilith Reader"
-#define MyAppVersion "0.6.0"
+; 显示版本（可含预发布后缀，用于文件名、注册表显示、欢迎页文案）
+#define MyAppVersion "1.0-rc.1"
+; 数字版本：PE 版本资源是 4 段纯数字，无法表达 "-rc.1"；它必须与
+; src/app/app.rc 的 FILEVERSION 一致，是编译期校验的比对基准。
+#define MyAppVersionNumeric "1.0.0.0"
 #define MyAppPublisher "Lilith"
 #define MyAppExeName "LilithReader.exe"
 #define MyAppDescription "轻量级文档阅读器：PDF / EPUB / MOBI / FB2 / CBZ / XPS，单文件、零依赖、极致效率"
 ; 固定 AppId：升级/卸载识别的唯一凭据，发布后不得更改
 #define MyAppId "{A6E4B7C2-9F31-4D08-B7A5-3C8E1D2F4A90}"
 
-; 编译期版本一致性校验：exe 的版本资源（src/app/app.rc）必须与脚本里的版本一致，
-; 否则两处会各自漂移，最后出现"安装包说 0.6.0、程序说 0.5.0"这种事故。
-#if GetVersionNumbersString("..\bin\Release\" + MyAppExeName) != MyAppVersion + ".0"
-  #error 版本不一致：bin\Release\LilithReader.exe 的版本资源与 MyAppVersion 不符，请先同步 src/app/app.rc 并重新编译。
+; 编译期版本一致性校验：exe 的版本资源（src/app/app.rc 的 FILEVERSION）必须与
+; MyAppVersionNumeric 一致，否则两处会各自漂移，最后出现"安装包说 1.0、程序说 0.9"这种事故。
+#if GetVersionNumbersString("..\bin\Release\" + MyAppExeName) != MyAppVersionNumeric
+  #error 版本不一致：bin\Release\LilithReader.exe 的数字版本与 MyAppVersionNumeric 不符，请先同步 src/app/app.rc 并重新编译。
 #endif
 
 [Setup]
@@ -42,11 +46,14 @@ AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppComments={#MyAppDescription}
-VersionInfoVersion={#MyAppVersion}.0
+VersionInfoVersion={#MyAppVersionNumeric}
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} 安装程序
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion={#MyAppVersion}
+; 数字版本字段只接受 x.x.x.x，预发布后缀（-rc.1）放到 *TextVersion 字段
+VersionInfoProductVersion={#MyAppVersionNumeric}
+VersionInfoTextVersion={#MyAppVersion}
+VersionInfoProductTextVersion={#MyAppVersion}
 DefaultDirName={autopf}\Lilith Reader
 ; 每用户安装：免管理员；程序目录可写（见文件头第 1 条）
 PrivilegesRequired=lowest
