@@ -6,6 +6,7 @@
 // take_page_content），本 TU 只做纯浮点命中测试。
 
 #include "app_internal.h"
+#include "text_hit.h"   // 选行的两维判据（多列版面必需），纯函数、可单测
 
 namespace lr::app {
 
@@ -129,11 +130,9 @@ int page_at_screen(const ImVec2& origin, const ImVec2& screen) {
 
 namespace {
 
-// 行的"文字高度"：取 bbox 高与宽的较小者。
-// 竖排文字的 bbox 高是**文字长度**，直接拿它当行高会得出荒唐的容差（整页都算命中）。
-float line_text_height(const lr::TextLine& L) {
-    return std::max(std::min(L.y1 - L.y0, L.x1 - L.x0), 1.0f);
-}
+// 行的"文字高度"：取 bbox 高与宽的较小者 —— 定义已抽到 text_hit.h（纯函数、可单测），
+// 此处只作 using 别名，避免两处实现漂移。
+using lr::app::hit_line_text_height;
 
 }  // namespace
 
@@ -144,29 +143,17 @@ int char_index_at(int page, float x_pt, float y_pt, bool clamp_to_nearest) {
 
     // 1) 选行。带"行高 1/4"的容差：点在行间空白（行距小于半个字高）仍算落在该行。
     //    **超出容差就是"此处无文字"** —— 悬停/按下走这条路；拖拽时（clamp）才退回最近行。
-    int   hit_line = -1;
-    int   near_line = -1;
-    float near_d = 0.0f;
-    for (std::size_t i = 0; i < g_app.content.lines.size(); ++i) {
-        const lr::TextLine& L = g_app.content.lines[i];
-        const float pad = line_text_height(L) * 0.25f;
-        if (y_pt >= L.y0 - pad && y_pt <= L.y1 + pad) {
-            hit_line = static_cast<int>(i);
-            break;
-        }
-        const float d = std::fabs(y_pt - (L.y0 + L.y1) * 0.5f);
-        if (near_line < 0 || d < near_d) {
-            near_line = static_cast<int>(i);
-            near_d = d;
-        }
-    }
-    const int line = (hit_line >= 0) ? hit_line : (clamp_to_nearest ? near_line : -1);
+    //    多列版面同一 y 区间有多行（左列/右列，行带重叠），故判据必须是两维的
+    //    （纵向距带 → 横向距框），不能"取第一个 y 命中就收"（见 text_hit.h）。
+    int in_band = 0;
+    const int line = lr::app::pick_text_line(g_app.content.lines, x_pt, y_pt, &in_band);
     if (line < 0) return -1;
+    if (!in_band && !clamp_to_nearest) return -1;
 
     // 2) 行内选字符：x 落在字符框内即命中；否则取 x 距离最近的一个。
     //    严格模式下只有"离行内字符不超过半个字高"才算命中 —— 于是拖到行尾之外能吸附到
     //    最后一个字符（拖拽走 clamp），而**在页边空白上悬停则如实报告"没有文字"**。
-    const float pad_x = line_text_height(g_app.content.lines[static_cast<std::size_t>(line)]) * 0.5f;
+    const float pad_x = hit_line_text_height(g_app.content.lines[static_cast<std::size_t>(line)]) * 0.5f;
     int   best = -1;
     float bd = 0.0f;
     for (int i = 0; i < cnt; ++i) {

@@ -60,7 +60,7 @@ def main() -> int:
         appearance = ui.split("void draw_appearance_menu_contents(bool reading)", 1)[1].split(
             "void draw_view_menu_contents()", 1)[0]
         settings = ui.split("void draw_settings_interface_tab()", 1)[1].split(
-            "void draw_settings_reading_tab()", 1)[0]
+            "void draw_settings_performance_tab()", 1)[0]
     except IndexError:
         print("  [FAIL] 找不到外观菜单或界面设置实现", file=sys.stderr)
         failed = True

@@ -6,7 +6,7 @@
 ## 用法
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(72) + canvas_test(126) + page_cache_test(32) + page_state_test(54) + reader_state_test(110) + persist_test(7) + tone_test(113) + page_map_test(26) + render_search_test(10) + render_fault_test(7) + imgui_raii_test(8) + 菜单文案宽度 + 主题重置 / 优先级 + 资源断言（字体子集 / 图标帧集）
+powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(72) + canvas_test(126) + page_cache_test(32) + page_state_test(54) + reader_state_test(110) + persist_test(7) + tone_test(113) + page_map_test(26) + text_hit_test(14) + render_search_test(10) + render_fault_test(7) + imgui_raii_test(8) + 菜单文案宽度 + 主题重置 / 优先级 + 资源断言（字体子集 / 图标帧集）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Probe   # 额外跑 MuPDF 诊断探针（打印 FZ_META_FORMAT 等）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # 复用已有 samples/
 ```
@@ -31,6 +31,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # �
 | `render_fault_test.cpp` | 7 例断言（Phase 7，ADR-079）：**渲染工作线程的故障隔离**——必须在真实线程边界上跑，单测覆盖不到 `std::jthread` 入口。断言：5 种坏文件（不存在/截断/随机字节/空 PDF/坏 zip 容器）全部**文档级** Failed 且错误详情非空、失败后**仍能**正常打开下一个文档（无 `std::terminate` 的直接证据）、越界页码/请求（slot/retry/wants/thumbs/copy）安全退化且不污染文档状态、25 轮好坏交替 open/close 无死锁无累积、400 轮请求洪峰 + 检索起停后仍收敛、1200 页文档可打开可检索、A0 幅面（2384×3370pt，走 tile 路径）收敛后调度器仍健康。设备传 `nullptr`：建纹理必然失败，恰好压到"整页分块渲染 → 逐 tile 失败 → 自动重试 → 清理"路径 |
 | `imgui_raii_test.cpp` | 8 例断言（Phase 7，ADR-078）：**ImGui RAII 包装与栈平衡自检的 headless 测试**。只编 ImGui 核心（无 Win32/D3D 后端），NewFrame → 绘制 → Render 无后端同样成立，故栈平衡可完全离线、确定性验证。断言：Push/Pop 全家族配对、Begin/End 条件配对（含返回 false 分支）、**异常展开收回全部栈**（抛出点无条件执行，不依赖任何 ImGui 返回值）、`dismiss()` 提前收口且幂等、`format_stack_diff` 能检出注入的漏配对、200 帧连续绘制不累积泄漏、帧首基线跨帧稳定（判据是"帧尾 == 帧首"而非"各层为 0"——ImGui 的隐式窗口与默认字体使后者恒假）。另把 ImGui 自身检出的错误接到计数回调：**报错即失败**，比"崩没崩"严格 |
 | `page_map_test.cpp` | 26 例断言（ADR-069，含 `src/app/page_map.h`）：屏幕点 ↔ **未旋转页面 pt** 的折算。四类：**四角对应**（90°/180°/270° 下未旋转页面的四个角各落到屏幕矩形的哪个角 —— 这是最容易写反的一处）、**正逆往返一致**（含页外点，拖动选择依赖它）、**退化输入返回 false**（页尺寸/页矩形为 0，不产生 NaN）、**角度归一化**（负数 / 超 360 / 非 90 倍数）。文本选择、复制、超链接命中、搜索高亮全部建立在这组折算之上，而它的错误是"0° 正常、一旋转就整体偏一格"这类肉眼难判的一类 |
+| `text_hit_test.cpp` | 14 例断言（ADR-091，含 `src/app/text_hit.h`）：文本命中测试的**选行**判据。核心是**多列版面**——左右两列的正文行 y 带完全重叠、左列在 stext 顺序里靠前，旧实现"取第一个 y 命中就收"会把右列的点判给左列（实测两列论文右列几乎选不中）。断言覆盖：单列（每 y 至多一行，回归守卫）、多列（按 x 破平取到正确列）、带外（`in_band=0`）、拖拽（横向远离仍返回该行）、竖排行高取宽度。零依赖 |
 | `check_theme_reset.py` | 主题重置断言（ADR-068）：`apply_theme_colors` 的两个分支必须先 `StyleColorsLight` / `StyleColorsDark` **整套重置**再逐项覆盖 —— 否则未覆盖的颜色项会带着上一个主题的值活过来（深色勾选框曾因此变成亮奶油色）。跨状态残留这类 bug 在代码里毫无痕迹，只能靠结构性约束挡住 |
 | `check_theme_precedence.py` | 外观契约断言：深色纸张只在“跟随系统”时额外令界面变暗，显式浅色/深色不被文档状态覆盖；同时检查菜单分组、统一标签表与设置项顺序 |
 | `check_menu_width.py` | 菜单文案宽度断言（ADR-067）：扫描 `src/app/ui.cpp` 的菜单字面量，显示宽度（CJK=2 列）不得超过 12 列 —— 弹出菜单的宽度由最长项决定，一条超长文案会把整张菜单撑宽。补充说明应改用悬停提示 |

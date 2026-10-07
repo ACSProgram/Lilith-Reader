@@ -1195,7 +1195,7 @@ void draw_main_menu_contents() {
     if (menu_item_cmd(kIcSettings, "设置…", Cmd::OpenSettings)) g_app.show_settings = true;
     if (menu_item_cmd(kIcHelp, "按键设置…", Cmd::OpenKeys)) {
         g_app.show_settings = true;
-        g_app.settings_open_tab = 3;   // 直接落到「按键」分栏
+        g_app.settings_open_tab = 2;   // 直接落到「按键」分栏
     }
     ImGui::Separator();
     if (menu_item(kIcClose, "退出", nullptr)) PostMessageW(g_app.hwnd, WM_CLOSE, 0, 0);
@@ -1254,7 +1254,7 @@ void draw_canvas_context_menu() {
         if (menu_item_cmd(kIcSettings, "设置…", Cmd::OpenSettings)) g_app.show_settings = true;
         if (menu_item_cmd(kIcHelp, "按键设置…", Cmd::OpenKeys)) {
             g_app.show_settings = true;
-            g_app.settings_open_tab = 3;
+            g_app.settings_open_tab = 2;
         }
     }
 }
@@ -1947,7 +1947,7 @@ void draw_settings_reading_data_tab() {
     ImGui::TextColored(col_dim(), "%s", count);
 }
 
-// ---- 设置窗口（分栏：界面 / 阅读 / 性能 / 按键） ----
+// ---- 设置窗口（分栏：界面 / 性能 / 按键 / 阅读数据） ----
 
 void reset_prefs_to_default() {
     g_app.prefs = UiPrefs{};
@@ -1999,11 +1999,9 @@ void draw_settings_interface_tab() {
         settings_row("界面动效");
         if (ImGui::Checkbox("##motion", &g_app.prefs.motion)) save_prefs();
         settings_note("页面淡入 / 滚动缩放平滑 / 顶栏与侧栏滑动 / 窗口淡入淡出");
-    }
-}
 
-void draw_settings_reading_tab() {
-    if (const SettingsRows rows = SettingsRows("##set_read")) {
+        // 「页面间距」原先单列「阅读」分栏，现并入本栏（分栏合并）：它同样是"看着舒服"
+        // 的观感项，与界面缩放/动效同属一类，单独占一栏显得空。
         settings_row("页面间距");
         float gp = g_app.prefs.gap_percent;
         if (ImGui::SliderFloat("##gap", &gp, 0.0f, 6.0f, "%.1f%%")) {
@@ -2011,7 +2009,7 @@ void draw_settings_reading_tab() {
             apply_gap_pref();
             save_prefs();
         }
-        settings_note("页与页之间的留白比例");
+        settings_note("页与页之间的留白比例（列宽的百分比）");
     }
 }
 
@@ -2248,19 +2246,15 @@ void draw_settings_window() {
                     draw_settings_interface_tab();
                 }
                 if (const ig::TabItem t = ig::TabItem(
-                        "阅读", nullptr, want_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
-                    draw_settings_reading_tab();
-                }
-                if (const ig::TabItem t = ig::TabItem(
-                        "性能", nullptr, want_tab == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                        "性能", nullptr, want_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
                     draw_settings_performance_tab();
                 }
                 if (const ig::TabItem t = ig::TabItem(
-                        "按键", nullptr, want_tab == 3 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                        "按键", nullptr, want_tab == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
                     draw_settings_keys_tab();
                 }
                 if (const ig::TabItem t = ig::TabItem(
-                        "阅读数据", nullptr, want_tab == 4 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                        "阅读数据", nullptr, want_tab == 3 ? ImGuiTabItemFlags_SetSelected : 0)) {
                     draw_settings_reading_data_tab();
                 }
             }

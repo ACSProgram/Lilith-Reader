@@ -317,6 +317,13 @@ Invoke-Cl ($defs + @("/I$(Join-Path $src 'app')") + $incs + @("/c",
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\page_map_test.exe", "$out\page_map_test.obj", "/link") +
     $libdirs) "链接 page_map_test.exe"
 
+# 命中测试的「选行」判据：同样是 app 层抽出的纯函数（text_hit.h）。多列版面左右两列的
+# y 带重叠，选行必须两维（纵向距带 → 横向距框），否则右列几乎选不中。只依赖 C++ 标准库。
+Invoke-Cl ($defs + @("/I$(Join-Path $src 'app')") + $incs + @("/c",
+    "/Fo$out\text_hit_test.obj", (Join-Path $tests "text_hit_test.cpp"))) "编译 text_hit_test.cpp"
+Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\text_hit_test.exe", "$out\text_hit_test.obj", "/link") +
+    $libdirs) "链接 text_hit_test.exe"
+
 # ---- 4. 运行测试 ---------------------------------------------------------------
 
 Step "运行断言测试"
@@ -406,6 +413,16 @@ try {
 }
 $pageMapExit = $LASTEXITCODE
 Write-Host "  page_map_test.exe 退出码 = $pageMapExit"
+
+Step "运行命中测试选行断言"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & "$out\text_hit_test.exe"
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$textHitExit = $LASTEXITCODE
+Write-Host "  text_hit_test.exe 退出码 = $textHitExit"
 
 Step "运行渲染层检索测试"
 try {
@@ -513,6 +530,7 @@ if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $pageState
     $persistExit -eq 0 -and
     $toneExit -eq 0 -and $pageMapExit -eq 0 -and $renderSearchExit -eq 0 -and
     $renderFaultExit -eq 0 -and $raiiExit -eq 0 -and
+    $textHitExit -eq 0 -and
     $fontExit -eq 0 -and $iconExit -eq 0 -and
     $menuExit -eq 0 -and $themeExit -eq 0 -and $themePrecedenceExit -eq 0) {
     Write-Host "全部通过。" -ForegroundColor Green
@@ -527,6 +545,7 @@ if ($stateExit -ne 0) { exit $stateExit }
 if ($persistExit -ne 0) { exit $persistExit }
 if ($toneExit -ne 0) { exit $toneExit }
 if ($pageMapExit -ne 0) { exit $pageMapExit }
+if ($textHitExit -ne 0) { exit $textHitExit }
 if ($renderSearchExit -ne 0) { exit $renderSearchExit }
 if ($renderFaultExit -ne 0) { exit $renderFaultExit }
 if ($raiiExit -ne 0) { exit $raiiExit }

@@ -619,7 +619,7 @@ void handle_global_commands() {
     if (cmd_pressed(Cmd::ToggleFullscreen)) g_app.request_fullscreen_toggle = true;  // 帧间执行（ADR-060）
     if (cmd_pressed(Cmd::OpenFile))         g_app.request_open_dialog = true;
     if (cmd_pressed(Cmd::OpenSettings))     g_app.show_settings = true;
-    if (cmd_pressed(Cmd::OpenKeys))         { g_app.show_settings = true; g_app.settings_open_tab = 3; }
+    if (cmd_pressed(Cmd::OpenKeys))         { g_app.show_settings = true; g_app.settings_open_tab = 2; }
 
     // 画布右键菜单的键盘等价入口（Shift+F10 / 菜单键）：标准 Windows 习惯、
     // 属"无鼠标兜底"而非可自定义命令，故仍写死。
