@@ -26,6 +26,10 @@
 //     ImTextureID（= ID3D11ShaderResourceView*）。UI **只读**该句柄，绝不释放。
 //   · 本层不出现任何 fz_* 调用（只经 Document/PageBitmap 公开接口），
 //     故不受 ADR-009 的 setjmp 纪律约束。
+//
+// 内部结构（架构加固，ADR-085）：本接口**不变**；实现单元 `render.cpp` 内 `Renderer::Impl`
+// 已拆为 TextureStore / DocumentWorker / PageScheduler / ContentService / SearchJob 五个组件
+// （唯一互斥量与工作线程仍归 Impl）。页状态机见 lilithreader.page_state。
 
 module;
 
@@ -45,17 +49,15 @@ export import lilithreader.document;
 // 重新导出页缓存纯策略：预算常量/钳制、自动重试上限供 app 层直接使用。
 export import lilithreader.page_cache;
 
+// 重新导出页状态机：PageStatus / PageState。状态本体与转移函数在 lilithreader.page_state
+// （纯模块、可单测，ADR-085）；此处重导出使 `import lilithreader.render` 的翻译单元
+// 仍可见 `lr::PageStatus`（PageSlot::status 用到它）。
+export import lilithreader.page_state;
+
 export namespace lr {
 
-// ---- 单页状态机 ----
-enum class PageStatus : int {
-    Unloaded = 0,  // 无纹理（尚未请求，或已被逐出）
-    Loading,       // 渲染中（保留旧纹理，UI 继续显示旧图，ADR-024）
-    Loaded,        // 纹理可用
-    Failed,        // 渲染失败：自动重试已用尽。UI 显示错误占位，点击可重试（retry_page）
-};
-
-// UI 线程读取的页快照（值拷贝，不持有所有权）
+// UI 线程读取的页快照（值拷贝，不持有所有权）。
+// status 由 render 内部组件的 PageState 派生填充（ADR-085）。
 struct PageSlot {
     PageStatus status = PageStatus::Unloaded;
     void*      texture = nullptr;  // ID3D11ShaderResourceView*，不透明；UI 只读

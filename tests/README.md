@@ -6,7 +6,7 @@
 ## 用法
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(72) + canvas_test(126) + page_cache_test(32) + reader_state_test(110) + persist_test(7) + tone_test(113) + page_map_test(26) + render_search_test(10) + render_fault_test(7) + imgui_raii_test(8) + 菜单文案宽度 + 主题重置 / 优先级 + 资源断言（字体子集 / 图标帧集）
+powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1          # 常规：生成样本 → 编译 → 运行 doc_test(72) + canvas_test(126) + page_cache_test(32) + page_state_test(54) + reader_state_test(110) + persist_test(7) + tone_test(113) + page_map_test(26) + render_search_test(10) + render_fault_test(7) + imgui_raii_test(8) + 菜单文案宽度 + 主题重置 / 优先级 + 资源断言（字体子集 / 图标帧集）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Probe   # 额外跑 MuPDF 诊断探针（打印 FZ_META_FORMAT 等）
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # 复用已有 samples/
 ```
@@ -22,6 +22,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # �
 | `doc_test.cpp` | 72 例断言表：合法格式、改名放行、归档冒充拒绝、加密三态、扩展名闸门、**逐页尺寸**（形变防线）、**目录解析**（顺序/层级/页号）、**旋转渲染**（0°/180° 尺寸不变、90° 宽高互换）、**纸张方案配色**（深色纸张背景为深暖灰且保留 alpha、暖色 R>B）、**配色分层**（ADR-067：`with_image.pdf` 深色纸张下照片仍是红的、纸面仍变深；`scan_only.pdf` 整页扫描件整体变深；`ink_black.pdf` 正文（纯黑）映射为浅暖灰、**并与纸面暖度一致**——LUT 两端等斜率）、**文本层**（Phase 8，ADR-069/070：`page_content` 抽到字符与行、码点拼回词、`copy_text` 的**选区端点约定**（字符框中心朝外偏 30%，用中心点会少一个字）、`search_page` 命中 / 大小写不敏感 / 无匹配为空表、**自洽检索**（把抽到的**同一行**前 4 个字符拼成关键字再搜自己 —— PDF/EPUB/FB2 通用，不依赖样本文案） |
 | `canvas_test.cpp` | 126 例断言：fit-width 派生、固定缩放居中、内容尺寸、滚动钳制、以鼠标为锚的缩放定点不变性、命中测试、可见范围、列切换锚定、非均匀页尺寸、缩放钳制、空文档、**翻页游标**（矮页视口不卡住 / 多列按行推进 / 与手动滚动同步）、**页间距随缩放**（ADR-029）、**双页对开**（ADR-038：封面单独居中 / 对开分列 / 按行推进 / `spread=false` 回归守卫 / 切换锚定 / **对开与列数同层级互斥**：切列退出对开、`columns` 值保留） |
 | `page_cache_test.cpp` | 32 例断言：预算钳制（0/下限/上限/SIZE_MAX）、自动重试上限与 `should_render_failed`、**LRU 逐出**（最久未用先出、pinned 保护、同序号按下标定序、恰好达标即停、未驻留页跳过、按字节累计）（Phase 4，ADR-030/031） |
+| `page_state_test.cpp` | 54 例断言（ADR-085，含 `src/render/page_state.ixx`）：**单页渲染状态机的纯逻辑**。`Unloaded→Loading→Loaded` 基本环、`stale`（配色失效保留纹理、重渲清 stale）、自动重试额度消耗、**失败定格**（同倍率不再重渲 / 换倍率视为新请求并重置额度 / 容差 0.002）、手动重试（一次性放行并复位额度）、逐出与旋转作废三条复位路径、`PageStatus` 取值稳定（UI/快照依赖数值）。零 D3D/线程依赖 |
 | `reader_state_test.cpp` | 110 例断言（Phase 5，ADR-034；ADR-062/065 增身份分层与位置列表）：序列化往返（含书签/确定性）、容器语义（find/upsert/erase/rekey）、**坏输入一律安全拒绝**（nullptr/magic/版本不配对/路径超长/位置条数或长度超限/超限/截断）、字段钳制（列/旋转/配色/非法 zoom）、文档键（不存在→0、同路径稳定）、**v3 身份与位置往返**（path_key/page_count/多条位置及其顺序/last_location）、**v1 迁移**（旧 key → path_key，位置留空）、**v2 迁移**（单路径 → 位置列表，空路径不进表）、**分层定位**（指纹命中/relocated/回到记过的位置不再询问/关掉智能匹配/页数不符不继承/adopt 改挂主键并累积位置/primary_key/rekey）、**位置记忆**（去重、最近优先、封顶丢最旧）、**内容指纹**（同一文件稳定、改中段或尾段一字节即变、复制到新路径不变） |
 | `persist_test.cpp` | 7 例断言（ADR-082）：**异步持久化服务的端到端测试**（跨线程，纯函数单测覆盖不到）。真跑工作线程，用轮询把"什么时候落盘"变成可断言的现象。断言：`write_state_bytes`/`load_state` 字节往返、防抖窗口后自动落盘（dirty 转清）、`flush` 越过长防抖窗口立即落盘、写失败（目录不存在）如实上报、**析构 flush**、空状态落盘、连续多次 `request_save` 合并为最后一次内容 |
 | `mupdf_probe.cpp` | 诊断工具：打印 MuPDF 对每个样本的原始判定（页数、`FZ_META_FORMAT`），新增格式支持时先用它摸底 |
@@ -44,13 +45,16 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # �
 - 链接 `canvas_test.exe` 时**必须一并链接 `canvas.ixx.obj`**：画布接口单元里的内联
   成员（如 `Canvas::state`）由它发射，只链 `canvas.obj` 会报 LNK2019。
 - 同理 `page_cache_test.exe` 必须链 `page_cache.ixx.obj`：`select_evictions` 定义在接口单元里。
+- `page_state_test.exe` 必须链 `page_state.ixx.obj` + `page_cache.ixx.obj`：转移函数与
+  `PageState` 内联由接口单元发射，且它 import `page_cache` 的重试策略常量。编译 `page_state.ixx`
+  要 `/reference page_cache.ifc`；编译顺序 `page_cache` → `page_state`（ADR-085）。
 - `reader_state_test.exe` 必须链 `reader_state.ixx.obj` + `reader_state.obj`：接口单元发射
   `ReaderState` 的成员函数（`find`/`upsert`/`erase`），实现单元提供 `encode_state`/`document_key` 等。
   用例含内容指纹断言，故编译时还需 `/reference utils.ifc`（`file_fingerprint` 是内联函数，无需额外链 obj）。
 - `render_search_test.exe` 必须链 `render.ixx.obj` + `render.obj` + `document.ixx.obj` + `document.obj`
-  + `page_cache.ixx.obj` + `utils.ixx.obj`，并额外加 `d3d11.lib`（`render.cpp` 里建纹理用；
-  本用例不实际建，但符号必须能解析）。编译 `render.ixx` 时要 `/reference` 它 import 的
-  `document` / `page_cache` / `utils` 三个 `.ifc`。
+  + `page_cache.ixx.obj` + `page_state.ixx.obj` + `utils.ixx.obj`，并额外加 `d3d11.lib`（`render.cpp`
+  里建纹理用；本用例不实际建，但符号必须能解析）。编译 `render.ixx` 时要 `/reference` 它 import 的
+  `document` / `page_cache` / `page_state` / `utils` 四个 `.ifc`（ADR-085：`PageStatus` 迁入 `page_state`）。
 - `persist_test.exe` 必须链 `persist.ixx.obj` + `persist.obj` + `reader_state.ixx.obj` +
   `reader_state.obj` + `log.obj` + `log.ixx.obj`。编译 `persist.ixx` 要 `/reference reader_state.ifc`；
   编译 `persist.cpp` 要 `/reference persist.ifc` + `reader_state.ifc` + `log.ifc`。

@@ -140,6 +140,8 @@
     <ClCompile Include="render\render.cpp" />
     <!-- Phase 4：页缓存纯策略（零依赖，可单测；render.cpp 使用） -->
     <ClCompile Include="render\page_cache.ixx" />
+    <!-- 架构加固（ADR-085）：单页状态机（纯逻辑，可单测；render.cpp 使用） -->
+    <ClCompile Include="render\page_state.ixx" />
     <!-- Phase 5：阅读状态持久化（纯序列化 + 原子文件 I/O，可单测） -->
     <ClCompile Include="state\reader_state.ixx" />
     <ClCompile Include="state\reader_state.cpp" />

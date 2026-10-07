@@ -167,19 +167,30 @@ Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\page_cache.ifc", "/Fo$out\pag
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\page_cache.ifc",
     "/Fo$out\page_cache_test.obj", (Join-Path $tests "page_cache_test.cpp"))) "编译 page_cache_test.cpp"
 
+# 架构加固（ADR-085）：单页状态机（纯逻辑，不碰 D3D/线程），单独编译成 page_state_test.exe。
+# page_state.ixx 依赖 page_cache 的重试策略，故编译顺序必须是 page_cache → page_state。
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\page_cache.ifc",
+    "/ifcOutput$out\page_state.ifc", "/Fo$out\page_state.ixx.obj",
+    (Join-Path $src "render\page_state.ixx"))) "编译 page_state.ixx"
+Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\page_state.ifc",
+    "/reference", "$out\page_cache.ifc",
+    "/Fo$out\page_state_test.obj", (Join-Path $tests "page_state_test.cpp"))) "编译 page_state_test.cpp"
+
 # Phase 8：渲染层「文本通道 + 全文检索」端到端测试（跨线程，纯函数单测覆盖不到）。
 # 设备传 nullptr：用例只走文本通道，不建纹理，故不需要真的 D3D 设备。
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\document.ifc",
-    "/reference", "$out\page_cache.ifc", "/reference", "$out\utils.ifc",
+    "/reference", "$out\page_cache.ifc", "/reference", "$out\page_state.ifc",
+    "/reference", "$out\utils.ifc",
     "/ifcOutput$out\render.ifc", "/Fo$out\render.ixx.obj",
     (Join-Path $src "render\render.ixx"))) "编译 render.ixx"
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\render.ifc",
     "/reference", "$out\document.ifc", "/reference", "$out\page_cache.ifc",
+    "/reference", "$out\page_state.ifc",
     "/reference", "$out\utils.ifc", "/reference", "$out\log.ifc",
     "/Fo$out\render.obj", (Join-Path $src "render\render.cpp"))) "编译 render.cpp"
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\render.ifc",
     "/reference", "$out\document.ifc", "/reference", "$out\page_cache.ifc",
-    "/reference", "$out\utils.ifc",
+    "/reference", "$out\page_state.ifc", "/reference", "$out\utils.ifc",
     "/Fo$out\render_search_test.obj",
     (Join-Path $tests "render_search_test.cpp"))) "编译 render_search_test.cpp"
 
@@ -187,7 +198,7 @@ Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\render.ifc",
 # 命题是"一个错误不会让调度器死掉"：坏文件只置文档级 Failed，之后仍能正常打开。
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\render.ifc",
     "/reference", "$out\document.ifc", "/reference", "$out\page_cache.ifc",
-    "/reference", "$out\utils.ifc",
+    "/reference", "$out\page_state.ifc", "/reference", "$out\utils.ifc",
     "/Fo$out\render_fault_test.obj",
     (Join-Path $tests "render_fault_test.cpp"))) "编译 render_fault_test.cpp"
 
@@ -259,17 +270,24 @@ Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\canvas_test.exe", "$out\canvas_test.obj
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\page_cache_test.exe", "$out\page_cache_test.obj",
     "$out\page_cache.ixx.obj", "/link") + $libdirs) "链接 page_cache_test.exe"
 
-# 渲染层检索测试：链 render 接口单元 + 实现单元 + 它依赖的 document/page_cache/utils，
+# 页状态机测试同样只用 C++ 标准库；链 page_state.ixx.obj + page_cache.ixx.obj
+# （page_state 引用 page_cache 的重试策略常量）。
+Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\page_state_test.exe", "$out\page_state_test.obj",
+    "$out\page_state.ixx.obj", "$out\page_cache.ixx.obj", "/link") + $libdirs) "链接 page_state_test.exe"
+
+# 渲染层检索测试：链 render 接口单元 + 实现单元 + 它依赖的 document/page_cache/page_state/utils，
 # 以及 d3d11（render.cpp 里建纹理用；本用例不实际建，但符号必须能解析）。
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\render_search_test.exe", "$out\render_search_test.obj",
     "$out\render.obj", "$out\render.ixx.obj", "$out\document.obj", "$out\document.ixx.obj",
-    "$out\page_cache.ixx.obj", "$out\utils.ixx.obj", "$out\log.obj", "$out\log.ixx.obj",
+    "$out\page_cache.ixx.obj", "$out\page_state.ixx.obj", "$out\utils.ixx.obj",
+    "$out\log.obj", "$out\log.ixx.obj",
     "/link") + $libdirs + $libs + @("d3d11.lib")) "链接 render_search_test.exe"
 
 # 故障隔离测试：链接目标与 render_search_test 完全一致（同一套模块）。
 Invoke-Cl (@("/nologo", "/MT", "/Fe:$out\render_fault_test.exe", "$out\render_fault_test.obj",
     "$out\render.obj", "$out\render.ixx.obj", "$out\document.obj", "$out\document.ixx.obj",
-    "$out\page_cache.ixx.obj", "$out\utils.ixx.obj", "$out\log.obj", "$out\log.ixx.obj",
+    "$out\page_cache.ixx.obj", "$out\page_state.ixx.obj", "$out\utils.ixx.obj",
+    "$out\log.obj", "$out\log.ixx.obj",
     "/link") + $libdirs + $libs + @("d3d11.lib")) "链接 render_fault_test.exe"
 
 # headless ImGui RAII 测试：只链 ImGui 核心，无任何后端。
@@ -338,6 +356,16 @@ try {
 }
 $cacheExit = $LASTEXITCODE
 Write-Host "  page_cache_test.exe 退出码 = $cacheExit"
+
+Step "运行页状态机测试"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & "$out\page_state_test.exe"
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$pageStateExit = $LASTEXITCODE
+Write-Host "  page_state_test.exe 退出码 = $pageStateExit"
 
 Step "运行阅读状态测试"
 try {
@@ -480,7 +508,8 @@ $themePrecedenceExit = $LASTEXITCODE
 Write-Host "  check_theme_precedence.py 退出码 = $themePrecedenceExit"
 
 Step "结束"
-if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $stateExit -eq 0 -and
+if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $pageStateExit -eq 0 -and
+    $stateExit -eq 0 -and
     $persistExit -eq 0 -and
     $toneExit -eq 0 -and $pageMapExit -eq 0 -and $renderSearchExit -eq 0 -and
     $renderFaultExit -eq 0 -and $raiiExit -eq 0 -and
@@ -493,6 +522,7 @@ if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $stateExit
 if ($testExit -ne 0) { exit $testExit }
 if ($canvasExit -ne 0) { exit $canvasExit }
 if ($cacheExit -ne 0) { exit $cacheExit }
+if ($pageStateExit -ne 0) { exit $pageStateExit }
 if ($stateExit -ne 0) { exit $stateExit }
 if ($persistExit -ne 0) { exit $persistExit }
 if ($toneExit -ne 0) { exit $toneExit }
