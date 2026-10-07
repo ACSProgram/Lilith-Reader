@@ -84,6 +84,7 @@ public:
     Canvas() = default;
 
     // ---- 输入 ----
+    // 改变视口时保持当前内容中心锚点，避免 fit-width 重算 zoom 后阅读位置跳变。
     void set_viewport(float w, float h);
     void set_uniform(int page_count, PageSizePt size);       // 全部页面同一尺寸
     void set_page_sizes(std::vector<PageSizePt> sizes);      // 逐页尺寸（ADR-022）

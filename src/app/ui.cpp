@@ -38,6 +38,7 @@ constexpr float kScrollBarMinThumb = 30.0f; // 滑块最小长度
 
 constexpr double kToolbarHideDelaySec = 1.6;   // 鼠标离开顶部区域多久后收起顶栏
 constexpr float  kToolbarRevealBandPx = 4.0f;  // 距窗口顶端多少像素内即判定"要显示"
+constexpr float  kStatusRevealBandPx = 4.0f;   // 全屏时距窗口底端多少像素内弹出底栏
 
 constexpr float  kPageFadeSec = 0.18f;         // 页面首次出现淡入时长
 constexpr double kScrollIndHoldSec = 1.2;      // 滚动指示条静止后渐隐的等待
@@ -481,22 +482,33 @@ void draw_canvas_area(float height) {
     draw_canvas_context_menu();  // 命中区是画布，命令集中在上下文菜单里
 }
 
-void draw_status_bar() {
+// reveal ∈ [0,1]：全屏覆盖弹出时的滑入/淡入进度（1 = 静止显示；普通窗口恒为 1）。
+// 实现要点（ADR-097）：子窗口**矩形始终停在最终位置**（尺寸不变、不越出父窗口），只把
+// 内部内容整体下移 (1-reveal)·bar_h，由子窗口自身的裁剪留下"露出来的那一段"——于是观感
+// 是"从窗口下缘滑上来"，又不至于因移动子窗口而越界。子窗口自身背景必须关掉（NoBackground），
+// 否则那层不随偏移的底色会在动画中途露出一条色带。
+void draw_status_bar(float reveal) {
     const float bar_h = px(kStatusBarH);
+    const float dy = (1.0f - reveal) * bar_h;   // 内容相对最终位置的下移量
     // 内边距与项距只覆盖"创建状态栏子窗口"这一瞬（原 PopStyleVar(2) 的位置即 dismiss 处）。
+    // 透明度作用域同样只包本函数；NoInputs 让只读信息层不接收鼠标 —— 覆盖弹出时不"吃掉"
+    // 一次滚轮/点击，事件照常落到下面的画布上。
+    ig::StyleVar status_alpha(ImGuiStyleVar_Alpha, reveal);
     ig::StyleVar2 status_pad(ImGuiStyleVar_WindowPadding, ImVec2(px(kChromePadX), px(2)),
                              ImGuiStyleVar_ItemSpacing, ImVec2(px(7), 0));
     ig::Child status("##status", ImVec2(0, bar_h), false,
                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                     ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoInputs |
                      ImGuiWindowFlags_NoNav);
     status_pad.dismiss();
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos();
     const ImVec2 ws = ImGui::GetWindowSize();
-    dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + ws.y), g_app.pal.chrome);
-    dl->AddLine(ImVec2(wp.x, wp.y + 0.5f), ImVec2(wp.x + ws.x, wp.y + 0.5f),
-                g_app.pal.chrome_border);
+    dl->AddRectFilled(ImVec2(wp.x, wp.y + dy), ImVec2(wp.x + ws.x, wp.y + ws.y + dy),
+                      with_alpha(g_app.pal.chrome, reveal));
+    dl->AddLine(ImVec2(wp.x, wp.y + dy + 0.5f), ImVec2(wp.x + ws.x, wp.y + dy + 0.5f),
+                with_alpha(g_app.pal.chrome_border, reveal));
 
     const int total = g_app.canvas.page_count();
     // 页码用画布游标（到底时即末行首页），而不是 visible_first()：后者在
@@ -504,7 +516,7 @@ void draw_status_bar() {
     const int cur = std::min(total, std::max(1, g_app.canvas.current_page() + 1));
 
     // 状态栏只承载**只读信息**（可点的控件全部集中在顶栏与菜单，避免状态栏变成按钮堆）。
-    const float ty = (bar_h - ImGui::GetTextLineHeight()) * 0.5f;
+    const float ty = (bar_h - ImGui::GetTextLineHeight()) * 0.5f + dy;
     ImGui::SetCursorPos(ImVec2(px(kChromePadX), ty));
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_app.pal.chrome_text),
                        "第 %d / %d 页", cur, std::max(1, total));
@@ -1325,6 +1337,24 @@ float update_top_bar_height(float dt) {
     return g_app.top_bar_h;
 }
 
+// 全屏时底栏不参与画布布局；鼠标移到窗口底端才作为覆盖层暂时弹出（弹出进度见
+// g_app.status_popup_anim）。只读状态信息不需要占用沉浸阅读的固定高度。
+bool fullscreen_status_popup_visible(float client_h) {
+    if (!g_app.fullscreen) return false;
+    const ImVec2 mp = ImGui::GetIO().MousePos;
+    const ImVec2 vp = ImGui::GetMainViewport()->Pos;
+    return mp.y >= vp.y + client_h - px(kStatusBarH + kStatusRevealBandPx) &&
+           mp.y <= vp.y + client_h + px(kStatusRevealBandPx);
+}
+
+// 顶栏是否作为**覆盖层**（不占用画布上方的布局高度）。
+// 只有"会自动隐藏"的顶栏才覆盖：它随时滑入/滑出，若占位就会每帧改动画布视口，让
+// fit-width 页面随动画上下"呼吸"（与底栏同一个理由，ADR-097）。常驻顶栏（非阅读态 /
+// 关掉自动隐藏）仍占位 —— 覆盖会永久遮住页面顶部，那是不可接受的。
+bool top_bar_overlays_canvas() {
+    return g_app.session.doc.kind == UiDoc::Kind::Reading && g_app.prefs.auto_hide_toolbar;
+}
+
 // 侧栏宽度的滑入/滑出插值：返回当前动画宽度（0 ~ px(kSidebarWidthPx)）。
 // 与顶栏同一手法（一阶滞后、帧率无关）；关闭动效时直切。
 float update_sidebar_width(float dt) {
@@ -1628,13 +1658,23 @@ void draw_shell() {
     // 改为显式定位 + 显式高度后：三段**恰好铺满客户区**，中间不留缝，几何一眼可读（ADR-049）。
     const float dt = ImGui::GetIO().DeltaTime;
     const float client_h = ImGui::GetContentRegionAvail().y;
-    const float status_h = px(kStatusBarH);
     const float top_h = update_top_bar_height(dt);
-    if (top_h >= 1.0f) {   // 高度为 0 时不创建子窗口：BeginChild 把 0 当作"自动高度"
-        ImGui::SetCursorPosY(0.0f);
-        draw_top_bar(top_h);
-    }
+    const bool top_overlay = top_bar_overlays_canvas();
+
+    // 底栏：全屏时是**覆盖层**（默认不占画布高度），鼠标靠近窗口底端才滑入/淡入；
+    // 普通窗口常驻底部、正常占位。step() 与 prefs.motion 联动（关动效即直切）。
+    const float status_full_h = px(kStatusBarH);
+    const float status_h = g_app.fullscreen ? 0.0f : status_full_h;
+    const bool status_alive =
+        g_app.status_popup_anim.step(dt, fullscreen_status_popup_visible(client_h), g_app.prefs.motion);
+    const float status_reveal = g_app.fullscreen ? g_app.status_popup_anim.value : 1.0f;
+
+    // 顶栏覆盖时**画布不让位**（顶栏压在画布上），于是顶栏滑入/滑出不再改动画布视口 ——
+    // 页面不会随动画重排"呼吸"；侧栏仍按顶栏的实际高度让位：它的分栏标题就在窗口顶端，
+    // 被顶栏盖住会点不中。
+    const float canvas_top = top_overlay ? 0.0f : top_h;
     const float body_h = std::max(px(60.0f), client_h - top_h - status_h);
+    const float canvas_h = std::max(px(60.0f), client_h - canvas_top - status_h);
 
     // 非阅读态把内容区铺成画布同色的底，与阅读态的视觉语言一致（否则是一大片窗口底色）。
     if (g_app.session.doc.kind != UiDoc::Kind::Reading) {
@@ -1661,9 +1701,12 @@ void draw_shell() {
             draw_sidebar(body_h, sidebar_w);
             ImGui::SameLine(0.0f, 0.0f);
         }
-        draw_canvas_area(body_h);
-        ImGui::SetCursorPosY(client_h - status_h);
-        draw_status_bar();
+        ImGui::SetCursorPosY(canvas_top);   // 顶栏覆盖时画布回到窗口顶端（不让位）
+        draw_canvas_area(canvas_h);
+        if (!g_app.fullscreen || status_alive) {
+            ImGui::SetCursorPosY(client_h - status_full_h);
+            draw_status_bar(status_reveal);
+        }
         break;
     }
     case UiDoc::Kind::Failed:
@@ -1678,6 +1721,14 @@ void draw_shell() {
         ImGui::SetCursorPosY(top_h);
         draw_rejected();
         break;
+    }
+
+    // 顶栏**最后**绘制（ADR-097）：自动隐藏时它是覆盖层，必须压在画布之上。ImGui 的子窗口
+    // 渲染与命中顺序都取自本帧的**创建顺序**（EndFrame 会把 g.Windows 按 ChildWindows 递归
+    // 排序），故"后画即在最上"是稳定成立的，不依赖焦点或持久 z 序。
+    if (top_h >= 1.0f) {   // 高度为 0 时不创建子窗口：BeginChild 把 0 当作"自动高度"
+        ImGui::SetCursorPos(ImVec2(0.0f, 0.0f));   // 子窗口宽 0 = 占满剩余宽度，X 必须归零
+        draw_top_bar(top_h);
     }
 
     if (g_app.show_debug) draw_debug_overlay();

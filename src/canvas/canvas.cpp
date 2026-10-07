@@ -32,11 +32,23 @@ void Canvas::set_viewport(float w, float h) {
     // UI 每帧都会调用本函数：**无变化就不要让布局缓存失效**，否则"滚动不重算布局"
     // 的 O(1) 性质会被破坏（每帧重算行前缀和 + 两次 vector 重分配）。
     if (nw == viewport_w_ && nh == viewport_h_) return;
+    // scroll_* 以屏幕像素保存，但 fit-width 的 zoom 会随视口宽度变化。
+    // 先把当前视口中心换算成文档坐标，重排后再换回新的像素尺度，保证布局
+    // 围绕用户正在看的内容变化，同时不把阅读位置映射到另一页。
+    ensure_layout();
+    const float old_zoom = eff_zoom_ > 0.0f ? eff_zoom_ : 1.0f;
+    const float anchor_x_pt = (state_.scroll_x + viewport_w_ * 0.5f) / old_zoom;
+    const float anchor_y_pt = (state_.scroll_y + viewport_h_ * 0.5f) / old_zoom;
+
     viewport_w_ = nw;
     viewport_h_ = nh;
     dirty_ = true;
-    // 视口变大后 max_scroll 变小，钳掉越界的滚动位置（否则会露出内容下方的空白）
+    ensure_layout();
+    state_.scroll_x = anchor_x_pt * eff_zoom_ - viewport_w_ * 0.5f;
+    state_.scroll_y = anchor_y_pt * eff_zoom_ - viewport_h_ * 0.5f;
+    // 视口变大后 max_scroll 变小，钳掉越界的滚动位置（否则会露出内容下方的空白）。
     clamp_scroll();
+    sync_nav_row();
 }
 
 void Canvas::set_uniform(int page_count, PageSizePt size) {
@@ -60,9 +72,18 @@ void Canvas::set_state(const CanvasState& s) {
 }
 
 void Canvas::set_margin_gap(float margin_px, float gap_ratio) {
+    ensure_layout();
+    const float old_zoom = eff_zoom_ > 0.0f ? eff_zoom_ : 1.0f;
+    const float anchor_x_pt = (state_.scroll_x + viewport_w_ * 0.5f) / old_zoom;
+    const float anchor_y_pt = (state_.scroll_y + viewport_h_ * 0.5f) / old_zoom;
     state_.margin_px = margin_px > 0.0f ? margin_px : 0.0f;
     state_.gap_ratio = gap_ratio >= 0.0f ? gap_ratio : 0.0f;
     dirty_ = true;
+    ensure_layout();
+    state_.scroll_x = anchor_x_pt * eff_zoom_ - viewport_w_ * 0.5f;
+    state_.scroll_y = anchor_y_pt * eff_zoom_ - viewport_h_ * 0.5f;
+    clamp_scroll();
+    sync_nav_row();
 }
 
 PageSizePt Canvas::size_of(int i) const {

@@ -40,6 +40,28 @@ constexpr const char* kIconGlyphs =
 
 namespace {
 
+// 全屏切换会同时改变窗口样式、非客户区和外框几何。DWM 默认可能为这组变化
+// 合成过渡帧；从最大化状态退出时，过渡帧正好暴露出 SetWindowPlacement 内部
+// 的「先恢复 rcNormalPosition、再最大化」中间态。过渡必须保持关闭到新几何的
+// 第一帧 Present 完成，否则 DWM 仍可能在 swapchain 重建前合成一次旧/空白帧。
+bool g_dwm_transitions_disabled = false;
+
+void disable_dwm_transitions(HWND hwnd) {
+    if (g_dwm_transitions_disabled) return;
+    BOOL disable = TRUE;
+    g_dwm_transitions_disabled =
+        SUCCEEDED(DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED,
+                                        &disable, sizeof disable));
+}
+
+void enable_dwm_transitions(HWND hwnd) {
+    if (!g_dwm_transitions_disabled) return;
+    BOOL disable = FALSE;
+    DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED,
+                          &disable, sizeof disable);
+    g_dwm_transitions_disabled = false;
+}
+
 // 校验 kIconGlyphs 里每个码位在本机 "Segoe MDL2 Assets" 中确有字形。
 // 用 GDI 的 GetGlyphIndicesW（GGI_MARK_NONEXISTING_GLYPHS 对缺失字形返回 0xFFFF）。
 // 只处理本项目用到的 3 字节 UTF-8 序列（PUA 码位恒为 3 字节）。
@@ -704,6 +726,7 @@ void toggle_fullscreen() {
         GetWindowPlacement(g_app.hwnd, &g_app.prev_placement);
         MONITORINFO mi{ sizeof(mi) };
         if (!GetMonitorInfoW(MonitorFromWindow(g_app.hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
+        disable_dwm_transitions(g_app.hwnd);
         SetWindowLongPtrW(g_app.hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
         SetWindowPos(g_app.hwnd, nullptr,
                      mi.rcMonitor.left, mi.rcMonitor.top,
@@ -712,19 +735,43 @@ void toggle_fullscreen() {
                      SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
         g_app.fullscreen = true;
     } else {
-        // 退出全屏：**先提交新样式（FRAMECHANGED），再落位**。
-        // 反过来（原实现：先 SetWindowPlacement 再补 FRAMECHANGED）会出问题：
-        //   SetWindowPlacement 用的是尚未生效的 WS_POPUP（无边框）度量来摆放窗口，
-        //   随后的 FRAMECHANGED 重算非客户区、把窗口再挪一次 —— 肉眼即"变了又归位"。
-        // 这里先让样式在**全屏矩形上**生效（NOMOVE|NOSIZE，几何不动、无可见中间态），
-        // 再用 SetWindowPlacement 一次落位：几何只变一次，且工作区坐标换算交给系统
-        // （rcNormalPosition 是工作区坐标，手工 SetWindowPos 在多显示器下会偏）。
+        disable_dwm_transitions(g_app.hwnd);
+        // 退出全屏时先恢复样式，再一次性提交目标几何。普通窗口仍交给
+        // SetWindowPlacement 处理 workspace 坐标；最大化窗口走显式工作区几何，
+        // 避免 SetWindowPlacement(SW_SHOWMAXIMIZED) 内部先显示 rcNormalPosition、
+        // 再最大化而触发可见的隐藏/恢复中间态。
         SetWindowLongPtrW(g_app.hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
-        SetWindowPos(g_app.hwnd, nullptr, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        SetWindowPlacement(g_app.hwnd, &g_app.prev_placement);
+        if (g_app.prev_placement.showCmd == SW_SHOWMAXIMIZED) {
+            MONITORINFO mi{ sizeof(mi) };
+            if (GetMonitorInfoW(MonitorFromWindow(g_app.hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+                SetWindowPos(g_app.hwnd, nullptr,
+                             mi.rcWork.left, mi.rcWork.top,
+                             mi.rcWork.right - mi.rcWork.left,
+                             mi.rcWork.bottom - mi.rcWork.top,
+                             SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            // 几何已经是工作区矩形，SW_MAXIMIZE 只提交窗口状态；原 placement
+            // 仍由系统保留，用于之后从最大化恢复到原来的普通窗口位置。
+            ShowWindow(g_app.hwnd, SW_MAXIMIZE);
+            // SetWindowPos 发生在恢复样式之后，Windows 可能据此更新内部的
+            // rcNormalPosition。窗口已经处于最大化态，重新提交原 placement 只
+            // 修复“取消最大化”要使用的普通窗口矩形，不再经过可见的恢复中间态。
+            WINDOWPLACEMENT placement = g_app.prev_placement;
+            placement.length = sizeof(placement);
+            placement.showCmd = SW_SHOWMAXIMIZED;
+            SetWindowPlacement(g_app.hwnd, &placement);
+        } else {
+            SetWindowPos(g_app.hwnd, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                             SWP_FRAMECHANGED);
+            SetWindowPlacement(g_app.hwnd, &g_app.prev_placement);
+        }
         g_app.fullscreen = false;
     }
+}
+
+void finish_fullscreen_transition() {
+    enable_dwm_transitions(g_app.hwnd);
 }
 
 // ---------------- 剪贴板 ----------------

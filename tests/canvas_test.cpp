@@ -407,13 +407,44 @@ void test_gap_scales_with_zoom() {
     check_near(c2.content_width_px(), kVW, "含间距后 fit-width 仍严格铺满视口宽");
 }
 
-// ---- 17. 双页对开（书籍模式，Phase 5）----
+// ---- 17. 视口变化保持阅读位置 ----
+//
+// 全屏/退出全屏会改变视口宽度。fit-width 下 zoom 随之变化，若直接沿用屏幕像素
+// scroll_y，同一数值会落到另一段文档，导致页码跳变；这里固定视口中心的内容锚点。
+void test_viewport_change_preserves_anchor() {
+    std::printf("\n[17] 视口变化保持阅读位置\n");
+
+    lr::Canvas c;
+    c.set_viewport(1000.0f, 800.0f);
+    c.set_default_size({ kPW, kPH });
+    c.set_uniform(240, { kPW, kPH });
+    lr::CanvasState st;
+    st.fit_width = true;
+    c.set_state(st);
+    c.scroll_to_page(73, 0.0f);
+
+    const float old_zoom = c.effective_zoom();
+    const float old_anchor = (c.state().scroll_y + 400.0f) / old_zoom;
+    check(c.current_page() == 73, "视口变化前游标 = 页 73");
+
+    c.set_viewport(1800.0f, 1000.0f);
+    const float wide_anchor = (c.state().scroll_y + 500.0f) / c.effective_zoom();
+    check(c.current_page() == 73, "放大视口后游标仍为页 73");
+    check_near(wide_anchor, old_anchor, "放大视口后内容中心锚点不变");
+
+    c.set_viewport(1000.0f, 800.0f);
+    const float narrow_anchor = (c.state().scroll_y + 400.0f) / c.effective_zoom();
+    check(c.current_page() == 73, "恢复视口后游标仍为页 73");
+    check_near(narrow_anchor, old_anchor, "恢复视口后内容中心锚点不变");
+}
+
+// ---- 18. 双页对开（书籍模式，Phase 5）----
 //
 // 书籍模式 = 封面（第 0 页）单独成页 + 其余两页对开：(1,2)、(3,4)…。
 // 与"columns=2 均匀网格"的唯一区别是**奇偶偏移**；布局/翻页/缩放全部复用网格逻辑。
 // 这里把映射与"封面在整行内居中"钉死，并守卫 spread=false 时映射不被污染。
 void test_spread_book_mode() {
-    std::printf("\n[17] 双页对开（书籍模式，Phase 5）\n");
+    std::printf("\n[18] 双页对开（书籍模式，Phase 5）\n");
     auto make_spread = [](int pages, bool spread) {
         lr::Canvas c;
         c.set_viewport(kVW, kVH);
@@ -521,6 +552,7 @@ int main() {
     test_row_navigation_columns();
     test_nav_row_sync();
     test_gap_scales_with_zoom();
+    test_viewport_change_preserves_anchor();
     test_spread_book_mode();
 
     std::printf("\n合计：通过 %d，失败 %d\n", g_pass, g_fail);

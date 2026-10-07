@@ -36,6 +36,7 @@
 #include <shellscalingapi.h>
 #include <commdlg.h>      // GetOpenFileNameW：菜单「打开文档…」
 #include <imm.h>          // ImmAssociateContext：让阅读窗口脱离输入法（ADR-028）
+#include <dwmapi.h>       // DwmSetWindowAttribute：切换全屏时关闭 DWM 过渡动画
 #include <d3d11.h>
 #include <dxgi.h>
 
@@ -71,6 +72,7 @@ import lilithreader.log;      // 轻量日志（自实现，不引入 spdlog，A
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "imm32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 namespace lr::app {
 
@@ -323,6 +325,8 @@ bool set_clipboard_image_rgba(int w, int h, const std::uint8_t* rgba);
 
 // ---- 全屏 ----
 void toggle_fullscreen();
+// 在切换后的首帧 Present 完成后恢复 DWM 的普通过渡行为。
+void finish_fullscreen_transition();
 
 // ============================================================================
 // 跨 TU 共享类型（会话 / 命令 / 文本交互 / 绘制）
@@ -598,6 +602,9 @@ struct AppContext {
     // 侧栏滑入/滑出（ADR-055）：当前动画宽度（px），0 = 完全收起。与顶栏同一手法（一阶滞后）。
     // 侧栏面板**按整宽排布、整体左移**，由 ##shell 的裁剪实现"滑出左侧"，内容不随动画重排。
     float  sidebar_w = 0.0f;
+    // 全屏底栏覆盖弹出/收起的进度（ADR-097）：0 = 完全收起（不绘制），1 = 静止显示。
+    // 与设置窗口同一手法（一次性开合 + 三次缓出）——弹出是"单向、有终点"的过渡。普通窗口不使用。
+    ToggleAnim status_popup_anim;
     // 设置窗口的打开/关闭进度（ADR-056/061）：value 0 = 完全关闭（不绘制），1 = 静止态。
     // 同时驱动**透明度**与**缩放**（以窗口中心为不动点，kWindowScaleFrom ↔ 1.0）；关闭时边缩边淡。
     ToggleAnim settings_anim;
@@ -882,9 +889,11 @@ void update_search();                // 每帧：输入防抖 + 取新命中 + �
 
 // 三段外壳的绘制：**高度/位置由 draw_shell 显式给出**，不依赖 ImGui 的"相邻项自动间距"
 // （那正是状态栏被挤出窗口底部的根因，见 draw_shell 注释）。
+// 顶栏在**最后**绘制：自动隐藏时它是覆盖层，必须压在画布之上（绘制顺序即 z 序）。
 void draw_shell();
 void draw_top_bar(float bar_h);
-void draw_status_bar();
+// reveal ∈ [0,1]：底栏覆盖弹出时的滑入/淡入进度（1 = 静止显示）。普通窗口恒为 1。
+void draw_status_bar(float reveal);
 void draw_canvas_area(float height);
 void draw_sidebar(float height, float width);   // width 为动画宽度（px），内容仍按整宽排布
 void draw_canvas_context_menu();

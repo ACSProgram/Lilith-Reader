@@ -323,7 +323,12 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
         ImGui::Render();
         // 帧被异常截断时不提交绘制数据：窗口保留上一帧画面，胜过闪一帧半成品。
         // （ImGui 帧已经在上面正常收口，故跳过一次 Present 不会留下不完整状态。）
-        if (frame_ok) g_app.gfx.render_frame();
+        if (frame_ok) {
+            g_app.gfx.render_frame();
+            // 保持 DWM 过渡关闭到新几何的第一帧真正提交，避免窗口已变而画面仍是
+            // 旧布局或清屏色的可见中间帧。
+            finish_fullscreen_transition();
+        }
 
         // 显示设备丢失（ADR-088）：Present / ResizeBuffers 失败置标记后不再呈现，此时 ImGui
         // **画不出来**（没有可提交的目标），只能用原生弹窗如实告知；随后更新阅读位置快照并
