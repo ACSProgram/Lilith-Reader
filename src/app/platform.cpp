@@ -732,6 +732,10 @@ void toggle_fullscreen() {
 // 为什么不用 ImGui 的 SetClipboardText：它只能放文本，且依赖后端实现；
 // 图片必须走原生 CF_DIB，两者放一处才好统一处理"剪贴板被别的进程占用"这一失败路径
 // （OpenClipboard 会失败，此时必须如实报错，而不是假装复制成功）。
+//
+// **单次尝试、不阻塞**（ADR-081 第 4 条）：OpenClipboard 失败即返回 false，**不在这里
+// Sleep 重试**（旧实现失败时 Sleep(10) 重试 5 次，会卡住 UI 线程）。重试交给调用方在
+// **下一帧**做（`request_clipboard_*` + `update_clipboard_results`，ADR-092）。
 
 bool set_clipboard_text(const std::string& utf8) {
     if (utf8.empty()) return false;
@@ -751,25 +755,19 @@ bool set_clipboard_text(const std::string& utf8) {
         return false;
     }
 
-    // 剪贴板是全局独占资源：别的进程正开着时 OpenClipboard 会失败。
-    // 重试几次再放弃 —— 实践中多数占用只有几十毫秒。
-    bool ok = false;
-    for (int attempt = 0; attempt < 5 && !ok; ++attempt) {
-        if (!OpenClipboard(g_app.hwnd)) {
-            Sleep(10);
-            continue;
-        }
-        ok = EmptyClipboard() != FALSE;
-        if (ok) {
-            // SetClipboardData 成功后所有权移交系统；失败则我们必须自己释放。
-            if (SetClipboardData(CF_UNICODETEXT, mem) != nullptr) {
-                mem = nullptr;
-            } else {
-                ok = false;
-            }
-        }
-        CloseClipboard();
+    // 剪贴板是全局独占资源：别的进程正开着时 OpenClipboard 会失败 → 如实返回 false，
+    // 由下一帧重试。
+    if (!OpenClipboard(g_app.hwnd)) {
+        GlobalFree(mem);
+        return false;
     }
+    bool ok = EmptyClipboard() != FALSE;
+    if (ok) {
+        // SetClipboardData 成功后所有权移交系统；失败则我们必须自己释放。
+        if (SetClipboardData(CF_UNICODETEXT, mem) != nullptr) mem = nullptr;
+        else ok = false;
+    }
+    CloseClipboard();
     if (mem != nullptr) GlobalFree(mem);
     return ok;
 }
@@ -817,22 +815,17 @@ bool set_clipboard_image_rgba(int w, int h, const std::uint8_t* rgba) {
         return false;
     }
 
-    bool ok = false;
-    for (int attempt = 0; attempt < 5 && !ok; ++attempt) {
-        if (!OpenClipboard(g_app.hwnd)) {
-            Sleep(10);
-            continue;
-        }
-        ok = EmptyClipboard() != FALSE;
-        if (ok) {
-            if (SetClipboardData(CF_DIB, mem) != nullptr) {
-                mem = nullptr;
-            } else {
-                ok = false;
-            }
-        }
-        CloseClipboard();
+    // 同 set_clipboard_text：单次尝试、不阻塞，失败交由下一帧重试（ADR-081/091）。
+    if (!OpenClipboard(g_app.hwnd)) {
+        GlobalFree(mem);
+        return false;
     }
+    bool ok = EmptyClipboard() != FALSE;
+    if (ok) {
+        if (SetClipboardData(CF_DIB, mem) != nullptr) mem = nullptr;
+        else ok = false;
+    }
+    CloseClipboard();
     if (mem != nullptr) GlobalFree(mem);
     return ok;
 }

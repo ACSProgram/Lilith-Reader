@@ -315,7 +315,9 @@ void update_ime_association();
 
 // ---- 剪贴板 ----
 // 文本走 CF_UNICODETEXT（内部 UTF-8 → UTF-16，避免中文变乱码）；
-// 图片走 CF_DIB（32bpp BGRA，自下而上）。返回 false = 写剪贴板失败（被别的进程占用）。
+// 图片走 CF_DIB（32bpp BGRA，自下而上）。返回 false = **本次**写入失败（被别的进程占用）。
+// **单次尝试、不阻塞**：失败不在平台层 Sleep 重试（那会卡住 UI 线程），转由 app 层下一帧重试
+// （见下方 `ClipboardRequest` / `request_clipboard_*`，ADR-081 第 4 条）。
 bool set_clipboard_text(const std::string& utf8);
 bool set_clipboard_image_rgba(int w, int h, const std::uint8_t* rgba);
 
@@ -475,6 +477,24 @@ struct SessionController {
     void enter_reading();                               // 打开成功 → 初始化画布进入阅读态
     void save();                                        // 阅读位置写入 state 并请求落盘
     void resolve_identity(std::uint64_t content_fp);    // 打开成功：分层定位阅读记录
+};
+
+// ============================================================================
+// 剪贴板写入请求（ADR-092）
+// ============================================================================
+//
+// 平台层写剪贴板是**单次尝试、失败即返回 false**（不 Sleep 重试，UI 线程零阻塞）。失败
+// 多为"别的进程短暂占用剪贴板"，故这里留存待写内容，由 `update_clipboard_results` 每帧
+// 尝试一次，直到成功或用尽重试次数。重试上限对应旧实现的 5 次尝试（旧实现每次 Sleep(10)
+// 阻塞 UI，现在每帧一次，时间窗相近而不阻塞）。后到的请求**覆盖**先到的（latest-wins）。
+inline constexpr int kClipboardRetries = 5;
+struct ClipboardRequest {
+    enum class Kind { None, Text, Image };
+    Kind          kind = Kind::None;
+    std::string   text;           // Kind::Text：UTF-8
+    lr::ImageData image;          // Kind::Image：RGBA8
+    std::string   ok_toast;       // 成功后的提示文案
+    int           retries = 0;    // 剩余尝试次数（每帧一次）
 };
 
 // ============================================================================
@@ -643,6 +663,10 @@ struct AppContext {
     std::string toast;
     double      toast_since = -1.0;
 
+    // 剪贴板写入请求（ADR-092）：平台函数单次尝试、失败不阻塞；这里留存待写内容，
+    // 由 update_clipboard_results 逐帧重试（见上方 ClipboardRequest 注释）。
+    ClipboardRequest clip;
+
     // ---- 全文搜索 ----
     char    search_buf[256] = {};
     bool    search_focus = false;              // 下一帧把键盘焦点交给输入框
@@ -681,7 +705,7 @@ struct AppContext {
     std::string   confirm_alt;        // 次按钮文案
     std::uint64_t confirm_target = 0; // ClearOne：要删的那条记录的主键
     // ---- 设置窗口的分栏索引（draw_settings_window 消费后复位为 -1）----
-    // 0 界面 / 1 阅读 / 2 性能 / 3 按键 / 4 阅读数据
+    // 0 界面（含页面间距）/ 1 性能 / 2 按键 / 3 阅读数据
     int  settings_open_tab = -1;
     // 「键盘打开画布右键菜单」（Shift+F10 / 菜单键）：由 draw_shell 置位，
     // draw_canvas_context_menu 在画布窗口作用域内消费（与右键同一 ID 空间）。
@@ -834,8 +858,12 @@ void open_link_at_context();
 [[nodiscard]] bool handle_text_interaction(const ImVec2& origin, const ImVec2& size, bool hovered);
 // 请求/接收鼠标所在页的内容快照（每帧调用）
 void update_hovered_content(const ImVec2& origin, bool hovered);
-// 取走复制结果并写入剪贴板（每帧调用）
+// 取走复制结果并写入剪贴板，并推进待写剪贴板请求的重试（每帧调用，ADR-092）
 void update_clipboard_results();
+// 请求写入剪贴板（文本 / 图片）：本帧或**下一帧**重试，成功/失败都会弹 toast。
+// 平台层不阻塞（见 set_clipboard_*），故调用方直接调用它们即可（ADR-092）。
+void request_clipboard_text(std::string text, std::string ok_toast);
+void request_clipboard_image(lr::ImageData image, std::string ok_toast);
 void show_toast(std::string text);
 [[nodiscard]] std::string toast_text();   // 有效期内返回文案，否则空串
 
@@ -868,8 +896,19 @@ void draw_debug_overlay();
 void draw_jump_popup();
 void draw_password_popup();
 void draw_confirm_popup();          // 通用确认弹窗（智能匹配询问 / 删除二次确认，ADR-062）
+// 设置窗口（settings_ui.cpp）：ui.cpp 的 draw_shell 只调这一个入口。
 void draw_settings_window();
-void draw_settings_reading_data_tab();   // 设置 ·「阅读数据」分栏（清单 + 删单条 / 清空全部）
+// ---- ui.cpp 与 settings_ui.cpp 共用的绘制辅助（定义在 ui.cpp）----
+// 设置窗口已拆到独立 TU（ADR-094），它需要这几个界面主题/色调/偏好入口；集中声明在此，
+// 两 TU 互不 include（沿用 ADR-087 的自由函数互调约定）。
+ImVec4 col_text();
+ImVec4 col_dim();
+ImVec4 col_warn();
+void set_theme_pref(int theme);     // 界面主题偏好（外观菜单与设置分栏共用）
+void apply_gap_pref();              // 下发「页面间距」偏好
+// 名称表定义在 ui.cpp；显式给出长度，便于另一 TU 用 IM_ARRAYSIZE（改动需同步此处与定义）。
+extern const char* const kThemeNames[3];       // 界面主题名称表（跟随系统 / 浅色 / 深色）
+extern const char* const kPageSchemeNames[3];  // 纸张方案名称表（原色 / 深色纸张 / 暖色）
 // 打开确认弹窗（由 session / 管理窗口在需要用户拍板时调用）。kind 决定按钮动作的归属。
 void request_confirm(ConfirmKind kind, std::string title, std::string body,
                      std::vector<std::pair<std::string, std::string>> rows,

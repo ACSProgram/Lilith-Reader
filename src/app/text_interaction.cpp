@@ -408,25 +408,60 @@ void update_hovered_content(const ImVec2& origin, bool hovered) {
     }
 }
 
+// 请求写入剪贴板（ADR-092）：只登记待写内容与成功文案，真正的写入在
+// update_clipboard_results 里**每帧一次**地做（失败留到下一帧），UI 线程零阻塞。
+void request_clipboard_text(std::string text, std::string ok_toast) {
+    g_app.clip.kind = ClipboardRequest::Kind::Text;
+    g_app.clip.text = std::move(text);
+    g_app.clip.image = lr::ImageData{};
+    g_app.clip.ok_toast = std::move(ok_toast);
+    g_app.clip.retries = kClipboardRetries;
+}
+
+void request_clipboard_image(lr::ImageData image, std::string ok_toast) {
+    g_app.clip.kind = ClipboardRequest::Kind::Image;
+    g_app.clip.text.clear();
+    g_app.clip.image = std::move(image);
+    g_app.clip.ok_toast = std::move(ok_toast);
+    g_app.clip.retries = kClipboardRetries;
+}
+
 void update_clipboard_results() {
     if (g_app.renderer == nullptr) return;
 
+    // 1) 取走渲染层备好的复制结果（若有），登记为待写请求。
     std::string text;
     if (g_app.renderer->take_copy_text(text)) {
         if (text.empty()) show_toast("没有可复制的文本");
-        else if (set_clipboard_text(text)) show_toast("已复制文本");
-        else show_toast("复制失败：剪贴板被占用");
+        else request_clipboard_text(std::move(text), "已复制文本");
     }
 
     lr::ImageData img;
     if (g_app.renderer->take_copy_image(img)) {
         if (!img.valid()) {
             show_toast("此处没有可复制的图片");
-        } else if (set_clipboard_image_rgba(img.w, img.h, img.rgba.data())) {
-            show_toast("已复制图片 " + std::to_string(img.w) + "×" + std::to_string(img.h));
         } else {
-            show_toast("复制失败：剪贴板被占用");
+            const std::string toast =
+                "已复制图片 " + std::to_string(img.w) + "×" + std::to_string(img.h);
+            request_clipboard_image(std::move(img), toast);
         }
+    }
+
+    // 2) 推进待写剪贴板请求：本帧尝试一次，失败留到下一帧（重试上限 kClipboardRetries）。
+    if (g_app.clip.kind == ClipboardRequest::Kind::None) return;
+    const bool is_text = (g_app.clip.kind == ClipboardRequest::Kind::Text);
+    const bool ok = is_text
+        ? set_clipboard_text(g_app.clip.text)
+        : set_clipboard_image_rgba(g_app.clip.image.w, g_app.clip.image.h,
+                                   g_app.clip.image.rgba.data());
+    if (ok) {
+        show_toast(g_app.clip.ok_toast);
+        g_app.clip = ClipboardRequest{};
+        return;
+    }
+    if (--g_app.clip.retries <= 0) {
+        show_toast("复制失败：剪贴板被占用");
+        g_app.clip = ClipboardRequest{};
     }
 }
 

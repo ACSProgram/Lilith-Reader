@@ -141,6 +141,7 @@ Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\log.ifc",
 Invoke-Cl ($defs + $incs + @("/c", "/ifcOutput$out\document.ifc", "/Fo$out\document.ixx.obj",
     (Join-Path $src "document\document.ixx"))) "编译 document.ixx"
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\document.ifc",
+    "/reference", "$out\utils.ifc",
     "/Fo$out\document.obj", (Join-Path $src "document\document.cpp"))) "编译 document.cpp"
 Invoke-Cl ($defs + $incs + @("/c", "/reference", "$out\utils.ifc",
     "/reference", "$out\document.ifc", "/Fo$out\doc_test.obj",
@@ -524,6 +525,17 @@ try {
 $themePrecedenceExit = $LASTEXITCODE
 Write-Host "  check_theme_precedence.py 退出码 = $themePrecedenceExit"
 
+# document 层 fz_* 边界纪律（ADR-083）：边界函数存在且被使用、PageBitmap 属性访问器为纯访问器。
+Step "document fz_* 边界纪律断言"
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & $Python (Join-Path $repo "tests\check_fz_boundary.py")
+} finally {
+    [Console]::OutputEncoding = $prevCp
+}
+$fzExit = $LASTEXITCODE
+Write-Host "  check_fz_boundary.py 退出码 = $fzExit"
+
 Step "结束"
 if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $pageStateExit -eq 0 -and
     $stateExit -eq 0 -and
@@ -532,7 +544,7 @@ if ($testExit -eq 0 -and $canvasExit -eq 0 -and $cacheExit -eq 0 -and $pageState
     $renderFaultExit -eq 0 -and $raiiExit -eq 0 -and
     $textHitExit -eq 0 -and
     $fontExit -eq 0 -and $iconExit -eq 0 -and
-    $menuExit -eq 0 -and $themeExit -eq 0 -and $themePrecedenceExit -eq 0) {
+    $menuExit -eq 0 -and $themeExit -eq 0 -and $themePrecedenceExit -eq 0 -and $fzExit -eq 0) {
     Write-Host "全部通过。" -ForegroundColor Green
 } else {
     Write-Host "存在失败用例。" -ForegroundColor Red
@@ -553,4 +565,5 @@ if ($fontExit -ne 0) { exit $fontExit }
 if ($iconExit -ne 0) { exit $iconExit }
 if ($menuExit -ne 0) { exit $menuExit }
 if ($themeExit -ne 0) { exit $themeExit }
-exit $themePrecedenceExit
+if ($themePrecedenceExit -ne 0) { exit $themePrecedenceExit }
+exit $fzExit

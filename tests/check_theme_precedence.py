@@ -13,6 +13,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 PLATFORM = REPO / "src" / "app" / "platform.cpp"
 UI = REPO / "src" / "app" / "ui.cpp"
+SETTINGS = REPO / "src" / "app" / "settings_ui.cpp"
 
 
 def main() -> int:
@@ -59,9 +60,11 @@ def main() -> int:
     try:
         appearance = ui.split("void draw_appearance_menu_contents(bool reading)", 1)[1].split(
             "void draw_view_menu_contents()", 1)[0]
-        settings = ui.split("void draw_settings_interface_tab()", 1)[1].split(
+        # 设置窗口已拆到 settings_ui.cpp（ADR-094）：界面分栏的断言改读该文件。
+        settings_src = SETTINGS.read_text(encoding="utf-8")
+        settings = settings_src.split("void draw_settings_interface_tab()", 1)[1].split(
             "void draw_settings_performance_tab()", 1)[0]
-    except IndexError:
+    except (IndexError, OSError):
         print("  [FAIL] 找不到外观菜单或界面设置实现", file=sys.stderr)
         failed = True
     else:

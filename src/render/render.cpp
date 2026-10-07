@@ -462,6 +462,10 @@ struct SearchJob {
 // 辅助请求走**独立队列**，刻意不共用 open/close/auth 的那个命令槽：文本请求由鼠标悬停
 // 触发、频率高得多，若共用槽位，一次悬停就能把"待打开的文档"覆盖掉。辅助请求与渲染请求
 // 同优先级、互不覆盖。
+// 辅助队列的硬上限（ADR-092）：页内容请求按页去重后本应很少，但工作线程被渲染长任务
+// 占用时，悬停/复制可能持续投递；超出即丢最旧的（可自愈：页内容有 0.6s 超时重发）。
+inline constexpr std::size_t kMaxAuxQueue = 64;
+
 struct ContentService {
     Sync*     sync = nullptr;
     Document* engine = nullptr;
@@ -475,6 +479,23 @@ struct ContentService {
     };
     std::deque<AuxReq> aux;
     bool               aux_dirty = false;
+
+    // 入队（调用方须已持有 sync->mtx）。
+    // · **latest-wins**：复制文本 / 复制图片只保留最近一次 —— 用户连点几下"复制"时旧请求
+    //   毫无价值，还会在工作线程里排队做多余的重活（ADR-092）。
+    // · **有界**：超过 kMaxAuxQueue 即丢最旧的。
+    void enqueue_locked(AuxReq r) {
+        if (r.kind == AuxReq::Kind::CopyText || r.kind == AuxReq::Kind::CopyImage) {
+            for (auto it = aux.begin(); it != aux.end();) {
+                if (it->kind == r.kind) it = aux.erase(it);
+                else ++it;
+            }
+        }
+        aux.push_back(std::move(r));
+        while (aux.size() > kMaxAuxQueue) aux.pop_front();
+        aux_dirty = true;
+        sync->cv.notify_all();
+    }
 
     // 已发布的页内容快照（只保留一页 + "未被取走"标记，理由同 document 的 stext 缓存）。
     PageContent content_pub;
@@ -959,9 +980,7 @@ void ContentService::request_page_content(int page) {
     AuxReq r;
     r.kind = AuxReq::Kind::PageContent;
     r.page = page;
-    aux.push_back(r);
-    aux_dirty = true;
-    sync->cv.notify_all();
+    enqueue_locked(std::move(r));
 }
 
 bool ContentService::take_page_content(int page, PageContent& out) {
@@ -981,9 +1000,7 @@ void ContentService::request_copy_text(int page, float ax, float ay, float bx, f
     r.page = page;
     r.ax = ax; r.ay = ay;
     r.bx = bx; r.by = by;
-    aux.push_back(r);
-    aux_dirty = true;
-    sync->cv.notify_all();
+    enqueue_locked(std::move(r));
 }
 
 bool ContentService::take_copy_text(std::string& out) {
@@ -1001,9 +1018,7 @@ void ContentService::request_copy_image(int page, float x, float y) {
     r.kind = AuxReq::Kind::CopyImage;
     r.page = page;
     r.px = x; r.py = y;
-    aux.push_back(r);
-    aux_dirty = true;
-    sync->cv.notify_all();
+    enqueue_locked(std::move(r));
 }
 
 bool ContentService::take_copy_image(ImageData& out) {

@@ -34,6 +34,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # �
 | `text_hit_test.cpp` | 14 例断言（ADR-091，含 `src/app/text_hit.h`）：文本命中测试的**选行**判据。核心是**多列版面**——左右两列的正文行 y 带完全重叠、左列在 stext 顺序里靠前，旧实现"取第一个 y 命中就收"会把右列的点判给左列（实测两列论文右列几乎选不中）。断言覆盖：单列（每 y 至多一行，回归守卫）、多列（按 x 破平取到正确列）、带外（`in_band=0`）、拖拽（横向远离仍返回该行）、竖排行高取宽度。零依赖 |
 | `check_theme_reset.py` | 主题重置断言（ADR-068）：`apply_theme_colors` 的两个分支必须先 `StyleColorsLight` / `StyleColorsDark` **整套重置**再逐项覆盖 —— 否则未覆盖的颜色项会带着上一个主题的值活过来（深色勾选框曾因此变成亮奶油色）。跨状态残留这类 bug 在代码里毫无痕迹，只能靠结构性约束挡住 |
 | `check_theme_precedence.py` | 外观契约断言：深色纸张只在“跟随系统”时额外令界面变暗，显式浅色/深色不被文档状态覆盖；同时检查菜单分组、统一标签表与设置项顺序 |
+| `check_fz_boundary.py` | document 层 fz_* 边界纪律（ADR-083）：断言四个边界函数（`pixmap_attrs` / `drop_pixmap_safe` / `drop_stext_safe` / `drop_document_safe`）存在且包了 `fz_try`、`PageBitmap::reset` 销毁走 `drop_pixmap_safe`、stext/document 拆解经安全包装、`PageBitmap` 的 `width/height/stride/samples` 为零 `fz_*` 的纯访问器。**范围刻意收窄**：整篇 `document.cpp` 并不满足"所有 fz_* 都在 fz_try 内"（设备回调转发、pixmap 读取、fz_caught_message 包装都在其外），故只断言 ADR-083 真正建立的那几条结构事实 |
 | `check_menu_width.py` | 菜单文案宽度断言（ADR-067）：扫描 `src/app/ui.cpp` 的菜单字面量，显示宽度（CJK=2 列）不得超过 12 列 —— 弹出菜单的宽度由最长项决定，一条超长文案会把整张菜单撑宽。补充说明应改用悬停提示 |
 | `check_installer_size.py` | 安装包体积门禁（ADR-084）：断言 `installer/dist/` 的安装包 ≤ 35 MiB（依据 docs/05 §5）。CI 的 installer job 与本地均可跑：`python tests/check_installer_size.py installer\dist` |
 | `../assets/check_icons.py` | 图标资源断言（Phase 7，ADR-051）：每个 `.ico` 的帧集必须完整（17 帧），且每帧位图的**真实解码尺寸**必须等于目录项声明的尺寸 —— 防"小图塞进大槽位 / 只剩一帧"这类只在特定 DPI 下暴露的错 |
@@ -42,7 +43,9 @@ powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -NoRegenerate  # �
 ## 注意
 
 - 脚本/测试均按 UTF-8 输出；控制台若乱码，先 `chcp 65001`。
-- 扩展名白名单（`utils.ixx`）与 `doc_test.cpp` 的闸门断言需保持同步。
+- 扩展名闸门与"扩展名 → 格式族"判断的**唯一出处**是 `utils.ixx` 的 `kExtTable`（ADR-093）；
+  `doc_test.cpp` 的闸门 / 归档冒充断言需与它保持一致。`document.cpp` 现在 `import lilithreader.utils;`，
+  故编译 `document.cpp` 时要 `/reference utils.ifc`（编译顺序：`utils.ixx` → `document.cpp`）。
 - 链接 `canvas_test.exe` 时**必须一并链接 `canvas.ixx.obj`**：画布接口单元里的内联
   成员（如 `Canvas::state`）由它发射，只链 `canvas.obj` 会报 LNK2019。
 - 同理 `page_cache_test.exe` 必须链 `page_cache.ixx.obj`：`select_evictions` 定义在接口单元里。

@@ -130,6 +130,8 @@
     <ClCompile Include="app\text_interaction.cpp" />
     <ClCompile Include="app\search.cpp" />
     <ClCompile Include="app\ui.cpp" />
+    <!-- 设置窗口（架构加固第五批，ADR-094）：从 ui.cpp 拆出的独立 TU -->
+    <ClCompile Include="app\settings_ui.cpp" />
     <!-- 进程级崩溃防线（set_terminate / SEH / MiniDump） -->
     <ClCompile Include="app\crash.cpp" />
     <ClCompile Include="utils\utils.ixx" />

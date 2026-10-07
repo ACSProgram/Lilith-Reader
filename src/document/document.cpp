@@ -40,6 +40,9 @@ module;
 
 module lilithreader.document;
 
+// 扩展名 → 格式族的表在 utils（ADR-093）：document 与闸门白名单共用同一出处。
+import lilithreader.utils;
+
 namespace lr {
 namespace {
 
@@ -639,41 +642,25 @@ constexpr int kMaxSizeProbePages = 10000;
 //   PDF → "PDF 1.4"   EPUB → "EPUB"   FB2 → "FictionBook2"
 //   XPS → "XPS"       CBZ  → 归档格式 "zip"/"tar"   单页图片 → "Image"
 // 处理器没实现该元数据时返回 -1，此时不做任何判定（宁可不拦，也不误伤）。
-enum class FormatFamily : int { Unknown, Pdf, Epub, Fb2, Xps, Archive, Image };
+// 格式族枚举与"扩展名 → 族"的表**唯一出处是 utils.ixx**（ADR-093）；此处只做
+// "MuPDF 上报串 → 族"的归类。
 
-FormatFamily classify_format(const char* fmt) noexcept {
-    if (fmt == nullptr || fmt[0] == '\0') return FormatFamily::Unknown;
-    if (std::strncmp(fmt, "PDF", 3) == 0) return FormatFamily::Pdf;
-    if (std::strcmp(fmt, "EPUB") == 0) return FormatFamily::Epub;
-    if (std::strncmp(fmt, "FictionBook", 11) == 0) return FormatFamily::Fb2;
-    if (std::strcmp(fmt, "XPS") == 0) return FormatFamily::Xps;
+lr::FormatFamily classify_format(const char* fmt) noexcept {
+    if (fmt == nullptr || fmt[0] == '\0') return lr::FormatFamily::Unknown;
+    if (std::strncmp(fmt, "PDF", 3) == 0) return lr::FormatFamily::Pdf;
+    if (std::strcmp(fmt, "EPUB") == 0) return lr::FormatFamily::Epub;
+    if (std::strncmp(fmt, "FictionBook", 11) == 0) return lr::FormatFamily::Fb2;
+    if (std::strcmp(fmt, "XPS") == 0) return lr::FormatFamily::Xps;
     if (std::strcmp(fmt, "zip") == 0 || std::strcmp(fmt, "tar") == 0)
-        return FormatFamily::Archive;  // CBZ 上报的是归档格式名
-    if (std::strcmp(fmt, "Image") == 0) return FormatFamily::Image;
-    return FormatFamily::Unknown;  // 不认识的上报值 ⇒ 不判定
+        return lr::FormatFamily::Archive;  // CBZ 上报的是归档格式名
+    if (std::strcmp(fmt, "Image") == 0) return lr::FormatFamily::Image;
+    return lr::FormatFamily::Unknown;  // 不认识的上报值 ⇒ 不判定
 }
 
-// 扩展名所暗示的格式族（ext 为小写含点，取自 extension_magic）。
-// 用途：① 判断"归档冒充单文档"；② UI 提示"扩展名与实际格式是否相符"。
-// 白名单本体在 utils.ixx（含单页图片，ADR-017），两处需保持同步。
-FormatFamily extension_family(const char* ext) noexcept {
-    if (ext == nullptr || ext[0] == '\0') return FormatFamily::Unknown;
-    if (std::strcmp(ext, ".pdf") == 0) return FormatFamily::Pdf;
-    if (std::strcmp(ext, ".epub") == 0) return FormatFamily::Epub;
-    if (std::strcmp(ext, ".fb2") == 0) return FormatFamily::Fb2;
-    if (std::strcmp(ext, ".xps") == 0) return FormatFamily::Xps;
-    if (std::strcmp(ext, ".cbz") == 0) return FormatFamily::Archive;
-    if (std::strcmp(ext, ".png") == 0 || std::strcmp(ext, ".jpg") == 0 ||
-        std::strcmp(ext, ".jpeg") == 0 || std::strcmp(ext, ".gif") == 0 ||
-        std::strcmp(ext, ".bmp") == 0 || std::strcmp(ext, ".tif") == 0 ||
-        std::strcmp(ext, ".tiff") == 0)
-        return FormatFamily::Image;
-    // .mobi 等未实测的格式串：返回 Unknown ⇒ 既不拦，UI 也不报"不符"（见 ADR-016 已知缺口）
-    return FormatFamily::Unknown;
-}
-
+// 扩展名所暗示的格式族（ext 为小写含点，取自 extension_magic）。表在 utils.ixx，
+// 与闸门白名单**同一出处**（ADR-093），不再各自维护两份。
 bool accepts_archive(const char* ext) noexcept {
-    return extension_family(ext) == FormatFamily::Archive;
+    return ext != nullptr && lr::ext_family_of(ext) == lr::FormatFamily::Archive;
 }
 
 // 把 string_view 拷进固定缓冲（截断 + NUL 结尾），避免在 noexcept 接口里分配内存
@@ -794,9 +781,9 @@ bool format_matches_extension(std::string_view format_utf8, std::string_view ext
     for (char* p = ext; *p != '\0'; ++p)
         if (*p >= 'A' && *p <= 'Z') *p = static_cast<char>(*p - 'A' + 'a');
 
-    const FormatFamily actual = classify_format(fmt);
-    const FormatFamily declared = extension_family(ext);
-    if (actual == FormatFamily::Unknown || declared == FormatFamily::Unknown) return true;
+    const lr::FormatFamily actual = classify_format(fmt);
+    const lr::FormatFamily declared = lr::ext_family_of(ext);
+    if (actual == lr::FormatFamily::Unknown || declared == lr::FormatFamily::Unknown) return true;
     return actual == declared;
 }
 
@@ -1144,7 +1131,7 @@ DocError Document::open(const std::wstring& path) noexcept {
 
     // 归档冒充单文档：zip 图集改名 .pdf/.epub 会被 CBZ 处理器接手，页数=图片条目数，
     // 内容类别与用户预期完全错位 —— 这是唯一必须拦的"有影响的"错配（ADR-016）。
-    if (!accepts_archive(magic) && classify_format(fmt) == FormatFamily::Archive) {
+    if (!accepts_archive(magic) && classify_format(fmt) == lr::FormatFamily::Archive) {
         // 错误信息在 fz_try 之外组装，可以放心用 std::string
         std::string detail = "archive file (";
         detail += fmt;
@@ -1196,7 +1183,7 @@ DocError Document::open(const std::wstring& path) noexcept {
         s.destroy();
         // .cbz 这类归档本来就该按"图片条目=页"来读；若一个图片页都没有，
         // 说明这个压缩包不是漫画。给 Mismatched 而不是"损坏"，UI 才说得清原因。
-        if (accepts_archive(magic) && classify_format(fmt) == FormatFamily::Archive) {
+        if (accepts_archive(magic) && classify_format(fmt) == lr::FormatFamily::Archive) {
             set_error(s.last_error,
                       "archive contains no displayable image pages (comic archive expected)");
             return DocError::Mismatched;

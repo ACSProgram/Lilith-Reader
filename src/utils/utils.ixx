@@ -16,15 +16,34 @@ export module lilithreader.utils;
 
 export namespace lr {
 
-// ---- 受支持的文档格式（经 MuPDF 接入） ----
+// ---- 受支持的文档格式 + 扩展名 → 格式族（单一出处，ADR-093） ----
 //
-// 这是一道**策略闸门**（ADR-013）：只有清单内的扩展名才会进入后台线程，
-// 内容终究交给 MuPDF 按内容识别（识别结果与扩展名不符时如何处置见 ADR-016）。
-// 单页图片（png/jpg/gif/bmp/tif）在 MuPDF 里本就是"1 页文档"，故正式纳入清单。
-inline constexpr std::wstring_view kSupportedExtensions[] = {
-    L".pdf", L".epub", L".mobi", L".fb2", L".cbz", L".xps",
-    // 单页图片（ADR-017）
-    L".png", L".jpg", L".jpeg", L".gif", L".bmp", L".tif", L".tiff",
+// 一张表同时承担两件事：**策略闸门**（只有清单内的扩展名才进入后台线程，ADR-013）与
+// **扩展名 → 格式族**的映射（用于拦"归档冒充单文档"与"扩展名与实际不符"提示，ADR-016）。
+// 过去白名单在本头、族判断在 `document.cpp`（注释还写着"两处需保持同步"）—— 两处各写一份
+// 迟早漂移；现在合并为这一张表：`is_supported` 与 `document` 的 `format_matches_extension`
+// 都从它取数。族为 `Unknown` 的扩展名（如 `.mobi`）**仍受支持**，只是"无法由扩展名断言族别"。
+enum class FormatFamily : int { Unknown, Pdf, Epub, Fb2, Xps, Archive, Image };
+
+struct ExtEntry {
+    std::string_view ext;   // 小写含点；扩展名一律 ASCII
+    FormatFamily     family;
+};
+inline constexpr ExtEntry kExtTable[] = {
+    { ".pdf",  FormatFamily::Pdf },
+    { ".epub", FormatFamily::Epub },
+    { ".mobi", FormatFamily::Unknown },   // MuPDF 按内容识别；扩展名不能断言族别（ADR-090）
+    { ".fb2",  FormatFamily::Fb2 },
+    { ".cbz",  FormatFamily::Archive },   // 暗指压缩包：用于拦"归档冒充单文档"
+    { ".xps",  FormatFamily::Xps },
+    // 单页图片（ADR-017）：在 MuPDF 里本就是"1 页文档"
+    { ".png",  FormatFamily::Image },
+    { ".jpg",  FormatFamily::Image },
+    { ".jpeg", FormatFamily::Image },
+    { ".gif",  FormatFamily::Image },
+    { ".bmp",  FormatFamily::Image },
+    { ".tif",  FormatFamily::Image },
+    { ".tiff", FormatFamily::Image },
 };
 
 inline std::wstring to_lower(std::wstring s) {
@@ -51,10 +70,23 @@ inline bool file_exists(const std::wstring& path) {
     return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+// 扩展名（小写含点）→ 格式族；不在表内返回 Unknown。
+inline FormatFamily ext_family_of(std::string_view ext) {
+    for (const ExtEntry& e : kExtTable)
+        if (ext == e.ext) return e.family;
+    return FormatFamily::Unknown;
+}
+
 inline bool is_supported(const std::wstring& path) {
     const std::wstring ext = extension_of(path);
-    for (const std::wstring_view e : kSupportedExtensions)
-        if (ext == e) return true;
+    // 扩展名一律 ASCII：逐字符与表比较即可（wchar_t 直接等于对应 char），无需分配。
+    for (const ExtEntry& e : kExtTable) {
+        if (e.ext.size() != ext.size()) continue;
+        bool eq = true;
+        for (std::size_t i = 0; i < e.ext.size(); ++i)
+            if (ext[i] != static_cast<wchar_t>(e.ext[i])) { eq = false; break; }
+        if (eq) return true;
+    }
     return false;
 }
 
