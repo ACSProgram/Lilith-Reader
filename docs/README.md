@@ -22,7 +22,6 @@
 | [`03-决策记录.md`](03-决策记录.md) | ADR 台账：选型的决定/理由/后果 | **只追加**，末尾续写；勘误以「勘误」注记 |
 | [`04-人工验证.md`](04-人工验证.md) | **待执行**的人工验证清单 | 项通过后整节移入归档 |
 | [`05-体积预算.md`](05-体积预算.md) | 体积构成与裁剪手段（**体积数据的唯一出处**） | 实测数据变化时更新 |
-| [`06-架构加固路线图.md`](06-架构加固路线图.md) | 外部复查报告 §五 剩余步骤的**临时**分批路线图（问题清单 + 批次边界 + 验收） | **全部批次完成后整份归档** |
 | [`archive/YYYY-MM/`](archive/README.md) | 已完成批次的过程记录、事故、已通过验证清单 | 只增不改，新文件必须在[索引](archive/README.md)登记 |
 
 各模块契约写在模块接口文件头注释（`src/*/*.ixx`）里，与 `02-架构设计.md` 互为摘要。
@@ -31,7 +30,7 @@
 
 | 任务 | 必读 | 代码起点 |
 | --- | --- | --- |
-| 下一步做什么、某个需求排在哪 | [计划](01-计划.md)、[架构加固路线图](06-架构加固路线图.md) | 该批次列出的文件 |
+| 下一步做什么、某个需求排在哪 | [计划](01-计划.md) | 该批次列出的文件 |
 | 总体架构、模块边界、线程模型 | [架构设计 §1/§3](02-架构设计.md) | `src/app/app_internal.h`（应用层 TU 分区）、各 `src/*/*.ixx` |
 | 画布布局（缩放/滚动/网格/阅读游标） | [架构设计 §2](02-架构设计.md) | `src/canvas/canvas.ixx`、`tests/canvas_test.cpp` |
 | 渲染调度、纹理生命周期、页状态机 | [架构设计 §3](02-架构设计.md) | `src/render/render.ixx`、`render.cpp` |
@@ -40,7 +39,7 @@
 | 阅读功能（阅读位置/目录/书签/缩略图/旋转/对开/配色/密码） | [架构设计 §6](02-架构设计.md)、[决策记录 ADR-034~044](03-决策记录.md) | `src/app/session.cpp`、`src/app/ui.cpp`、`src/state/reader_state.ixx` |
 | 文本交互与检索（选择/复制 · 图片复制 · 超链接 · 全文搜索） | [架构设计 §10](02-架构设计.md)、[决策记录 ADR-069~071](03-决策记录.md) | `src/document/document.ixx`、`src/render/render.ixx`、`src/app/text_interaction.cpp`、`src/app/search.cpp`、`src/app/page_map.h` |
 | 屏幕↔页面坐标折算（含旋转） | [架构设计 §10.1](02-架构设计.md) | `src/app/page_map.h`、`tests/page_map_test.cpp` |
-| 界面外壳（顶栏/主菜单/右键菜单/设置/按键/主题/图标/动效） | [架构设计 §7](02-架构设计.md)、[决策记录 ADR-045/054~056/059/061/066](03-决策记录.md) | `src/app/ui.cpp`、`src/app/platform.cpp`、`src/app/app.rc` |
+| 界面外壳（顶栏/主菜单/右键菜单/设置/按键/主题/图标/动效） | [架构设计 §7](02-架构设计.md)、[决策记录 ADR-045/054~056/059/061/066](03-决策记录.md) | `src/app/ui.cpp`、`src/app/settings_ui.cpp`、`src/app/platform.cpp`、`src/app/app.rc` |
 | 窗口尺寸/全屏/最小化（swapchain 重建、闪烁） | [架构设计 §7.1](02-架构设计.md)、[决策记录 ADR-057/058/060/061](03-决策记录.md) | `src/app/main.cpp`、`src/app/platform.cpp` |
 | 构建、依赖、打包、CI 的完整细节 | [架构设计 §8](02-架构设计.md)、[决策记录 ADR-076](03-决策记录.md) | `build.bat`、`vcpkg.json`、`installer/LilithReader.iss`、`.github/workflows/pr.yml` |
 | 体积构成、裁剪手段 | [体积预算](05-体积预算.md) | — |
