@@ -1,4 +1,4 @@
-// log.cpp — lilithreader.log 的实现单元（Phase 7 稳定性加固）
+// log.cpp — lilithreader.log 的实现单元
 //
 // 结构：写入侧只做「拼行 + 入队 + 通知」，落盘侧是唯一的后台线程（轮转也在这里做）。
 // 因此调用线程永远不碰磁盘，满足 UI 线程零阻塞。

@@ -1,4 +1,4 @@
-// render.cpp — lilithreader.render 的实现单元（Phase 3 建立，Phase 4/5/7/8 完善）
+// render.cpp — lilithreader.render 的实现单元
 //
 // 线程模型（架构文档 §3.1）：
 //   · UI 线程：只投递命令/渲染请求、读取快照；零 fz_*、零阻塞。
@@ -30,7 +30,7 @@
 // 本文件不含任何 fz_* 调用（只经 Document/PageBitmap 的公开接口），
 // 故不受 ADR-009 的 setjmp 纪律约束。
 //
-// ---- 稳定性纪律（Phase 7，ADR-078/079）----
+// ---- 稳定性纪律（ADR-078/079）----
 //   1. **工作线程入口绝不放异常逃逸**：std::jthread 的入口函数抛出 = std::terminate = 进程死亡。
 //      run() 外层包了 try/catch，且各子任务（单页渲染 / 辅助请求 / 检索）**各自**再包一层 ——
 //      粒度越细，"一次失败波及的范围"越小。
@@ -71,7 +71,7 @@ import lilithreader.document;
 import lilithreader.page_cache;
 import lilithreader.page_state;
 import lilithreader.utils;   // file_fingerprint（ADR-062）
-import lilithreader.log;     // Phase 7：工作线程异常留痕（ADR-077）
+import lilithreader.log;     // 工作线程异常留痕（ADR-077）
 
 namespace lr {
 
@@ -89,7 +89,7 @@ ResourceProfile resource_profile(ResourceTier tier) noexcept {
 
 namespace {
 
-// ---- 尺寸/数量上限（Phase 7）----
+// ---- 尺寸/数量上限 ----
 //
 // 为什么要有这些常量：这些上限原先"隐含"在 D3D 的返回值与分配失败里 ——
 // 于是超限的表现是"渲染失败"甚至 bad_alloc，而不是一句明确的 TooLarge。
@@ -108,7 +108,7 @@ constexpr int kMaxSearchHits = 5000;
 // 太大 → 单轮占用工作线程过久，期间渲染请求要排队（滚动会顿）。
 constexpr int kSearchBatchPages = 24;
 
-// ---- D3D 句柄的所有权包装（Phase 7）----
+// ---- D3D 句柄的所有权包装 ----
 //
 // PageSlot::texture 是**不拥有**的只读视图（UI 只读、绝不释放），于是"谁在什么时刻真正拥有
 // 这个 SRV"全靠人工记忆。SrvHandle 把所有权变成类型属性：只要没显式 release_raw() 交出去，
@@ -1662,7 +1662,7 @@ void Renderer::retry_page(int page) {
     impl_->sched.retry_page(page);
 }
 
-// ---- 文本 / 图片 / 链接（Phase 8）----
+// ---- 文本 / 图片 / 链接 ----
 
 void Renderer::request_page_content(int page) {
     if (!impl_) return;
@@ -1694,7 +1694,7 @@ bool Renderer::take_copy_image(ImageData& out) {
     return impl_->content.take_copy_image(out);
 }
 
-// ---- 全文搜索（Phase 8）----
+// ---- 全文搜索 ----
 
 void Renderer::start_search(std::string utf8_needle) {
     if (!impl_) return;
@@ -1716,7 +1716,7 @@ void Renderer::take_search_hits(std::vector<SearchHit>& out) {
     impl_->search.take(out);
 }
 
-// ---- 视图变换（Phase 5）----
+// ---- 视图变换 ----
 
 void Renderer::set_view_transform(int rotation_deg, PageScheme scheme) {
     if (!impl_) return;
@@ -1756,7 +1756,7 @@ void Renderer::set_view_transform(int rotation_deg, PageScheme scheme) {
     impl_->sync.cv.notify_all();
 }
 
-// ---- 缩略图通道（Phase 5）----
+// ---- 缩略图通道 ----
 
 void Renderer::set_thumbs_wanted(std::vector<int> pages, int target_px) {
     if (!impl_) return;

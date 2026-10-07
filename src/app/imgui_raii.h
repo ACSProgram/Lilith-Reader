@@ -1,4 +1,4 @@
-// imgui_raii.h — ImGui 栈操作的 RAII 包装（Phase 7 稳定性加固）
+// imgui_raii.h — ImGui 栈操作的 RAII 包装
 //
 // 为什么要这一层：
 //   ImGui 的 Push/Pop 与 Begin/End 是**手工配对**的栈操作。绘制中途一旦抛出 C++ 异常

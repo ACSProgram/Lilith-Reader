@@ -85,6 +85,14 @@ void request_state_save() {
     if (g_app.session.persist) g_app.session.persist->request_save(g_app.session.state);
 }
 
+// 帧首采样"阅读数据落盘是否失败"（ADR-089）：失败首次出现时弹一次 toast 提醒（常驻告警在状态栏，
+// 由 draw_status_bar 读 g_app.persist_failed 呈现）。服务本身已在失败时写日志，这里只负责让用户看得见。
+void update_save_failure_notice() {
+    const bool failed = g_app.session.persist && g_app.session.persist->last_save_failed();
+    if (failed && !g_app.persist_failed) show_toast("阅读数据保存失败，详见 logs 日志");
+    g_app.persist_failed = failed;
+}
+
 void SessionController::save() {
     if (g_app.session.doc_key == 0 || g_app.session.doc.kind != UiDoc::Kind::Reading) return;
     lr::DocRecord& r = g_app.session.state.upsert(g_app.session.doc_key);
@@ -292,7 +300,7 @@ void SessionController::reset() {
     g_app.session.rotation = 0;
     g_app.session.scheme = 0;
     g_app.show_sidebar = false;
-    // Phase 8：文本交互与检索状态必须随文档一起清掉 —— 否则换文档后
+    // 文本交互与检索状态必须随文档一起清掉 —— 否则换文档后
     // 选区/命中仍指向旧文档的页与字符下标（会复制出错内容、或高亮到无关位置）。
     g_app.sel = Selection{};
     g_app.select_all_pending = false;
@@ -534,7 +542,7 @@ void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered)
         }
     }
 
-    // 文本交互（Phase 8）：**先于平移**处理，因为它要决定"这一串左键归谁"。
+    // 文本交互：**先于平移**处理，因为它要决定"这一串左键归谁"。
     // 规则（人工确认的交互设计）：指针悬停在可选文本上时光标变成 I 型，
     // **此时拖拽 = 选择文本**；悬停不到文本时拖拽仍是平移（1:1 跟手，手感不变）。
     const bool text_took_drag = handle_text_interaction(origin, size, hovered);
@@ -549,7 +557,7 @@ void handle_canvas_input(const ImVec2& origin, const ImVec2& size, bool hovered)
         g_app.canvas.scroll_by(-io.MouseDelta.x, -io.MouseDelta.y);
     }
 
-    // 中键拖拽平移：**任何位置都可用**（Phase 8）。
+    // 中键拖拽平移：**任何位置都可用**。
     // 为什么必须有：左键在文字上已被"选择文本"接管，而放大到文字铺满视口时，
     // 左键处处都是选择 —— 没有这个兜底就无法平移。桌面阅读器的通行做法。
     if (hovered && !g_app.scroll_drag && ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f)) {
@@ -594,7 +602,7 @@ void handle_reading_commands(const ImVec2& size) {
     if (cmd_pressed(Cmd::ToggleSidebar))  set_sidebar(!g_app.show_sidebar, 0);
     if (cmd_pressed(Cmd::ToggleBookmark)) toggle_bookmark_current();
 
-    // 文本（Phase 8）。注意本函数只在"无文本输入"时被调用（见 handle_canvas_input 的门），
+    // 文本。注意本函数只在"无文本输入"时被调用（见 handle_canvas_input 的门），
     // 因此搜索框/密码框有焦点时 Ctrl+C / Ctrl+A 不会被这里抢走。
     if (cmd_pressed(Cmd::Copy))      selection_copy();
     if (cmd_pressed(Cmd::SelectAll)) selection_select_all();

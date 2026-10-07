@@ -13,8 +13,8 @@
 //                       视图变换/逐页尺寸、画布输入、缩放防抖与渲染请求
 //   input_bindings.cpp  命令表与按键绑定：kCmds、cmd_pressed、改键捕获（ADR-054）
 //   view_motion.cpp     视图动效：滚动/缩放/跳页的插值入口（ADR-047）
-//   text_interaction.cpp 文本交互与剪贴板：命中测试、选区、链接、复制（Phase 8）
-//   search.cpp          全文搜索：输入防抖、增量命中、跳转（Phase 8）
+//   text_interaction.cpp 文本交互与剪贴板：命中测试、选区、链接、复制
+//   search.cpp          全文搜索：输入防抖、增量命中、跳转
 //   ui.cpp              全部绘制：外壳/顶栏/状态栏/画布/侧栏/菜单/弹窗/设置/帮助/调试浮层
 //
 // 状态归属（ADR-086）：跨 TU 可变的全局集中在一个容器 `AppContext`（单例 `g_app`）里，
@@ -256,10 +256,13 @@ struct Graphics {
     ID3D11RenderTargetView* rtv = nullptr;
     DXGI_SWAP_CHAIN_DESC sc_desc{};
     UINT cur_w = 0, cur_h = 0;   // 当前后备缓冲尺寸：尺寸未变时跳过重建（避免无谓闪烁）
-    // 显示设备已丢失（Present 返回 DXGI_ERROR_DEVICE_REMOVED/RESET）：此后不再呈现。
-    // 只置标记、不做设备重建 —— 半途重建 device/swapchain 还必须让 ImGui 后端重新初始化并
-    // 重建字体纹理，失败面比收益大。置标记后由界面如实告知用户，日志里保留 HRESULT 供追溯。
+    // 显示设备已丢失（Present / ResizeBuffers 返回 DXGI_ERROR_DEVICE_REMOVED/RESET）：此后不再呈现。
+    // **不重建** device/swapchain —— 半途重建必须让 ImGui 后端重新初始化并重建字体纹理、
+    // 且要重挂 Renderer 持有的纹理，失败面远大于收益、又无法在"不运行本软件"的纪律下验证。
+    // 处置（ADR-088）：在帧首**如实告知**用户（原生弹窗，因为设备已丢失、ImGui 画不出来），
+    // 更新阅读位置快照后干净退出。`device_lost_notified` 保证只提示一次。
     bool device_lost = false;
+    bool device_lost_notified = false;
 
     // D3D 资源是**独占所有**：拷贝会得到两个"所有者"，析构时双重释放。
     Graphics() = default;
@@ -522,6 +525,12 @@ struct AppContext {
     // ---- 会话（唯一状态源）----
     SessionController session;
 
+    // ---- 失败提示体系（ADR-089）----
+    // 落盘失败（持久化服务最近一次写盘失败）的状态栏常驻告警：帧首从 `persist->last_save_failed()`
+    // 采样，并在首次出现时弹一次 toast。打开失败见 `session.doc.error`（画布引导页），
+    // 渲染失败见页占位（ADR-031）。
+    bool persist_failed = false;
+
     // ---- 渲染调度 / 画布 ----
     std::unique_ptr<lr::Renderer> renderer;  // 渲染调度层（ADR-020）
     lr::Canvas canvas;
@@ -729,6 +738,7 @@ void enter_reading();
 void request_open_document(std::wstring path);
 void close_document();
 void poll_document();               // 帧首接收后台打开/认证结果
+void update_save_failure_notice();  // 帧首采样落盘失败状态（ADR-089）
 void submit_password();
 void update_title();
 

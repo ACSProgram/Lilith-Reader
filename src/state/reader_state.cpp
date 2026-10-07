@@ -1,4 +1,4 @@
-// reader_state.cpp — lilithreader.reader_state 的实现单元（Phase 5，ADR-062 增身份分层）
+// reader_state.cpp — lilithreader.reader_state 的实现单元（ADR-062 增身份分层）
 //
 // 两部分：
 //   1. 纯序列化（encode_state / decode_state）——不碰磁盘，可单测；

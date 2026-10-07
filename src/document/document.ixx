@@ -1,4 +1,4 @@
-// document.ixx — Lilith Reader 文档核心模块（Phase 2）
+// document.ixx — Lilith Reader 文档核心模块
 //
 // 职责：MuPDF 的唯一入口。对外只暴露与 MuPDF 无关的类型，
 //       fz_context / fz_document / fz_pixmap 全部藏在实现单元的 PIMPL 里，
@@ -59,7 +59,7 @@ enum class DocError : std::int32_t {
 [[nodiscard]] bool format_matches_extension(std::string_view format_utf8,
                                             std::string_view ext_utf8) noexcept;
 
-// ---- 纸张方案（页面配色，Phase 5；分层渲染见 ADR-067）----
+// ---- 纸张方案（页面配色；分层渲染见 ADR-067）----
 //
 // 决策位置见 ADR-036/043；**按内容分层**见 ADR-067。这里只描述对外语义：
 //   Original  原样（不做任何变换，走单遍快路径）；
@@ -92,7 +92,7 @@ struct PageSize {
     float height_pt = 0.0f;
 };
 
-// ---- 目录（outline）条目（Phase 5）----
+// ---- 目录（outline）条目 ----
 //
 // 从 MuPDF 的 fz_outline 树**展平**为前序序列：depth 表示层级（顶层为 0），
 // 顺序即阅读顺序。用展平而非树结构，是为了让 UI 侧只需一次线性遍历即可绘制，
@@ -108,8 +108,8 @@ struct DocumentInfo {
     float  page_width_pt = 0.0f;   // 首页宽度（点，1 点 = 1/72 英寸）
     float  page_height_pt = 0.0f;  // 首页高度（点）
     bool   needs_password = false;
-    bool   has_outline = false;    // 是否存在目录（Phase 5 使用）
-    // 权限位（Phase 5）：PDF 标准加密可声明"禁复制/禁打印"。UI 层据此把相应功能置灰。
+    bool   has_outline = false;    // 是否存在目录
+    // 权限位：PDF 标准加密可声明"禁复制/禁打印"。UI 层据此把相应功能置灰。
     // 无加密或无法判定时**一律为 true**（保守放行，避免误禁）。
     bool   can_copy = true;
     bool   can_print = true;
@@ -300,7 +300,7 @@ public:
                               int rotation_deg = 0,
                               PageScheme scheme = PageScheme::Original) noexcept;
 
-    // ---- 文本 / 图片 / 链接（Phase 8）----
+    // ---- 文本 / 图片 / 链接 ----
     //
     // 三者都只在拥有本对象的线程内调用（与 render_page 同一纪律）。
     // 内部维护**一条** stext 缓存（最近一页）：抽一次文本的代价与渲染一页相当，

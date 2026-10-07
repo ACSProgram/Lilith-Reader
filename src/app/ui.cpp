@@ -15,8 +15,8 @@
 
 #include "app_internal.h"
 
-#include "imgui_raii.h"   // Phase 7：ImGui 栈的 RAII 包装（Push/Pop · Begin/End 自动配对）
-#include "crash.h"        // 上次异常退出的提示里要打开 crash 目录（Phase 7）
+#include "imgui_raii.h"   // ImGui 栈的 RAII 包装（Push/Pop · Begin/End 自动配对）
+#include "crash.h"        // 上次异常退出的提示里要打开 crash 目录
 
 namespace lr::app {
 
@@ -254,7 +254,7 @@ void draw_page_placeholder(ImDrawList* dl, const ImVec2& pmin, const ImVec2& pma
     }
 }
 
-// ---------------- 页内叠加层：选区 / 搜索命中 / 链接悬停（Phase 8） ----------------
+// ---------------- 页内叠加层：选区 / 搜索命中 / 链接悬停 ----------------
 
 namespace {
 
@@ -523,8 +523,17 @@ void draw_status_bar() {
     if (g_app.session.rotation != 0) chip("旋转 %d°", g_app.session.rotation);
     if (g_app.session.scheme != 0) chip("%s", page_scheme_name(g_app.session.scheme));
     if (current_page_has_bookmark()) chip("已加书签");
+    // 落盘失败告警（ADR-089）：只读状态里唯一"需要用户知道"的异常，用告警色常驻显示，
+    // 直到下一次写盘成功（persist 服务会把 failed 标记复位）。它不计入"非默认视图状态"，
+    // 用告警色与普通 chip 区分。
+    if (g_app.persist_failed) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(g_app.pal.chrome_dim), "·");
+        ImGui::SameLine();
+        ImGui::TextColored(col_warn(), "阅读数据保存失败");
+    }
 
-    // 操作提示（Phase 8）：居中显示"已复制 / 此处没有图片"这类一次性反馈。
+    // 操作提示：居中显示"已复制 / 此处没有图片"这类一次性反馈。
     // 居中而不是挤在左侧：左侧已承载页码与状态 chip，右侧是格式信息，中间正好空着。
     // 用状态栏而不是弹窗：复制是高频小动作，弹窗会打断阅读。
     {
@@ -619,7 +628,7 @@ void draw_debug_overlay() {
             ImGui::TextDisabled("canvas hover %d  focus %d  text-input %d  r-click down/up %d/%d",
                                 g_app.canvas_hovered ? 1 : 0, g_app.canvas_focused ? 1 : 0,
                                 ImGui::GetIO().WantTextInput ? 1 : 0, g_app.dbg_r_down, g_app.dbg_r_up);
-            // 文本交互读数（Phase 8）：排查"选不中 / 光标不变 / 复制没反应"时先看这里 ——
+            // 文本交互读数：排查"选不中 / 光标不变 / 复制没反应"时先看这里 ——
             // hover_char 为 -1 说明内容快照还没到（content 行能看到是哪一页），
             // 而不是命中测试算错了。
             ImGui::TextDisabled("hover: page %d link %d char %d", g_app.hover_page, g_app.hover_link,
@@ -835,7 +844,7 @@ void draw_sidebar(float height, float width) {
     }
 }
 
-// 侧栏「搜索」分栏（Phase 8）：输入框 + 进度/统计 + 结果列表。
+// 侧栏「搜索」分栏：输入框 + 进度/统计 + 结果列表。
 //
 // 为什么放在侧栏而不是独立窗口：它天然是"列表 + 跳转"的形态，与目录/书签/缩略图同类；
 // 复用侧栏即可继承既有的滑入滑出、宽度与开关（`O` 或 `Ctrl+F`），不必再造一个窗口，
@@ -1201,7 +1210,7 @@ void draw_canvas_context_menu() {
     const ig::StyleVar2 menu_style = popup_style();
     if (const ig::PopupContextWindow ctx =
             ig::PopupContextWindow("##canvas_ctx", ImGuiPopupFlags_MouseButtonRight)) {
-        // ---- 文本 / 图片 / 链接（Phase 8）----
+        // ---- 文本 / 图片 / 链接 ----
         // 置灰规则：没有选区 → 「复制」不可用；右键位置不在页面上 → 「复制图片」不可用；
         // 该位置没有链接 → 链接两项不可用。宁可置灰也不隐藏：菜单长度稳定，用户能找到功能。
         const bool has_sel = g_app.sel.active && !g_app.sel.rects.empty();
@@ -2284,9 +2293,10 @@ bool any_dialog_open() {
 
 void draw_shell() {
     poll_document();
+    update_save_failure_notice();  // 帧首：采样落盘失败（ADR-089）
     g_app.renderer->drain_retired();  // 帧首：释放上一帧退役的纹理
-    update_clipboard_results();   // 帧首：取走复制结果并写剪贴板（Phase 8）
-    update_search();              // 帧首：取走检索的新命中 + 执行待办跳转（Phase 8）
+    update_clipboard_results();   // 帧首：取走复制结果并写剪贴板
+    update_search();              // 帧首：取走检索的新命中 + 执行待办跳转
     update_ime_association();     // 输入法关联随文本输入激活状态切换（ADR-028）
     if (g_app.apply_scale_pending) {  // 界面缩放改动：样式只在帧首换，绝不在一帧中途换
         g_app.apply_scale_pending = false;

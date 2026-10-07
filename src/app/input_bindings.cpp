@@ -53,7 +53,7 @@ const CmdDef kCmds[kCmdCount] = {
     { "Col4",           "视图", "四页",                      false, false, kb(ImGuiKey_4),              kb(ImGuiKey_Keypad4) },
     { "ToggleSpread",   "视图", "双页对开（书籍模式）",      false, false, kb(ImGuiKey_D),              ImGuiKey_None },
     { "RotateCW",       "视图", "旋转 90°",                  false, false, kb(ImGuiKey_R),              ImGuiKey_None },
-    // id 保持 Phase 5 的历史名（"ToggleInvert"/"ToggleSepia"）：它是 ini 的**稳定标识**，
+    // id 保持历史名（"ToggleInvert"/"ToggleSepia"）：它是 ini 的**稳定标识**，
     // 改名会让用户已自定义的 I / E 绑定找不到而退回默认值。语义已在 ADR-067 里改过，
     // 显示名（第三列）随之更新，标识不动。
     { "ToggleInvert",   "视图", "深色纸张",                  false, false, kb(ImGuiKey_I),              ImGuiKey_None },
@@ -67,7 +67,7 @@ const CmdDef kCmds[kCmdCount] = {
     { "ToggleFullscreen","界面","全屏",                      false, true,  kb(ImGuiKey_F11),            kb(ImGuiKey_Escape) },
     { "OpenFile",       "界面", "打开文档…",                 false, true,  kb(ImGuiKey_O, ImGuiMod_Ctrl), ImGuiKey_None },
 
-    // Phase 8：文本。三条都**非全局**（global=false）—— 它们只在阅读态、且画布不在
+    // 文本。三条都**非全局**（global=false）—— 它们只在阅读态、且画布不在
     // 文本输入中时派发（见 handle_canvas_input 的 io.WantTextInput 门）：
     // 搜索框获得焦点时 Ctrl+C/Ctrl+A 必须归输入框，不能被这里抢走。
     { "Copy",           "文本", "复制选中文本",              false, false, kb(ImGuiKey_C, ImGuiMod_Ctrl), ImGuiKey_None },

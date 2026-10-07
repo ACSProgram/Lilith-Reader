@@ -1,4 +1,4 @@
-// log.ixx — Lilith Reader 轻量日志模块（Phase 7 稳定性加固）
+// log.ixx — Lilith Reader 轻量日志模块
 //
 // 定位：**只用于定位问题**。记录"发生了什么事、发生在哪个模块、带上哪些可检索字段"，
 //       不承担崩溃转储职责（那一层见 src/app/crash.cpp）。

@@ -203,6 +203,46 @@ def make_xps():
     ])
 
 
+def minimal_mobi(text, compression=1, name=b"LilithMobiSample"):
+    """最小合法 MOBI（Palm Database 容器，type/creator = TEXtREAd，即 PalmDOC）。
+
+    MuPDF 的 MOBI 处理器只实现无压缩（1）与 PalmDOC（2）两种压缩；HUFF/CDIC（17480）
+    会以"unknown compression method"拒绝。故本生成器用 compression 参数覆盖两条支持路径，
+    并用 17480 造一个"格式合法但压缩不受支持"的边界样本。
+
+    布局（参见 source/html/mobi.c 的 fz_extract_html_from_mobi）：
+      0   : 32  数据库名（NUL 填充）
+      32  : 28  attributes/version/日期/appInfoID/sortInfoID
+      60  : 8   type + creator = "TEXtREAd"
+      68  : 8   uniqueIDseed + nextRecordListID
+      76  : 2   记录数 n
+      78  : 8n  记录信息表（每条：偏移 4 + 属性 4，均大端）
+      随后     记录 0 = 16 字节 PalmDOC 头，记录 1 = 正文
+
+    TEXtREAd 为纯文本格式，正文按 Latin-1 直接放置（ASCII 文本同时是合法的 PalmDOC
+    字面量序列，故 compression=2 时无需重编码）。
+    """
+    raw = text.encode("latin-1", "replace") if isinstance(text, str) else text
+    # PalmDOC 头：compression / unused / text_length / record_count / record_size / 加密 / 保留
+    rec0 = struct.pack(">HHIHHHH", compression, 0, len(raw), 1, 4096, 0, 0)
+    records = [rec0, raw]
+
+    head = name[:31].ljust(32, b"\0")
+    # 28 字节：attributes / version / 三个日期 / modificationNumber / appInfoID / sortInfoID
+    head += struct.pack(">HHIIIIII", 0, 0, 0, 0, 0, 0, 0, 0)
+    head += b"TEXtREAd"
+    head += struct.pack(">II", 0, 0)                        # uniqueIDseed, nextRecordListID
+    n = len(records)
+    head += struct.pack(">H", n)
+
+    offsets, off = [], len(head) + n * 8
+    for r in records:
+        offsets.append(off)
+        off += len(r)
+    info = b"".join(struct.pack(">II", o, 0) for o in offsets)
+    return head + info + b"".join(records)
+
+
 FB2 = """<?xml version="1.0" encoding="utf-8"?>
 <FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0" xmlns:l="http://www.w3.org/1999/xlink">
 <description>
@@ -371,6 +411,10 @@ def main():
     write("real.fb2", FB2)
     write("real.xps", xps)
     write("real.png", png)
+    # MOBI：此前"声明支持、未充分验证"。这里造两个**格式合法**的 TEXtREAd（PalmDOC）
+    # 样本，覆盖 MuPDF 实现的两种压缩（无压缩 / PalmDOC），把"是否真能打开"钉进断言。
+    write("real.mobi", minimal_mobi("Lilith Reader MOBI sample.\nSecond line of text.\n", 1))
+    write("real_palmdoc.mobi", minimal_mobi("Lilith Reader PalmDOC sample.\n", 2))
     write("comic.cbz", zip_of([("1.png", png), ("2.png", png_1x1(120)), ("3.png", png_1x1(60))]))
     # 带两级目录的 PDF：供 doc_test 断言 outline() 的层级/页号解析
     write("outline.pdf", pdf_with_outline(3))
@@ -406,6 +450,9 @@ def main():
     write("random.pdf", bytes(rnd.randrange(256) for _ in range(4096)))
     write("empty_zip.epub", zip_of([]))
     write("zippdf_named_epub.epub", zip_of([("a.pdf", pdf1), ("b.pdf", pdf1)]))
+    # MOBI 边界：Kindle 常见的 HUFF/CDIC 压缩（17480）MuPDF 未实现，
+    # 格式合法的 PDB 也会被拒（Corrupt）。用样本把"声明支持 MOBI"的真实边界钉住。
+    write("mobi_huffcdic.mobi", minimal_mobi(b"\x00" * 32, 17480))
 
     log("== 5. 需修复但应能打开（容错用例） ==")
     write("junk_before_header.pdf", b"JUNK" * 64 + pdf3)

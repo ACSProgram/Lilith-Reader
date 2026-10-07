@@ -1,4 +1,4 @@
-// canvas.cpp — lilithreader.canvas 的实现单元（Phase 3）
+// canvas.cpp — lilithreader.canvas 的实现单元
 //
 // 纯几何计算，不含任何 ImGui / D3D / 线程代码，因此可脱离应用外壳单测。
 // 所有派生量在 ensure_layout() 里一次算清并缓存；滚动不影响布局，

@@ -1,8 +1,7 @@
-// app.rc — 应用资源（Phase 6）
+// app.rc — 应用资源
 // 目前三类：应用图标（exe 图标、窗口图标与任务栏图标）、UI 字体子集、版本资源。
-// 版本资源提前自 Phase 7 落地：exe 缺 FileDescription 时，系统"打开方式"列表会
-// 直接显示 "LilithReader.exe" 而非应用名。字符串值刻意全用 ASCII，规避 rc 编码问题。
-// 打开方式注册表脚本仍属 Phase 7 发布打包，见 docs/01-迁移计划.md。
+// 版本资源用于让系统"打开方式"列表显示应用名（exe 缺 FileDescription 时会退回文件名）。
+// 字符串值刻意全用 ASCII，规避 rc 编码问题。打开方式注册表脚本在 installer/ 下。
 //
 // 刻意不 #include <windows.h>：资源编译器对它的展开支持有限，这里只需要整型 ID。
 

@@ -18,7 +18,7 @@
 #include "backends/imgui_impl_win32.h"
 // FreeType 装载器（ADR-048）：比内置 stb_truetype 栅格化质量好，且能读 CFF/OTF（子集即 OTF）。
 #include "misc/freetype/imgui_freetype.h"
-// ImGui 内部错误的接管入口（Phase 7）——它需要 imgui_internal.h，故单独隔离在这个头里。
+// ImGui 内部错误的接管入口 —— 它需要 imgui_internal.h，故单独隔离在这个头里。
 #include "imgui_stacks.h"
 
 namespace lr::app {
@@ -429,7 +429,7 @@ void Graphics::render_frame() {
         const HRESULT reason = device->GetDeviceRemovedReason();
         lr::log::error("platform", "device removed " + lr::log::kv("hr", hr_field(hr)) +
                                        " " + lr::log::kv("reason", hr_field(reason)));
-        device_lost = true;   // 只标记、不再呈现；重建设备属未实现的边界（见 docs §3.4）
+        device_lost = true;   // 只标记、不再呈现；主循环据此如实告知并干净退出（ADR-088）
     }
 }
 
@@ -468,7 +468,7 @@ void ImGuiRaii::initialize(HWND hwnd) {
     // LilithReader.ini 自管，故直接禁用。
     io.IniFilename = nullptr;
 
-    // ---- 错误恢复与错误接管（Phase 7）----
+    // ---- 错误恢复与错误接管 ----
     //
     // ImGui 1.93 对"可恢复错误"（栈不平、Begin/End 误用、ID 冲突）自带恢复机制：它会自愈到
     // 一个可用状态，而不是直接把进程带走。我们做两件事：
@@ -727,7 +727,7 @@ void toggle_fullscreen() {
     }
 }
 
-// ---------------- 剪贴板（Phase 8） ----------------
+// ---------------- 剪贴板 ----------------
 //
 // 为什么不用 ImGui 的 SetClipboardText：它只能放文本，且依赖后端实现；
 // 图片必须走原生 CF_DIB，两者放一处才好统一处理"剪贴板被别的进程占用"这一失败路径

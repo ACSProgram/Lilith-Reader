@@ -1,4 +1,4 @@
-// crash.h — Lilith Reader 进程级崩溃防线（Phase 7 稳定性加固）
+// crash.h — Lilith Reader 进程级崩溃防线
 //
 // 分层位置（架构文档 §3.4）：
 //   · 模块边界（document 的 fz_try/catch）—— 已实现

@@ -1,4 +1,4 @@
-// document.cpp — lilithreader.document 的实现单元（Phase 2）
+// document.cpp — lilithreader.document 的实现单元
 //
 // 【模块边界纪律 · 必读】
 //   MuPDF 的错误处理基于 setjmp/longjmp（见 mupdf/fitz/context.h 的 fz_try/fz_catch），
@@ -46,7 +46,7 @@ namespace {
 // ---- 常量 ----
 
 // MuPDF 内部资源存储上限。留一份解码缓存给它，同时保证进程内存有界。
-// 页面级缓存不依赖它（由 render 层自己按字节预算管理，Phase 4）。
+// 页面级缓存不依赖它（由 render 层自己按字节预算管理）。
 constexpr std::size_t kStoreBytes = 128u << 20;  // 128 MB
 
 // pixmap 分量数：RGB + alpha ⇒ RGBA8
@@ -122,12 +122,20 @@ void copy_caught_message(fz_context* ctx, char* buf, std::size_t cap) noexcept {
 // 错误码分类：优先用 MuPDF 的错误码，只在笼统错误（GENERIC）时回退到消息特征。
 // 加密 PDF 在 1.26 上走的是 FZ_ERROR_GENERIC + "cannot authenticate password"，
 // 因此消息判断不可省。
+//
+// FORMAT 分支也要看消息：MuPDF 把"压缩方式不受支持"（如 MOBI 的 HUFF/CDIC）也抛成
+// FZ_ERROR_FORMAT，若一律归 Corrupt，用户会看到"文件已损坏"，而文件其实完好、只是这个
+// 压缩没实现 —— 属于"打开失败文案不实"。命中特征词时改判 Unsupported（"暂不支持的格式"）。
 DocError classify(fz_context* ctx) noexcept {
     switch (fz_caught(ctx)) {
     case FZ_ERROR_UNSUPPORTED: return DocError::Unsupported;
     case FZ_ERROR_LIMIT:       return DocError::TooLarge;
     case FZ_ERROR_FORMAT:
-    case FZ_ERROR_SYNTAX:      return DocError::Corrupt;
+    case FZ_ERROR_SYNTAX: {
+        const char* msg = fz_caught_message(ctx);
+        if (msg && std::strstr(msg, "unknown compression")) return DocError::Unsupported;
+        return DocError::Corrupt;
+    }
     case FZ_ERROR_SYSTEM:
     case FZ_ERROR_LIBRARY:
     case FZ_ERROR_ARGUMENT:    return DocError::Internal;
@@ -158,7 +166,7 @@ float clamp_scale(fz_rect bounds, float scale, int max_dimension) noexcept {
     return s;
 }
 
-// ---- 页面配色（Phase 5；按内容分层见 ADR-067）----
+// ---- 页面配色（按内容分层见 ADR-067）----
 //
 // 配色变换 = 一张逐通道 LUT，**只作用于"纸墨层"**（背景/文字/矢量/单色蒙版图），
 // 照片与插图由分流设备留在另一层、原样叠回（见下面的 SplitDevice）。
@@ -523,7 +531,7 @@ bool paper_is_blank(fz_context* ctx, fz_pixmap* pix) noexcept {
     return total == 0 || static_cast<double>(ink) < kPaperBlankFloor * static_cast<double>(total);
 }
 
-// ---- 目录遍历（Phase 5）----
+// ---- 目录遍历 ----
 //
 // fz_outline 是 next（同级）/ down（子级）构成的树。这里前序遍历并**展平**为
 // OutlinePOD 数组（只含 POD，可安全在 fz_try 内写），返回后由调用方转成
@@ -856,7 +864,7 @@ struct Document::Impl {
     int          needs_password = 0;
     std::string  last_error;
 
-    // ---- 文本抽取缓存（Phase 8）----
+    // ---- 文本抽取缓存 ----
     // 只缓存**一页**：选择/复制会在同一页上反复触发（每次重建 stext 与渲染一页同价），
     // 而交互始终集中在鼠标所在的那一页。跨页时重建一次（毫秒级），内存因此有界。
     // 归属：stext 由本 ctx 创建，必须先于 ctx 释放。
@@ -895,7 +903,7 @@ void set_error(std::string& dest, const char* msg) noexcept {
     dest.assign(msg, n);
 }
 
-// ---- 文本抽取（Phase 8：选择/复制/搜索共用）----
+// ---- 文本抽取（选择/复制/搜索共用）----
 
 // 取某页的 stext（必要时重建并写入 cache）。
 //
@@ -1412,7 +1420,7 @@ DocError Document::outline(std::vector<OutlineItem>& out) const noexcept {
     return DocError::Ok;
 }
 
-// ---- 文本 / 图片 / 链接（Phase 8）----
+// ---- 文本 / 图片 / 链接 ----
 
 DocError Document::page_content(int index, PageContent& out) const noexcept {
     out = PageContent{};

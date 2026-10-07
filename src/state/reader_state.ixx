@@ -1,4 +1,4 @@
-// reader_state.ixx — Lilith Reader 阅读状态持久化（Phase 5；身份分层见 ADR-062）
+// reader_state.ixx — Lilith Reader 阅读状态持久化（身份分层见 ADR-062）
 //
 // 职责：把"每本书读到哪、有哪些书签、用什么视图参数"存到 exe 同目录的
 //       reader_state.bin。**纯序列化部分与磁盘无关**，可脱离 Win32 单测

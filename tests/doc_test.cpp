@@ -61,6 +61,8 @@ const Case kCases[] = {
     {"real.fb2",   Expect::Open, {}, 2, "FictionBook", 1, "FB2 打开"},
     {"real.xps",   Expect::Open, {}, 1, "XPS", 1, "XPS 打开"},
     {"real.png",   Expect::Open, {}, 1, "Image", 1, "单页图片：白名单放行（ADR-017）"},
+    {"real.mobi",  Expect::Open, {}, 1, "MOBI", 1, "MOBI（无压缩）打开"},
+    {"real_palmdoc.mobi", Expect::Open, {}, 1, "MOBI", 1, "MOBI（PalmDOC 压缩）打开"},
     {"comic.cbz",  Expect::Open, {}, 3, "zip", 1, "CBZ 页数=图片数"},
     {"outline.pdf", Expect::Open, {}, 3, "PDF", 1, "带目录的 PDF（Phase 5）"},
 
@@ -98,6 +100,8 @@ const Case kCases[] = {
      kNoCheck, "空 zip 改 .epub"},
     {"zippdf_named_epub.epub", Expect::Reject, lr::DocError::Corrupt, 0, nullptr,
      kNoCheck, "zip 改 .epub：epub 处理器校验 container.xml 失败"},
+    {"mobi_huffcdic.mobi",     Expect::Reject, lr::DocError::Unsupported, 0, nullptr,
+     kNoCheck, "MOBI HUFF/CDIC 压缩：MuPDF 未实现 → 暂不支持（而非误报损坏）"},
 
     // ---- 5. 需修复型：容错断言 ----
     {"junk_before_header.pdf", Expect::OpenOrReject, lr::DocError::Corrupt, 0, nullptr,

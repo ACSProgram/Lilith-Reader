@@ -1,4 +1,4 @@
-// canvas.ixx — Lilith Reader 自研画布（Phase 3）
+// canvas.ixx — Lilith Reader 自研画布
 //
 // 职责：把"视图状态 + 文档度量"映射为屏幕布局。**全部是纯计算**：
 //       不依赖 ImGui、不依赖 D3D11、不感知线程，因此可以脱离应用外壳单测

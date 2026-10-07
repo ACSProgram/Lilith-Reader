@@ -16,8 +16,8 @@
 
 #include "app_internal.h"
 
-#include "crash.h"          // 进程级崩溃防线（Phase 7）
-#include "imgui_stacks.h"   // 帧级栈平衡自检与 ImGui 异常后恢复（Phase 7）
+#include "crash.h"          // 进程级崩溃防线
+#include "imgui_stacks.h"   // 帧级栈平衡自检与 ImGui 异常后恢复
 
 // Win32 后端消息处理器的前向声明。两点说明：
 //  1. 该声明**刻意不出现在 imgui_impl_win32.h**（避免那头引入 windows.h），官方要求使用者
@@ -162,7 +162,7 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    // ---- 最早的接线（Phase 7）----
+    // ---- 最早的接线 ----
     // 崩溃标记的读取必须**先于** install()：install 会写 running.flag，晚于它读到的永远是
     // 本次进程自己的标记，结果就是"每次启动都提示上次异常退出"（实测踩过；take_last_crash
     // 内部另有 PID 自检兜底，双保险）。
@@ -324,6 +324,21 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
         // 帧被异常截断时不提交绘制数据：窗口保留上一帧画面，胜过闪一帧半成品。
         // （ImGui 帧已经在上面正常收口，故跳过一次 Present 不会留下不完整状态。）
         if (frame_ok) g_app.gfx.render_frame();
+
+        // 显示设备丢失（ADR-088）：Present / ResizeBuffers 失败置标记后不再呈现，此时 ImGui
+        // **画不出来**（没有可提交的目标），只能用原生弹窗如实告知；随后更新阅读位置快照并
+        // 干净退出（退出路径会 flush 持久化服务，不丢进度）。不重建 device/swapchain ——
+        // 重建面大且无法在"不运行本软件"的纪律下验证，故不做。
+        if (g_app.gfx.device_lost && !g_app.gfx.device_lost_notified) {
+            g_app.gfx.device_lost_notified = true;
+            save_reading_state();   // 更新 g_app.session.state 快照（退出路径 flush）
+            lr::log::error("app", "D3D device lost; notifying user and exiting");
+            MessageBoxW(g_app.hwnd,
+                        L"显示设备已丢失（显卡驱动被重置、更新或显卡被移除）。\n"
+                        L"程序将关闭，请重新启动 Lilith Reader。",
+                        L"Lilith Reader", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+            PostQuitMessage(0);
+        }
 
         // 「打开文档…」：模态文件对话框放到帧与帧之间执行（见 open_file_dialog_now 注释）。
         if (g_app.request_open_dialog) {

@@ -1,4 +1,4 @@
-// search.cpp — Lilith Reader 应用层：全文搜索（Phase 8）
+// search.cpp — Lilith Reader 应用层：全文搜索
 //
 // 从 session.cpp 拆出（ADR-087）。检索本身在渲染工作线程执行（render 的 SearchJob），
 // 本 TU 只负责：输入防抖、取用增量命中、跳转命中、清空/取消。

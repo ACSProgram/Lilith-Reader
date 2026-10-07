@@ -1,4 +1,4 @@
-// utils.ixx — Lilith Reader 通用工具模块（Phase 1）
+// utils.ixx — Lilith Reader 通用工具模块
 // 路径/编码转换/扩展名闸门 + ini 读写（窗口状态 [window] 与用户偏好 [ui]/[cache]）。
 // 纪律：不抛异常跨边界，所有 Win32 调用失败均有合理回退。
 
@@ -16,7 +16,7 @@ export module lilithreader.utils;
 
 export namespace lr {
 
-// ---- 受支持的文档格式（渲染核心 Phase 2 经 MuPDF 接入） ----
+// ---- 受支持的文档格式（经 MuPDF 接入） ----
 //
 // 这是一道**策略闸门**（ADR-013）：只有清单内的扩展名才会进入后台线程，
 // 内容终究交给 MuPDF 按内容识别（识别结果与扩展名不符时如何处置见 ADR-016）。
@@ -194,7 +194,7 @@ inline float read_ini_float_ex(const std::wstring& ini, const wchar_t* section,
     return static_cast<float>(v);
 }
 
-// 通用 ini 写入（指定节；Phase 6 设置界面即时落盘用）。
+// 通用 ini 写入（指定节；设置界面即时落盘用）。
 inline void write_ini_int(const std::wstring& ini, const wchar_t* section,
                           const wchar_t* key, int value) {
     wchar_t buf[32]{};
