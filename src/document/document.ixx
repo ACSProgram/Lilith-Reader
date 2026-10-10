@@ -240,6 +240,17 @@ struct ImageData {
     [[nodiscard]] bool valid() const noexcept { return w > 0 && h > 0 && !rgba.empty(); }
 };
 
+// ---- 导出为图片 ----
+//
+// 支持的编码格式（均由 MuPDF 内置编码器提供，**不引入新依赖**）：
+//   Png  —— 无损，体积大；走 fz_new_buffer_from_pixmap_as_png（RGBA 直出，页面已是不透明白底）。
+//   Jpeg —— 有损，质量可调（1~100）；走 fz_new_buffer_from_pixmap_as_jpeg（先转 RGB，JPEG 无 alpha）。
+// MuPDF 还能写 JP2 / PNM / PSD / PCL 等，但面向用户无意义或过于专业，故只开放这两种。
+enum class ImageFormat : int {
+    Png  = 0,
+    Jpeg = 1,
+};
+
 // 一次搜索命中。矩形是命中文字的**外接框**（未旋转页面 pt）；snippet 是命中所在行的
 // 文本（结果列表显示上下文用，已截断）。同一处命中可能跨行 —— 跨行时拆成多条，
 // 这是刻意的：列表里逐条可跳转，比一条含换行的记录更好用。
@@ -329,6 +340,26 @@ public:
     // 分页搜索的调度（跨页顺序、取消、进度）在 render 层，本模块只负责"一页"。
     DocError search_page(int index, std::string_view utf8_needle, int max_hits,
                          std::vector<SearchHit>& out) noexcept;
+
+    // ---- 导出为图片 ----
+    //
+    // 把第 index 页渲染并编码为图片，按 Windows 原生 UTF-16 路径写出。
+    // 渲染**复用 render_page 的完整路径**（含旋转与纸张方案），故"导出当前视图"无需另写逻辑。
+    //   scale        : 1.0 = 72dpi；导出时由调用方按 DPI 折算（scale = dpi / 72）。
+    //   fmt          : Png / Jpeg。
+    //   quality      : JPEG 质量 1~100（Png 忽略）。
+    //   max_dimension: 单边像素上限（超出等比下调，实际倍率见 out_effective_scale）。
+    //   rotation_deg / scheme : 视图变换（导出"当前视图"时传入当前值，导出"原始页面"传 0）。
+    //   path         : 输出文件的 Windows 原生 UTF-16 路径。
+    //   out_effective_scale : 可空；回填实际使用的倍率（被上限下调时 < scale）。
+    //
+    // 为什么编码放在 document 层而不是 app 层：fz_* 只能出现在本模块（ADR-003/009）。
+    // 编码结果先落 fz_buffer，再经 Win32 写出 —— 避免把宽字符路径交给 MuPDF 的
+    // UTF-8 文件名入口（非 ASCII 路径会踩 ANSI 代码页）。
+    DocError save_page_as_image(int index, float scale, ImageFormat fmt, int quality,
+                                int max_dimension, int rotation_deg, PageScheme scheme,
+                                const std::wstring& path,
+                                float* out_effective_scale = nullptr) noexcept;
 
     // 最近一次失败的原始信息（UTF-8，截断到 1024 字节），调试/日志用。
     [[nodiscard]] std::string_view last_error() const noexcept;

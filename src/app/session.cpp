@@ -720,6 +720,9 @@ void handle_global_commands() {
     if (cmd_pressed(Cmd::ToggleDebug))      g_app.show_debug ^= 1;
     if (cmd_pressed(Cmd::ToggleFullscreen)) g_app.request_fullscreen_toggle = true;  // 帧间执行（ADR-060）
     if (cmd_pressed(Cmd::OpenFile))         g_app.request_open_dialog = true;
+    // 导出为图片：只在阅读态有意义（对话框本身会再校验页列表）。
+    if (cmd_pressed(Cmd::ExportImage) && g_app.session.doc.kind == UiDoc::Kind::Reading)
+        open_export_dialog();
     if (cmd_pressed(Cmd::OpenSettings))     g_app.show_settings = true;
     if (cmd_pressed(Cmd::OpenKeys))         { g_app.show_settings = true; g_app.settings_open_tab = 2; }
 

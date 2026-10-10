@@ -406,6 +406,8 @@ enum class Cmd : int {
     // 文本。追加在末尾而不是插进中间：`Cmd` 的整数值虽不落盘（ini 键名是 id 字符串），
     // 但让已有命令的序号保持稳定，能让任何按序号写的调试代码/日志不至于突然错位。
     Copy, SelectAll, OpenSearch,
+    // 导出为图片（导出功能）：追加在末尾，同上。
+    ExportImage,
     Count,
 };
 
@@ -758,6 +760,28 @@ struct AppContext {
     bool show_debug = false;
     bool show_settings = false;
 
+    // ---- 导出为图片（导出功能）----
+    // 对话框选项 + 输出目标 + 进度；绘制与编排在 export.cpp（独立 TU，ADR-094 同款拆分）。
+    // 输出选择（另存为 / 选目录）是**模态对话框、自带消息循环**，必须在**帧与帧之间**执行：
+    // 点「导出」只置 request_export_pick，主循环帧间执行 export_pick_output_now()。
+    bool             export_open = false;         // 对话框是否打开（any_dialog_open 据此门控全局命令）
+    int              export_scope = 0;            // 0 当前页 / 1 全部页 / 2 自定义范围
+    int              export_from = 1;             // 自定义范围起页（1 基，含）
+    int              export_to = 1;               // 自定义范围止页（1 基，含）
+    int              export_format = 0;           // 0 PNG / 1 JPEG（对应 lr::ImageFormat）
+    int              export_dpi = 300;            // 清晰度（DPI）；倍率 = dpi / 72
+    int              export_quality = 90;         // JPEG 质量 1~100
+    bool             export_apply_view = false;   // 应用当前视图（旋转 + 纸张配色）
+    std::vector<int> export_pages;                // 待导出页（0 基），点「导出」时确定
+    bool             request_export_pick = false; // 帧间：执行输出选择对话框
+    std::wstring     export_out_path;             // 单页：完整文件路径
+    std::wstring     export_out_dir;              // 多页：输出目录
+    bool             export_out_single = false;   // true = 单页（另存为）
+    bool             export_out_ready = false;    // 有已解析的输出目标待投递
+    bool             export_busy = false;         // 有在途导出（进度显示 / 入口提示）
+    int              export_done = 0, export_total = 0;
+    std::uint64_t    export_seen_id = 0;          // 已提示过的完成序号（避免重复提示）
+
     // ---- 通用确认弹窗 ----
     ConfirmKind   confirm_kind = ConfirmKind::None;
     bool          confirm_open = false;
@@ -943,6 +967,18 @@ void update_search();                // 每帧：输入防抖 + 取新命中 + �
 [[nodiscard]] bool search_has_query();
 
 // ============================================================================
+// 导出为图片（export.cpp）
+// ============================================================================
+//
+// 交互流程：open_export_dialog() 打开对话框 → 用户设选项 → 点「导出」确定页列表并置
+// request_export_pick → 主循环帧间 export_pick_output_now() 弹另存为/选目录 → 下一帧
+// update_export() 投递到 Renderer（后台导出）并轮询进度、完成时弹 toast。
+void open_export_dialog();       // 打开导出对话框（菜单 / 快捷键）
+void draw_export_popup();        // 绘制导出对话框（draw_shell 调用）
+void export_pick_output_now();   // 帧间：另存为 / 选目录对话框；取消则丢弃本次页列表
+void update_export();            // 帧首：投递输出目标 + 轮询进度、完成提示
+
+// ============================================================================
 // 绘制层（ui.cpp）
 // ============================================================================
 
@@ -966,12 +1002,15 @@ void draw_password_popup();
 void draw_confirm_popup();          // 通用确认弹窗（智能匹配询问 / 删除二次确认，ADR-062）
 // 设置窗口（settings_ui.cpp）：ui.cpp 的 draw_shell 只调这一个入口。
 void draw_settings_window();
-// ---- ui.cpp 与 settings_ui.cpp 共用的绘制辅助（定义在 ui.cpp）----
-// 设置窗口已拆到独立 TU（ADR-094），它需要这几个界面主题/色调/偏好入口；集中声明在此，
-// 两 TU 互不 include（沿用 ADR-087 的自由函数互调约定）。
+// ---- ui.cpp 与其余 app TU 共用的绘制辅助（定义在 ui.cpp）----
+// 设置窗口已拆到独立 TU（ADR-094）、导出对话框亦然（ADR-101），它们需要这几个界面主题/色调/偏好
+// 入口；集中声明在此，各 TU 互不 include（沿用 ADR-087 的自由函数互调约定）。
 ImVec4 col_text();
 ImVec4 col_dim();
 ImVec4 col_warn();
+// 当前主题（深/浅 chrome）× 纸张方案派生出的强调色（已过 tone_apply，ADR-068）。
+// ui.cpp 的扁平按钮与 export.cpp 的对话框主按钮/档位按钮共用一份，避免两处派生漂移。
+[[nodiscard]] ImVec4 accent_color();
 void set_theme_pref(int theme);     // 界面主题偏好（外观菜单与设置分栏共用）
 void apply_gap_pref();              // 下发「页面间距」偏好
 // 名称表定义在 ui.cpp；显式给出长度，便于另一 TU 用 IM_ARRAYSIZE（改动需同步此处与定义）。

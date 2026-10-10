@@ -147,6 +147,26 @@ bool file_exists(const std::wstring& path) {
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+// 读文件前 n 字节；读不到返回 0。
+std::size_t read_head(const std::wstring& path, unsigned char* buf, std::size_t n) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    DWORD got = 0;
+    const bool ok = ReadFile(h, buf, static_cast<DWORD>(n), &got, nullptr) != FALSE;
+    CloseHandle(h);
+    return ok ? static_cast<std::size_t>(got) : 0;
+}
+
+long long file_size(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) return -1;
+    LARGE_INTEGER li{};
+    li.LowPart = fad.nFileSizeLow;
+    li.HighPart = static_cast<LONG>(fad.nFileSizeHigh);
+    return static_cast<long long>(li.QuadPart);
+}
+
 
 // ---- 单个普通用例 ----
 
@@ -841,6 +861,89 @@ void run_text_cases(const std::wstring& dir) {
     }
 }
 
+// ---- 导出为图片（导出功能）----
+//
+// 端到端验证"渲染 → 编码 → 按宽字符路径写出"整条链路：编码在 document 层、涉及 MuPDF 的
+// PNG/JPEG 编码器与 Win32 写文件，纯函数单测覆盖不到。用例刻意用**中文文件名**，钉住
+// "绕开 MuPDF 的 UTF-8 文件名入口、改用宽字符路径写出"这条设计（否则非 ASCII 路径会踩代码页）。
+void run_export_cases(const std::wstring& dir) {
+    const std::wstring src = dir + L"\\real.pdf";
+    if (!file_exists(src)) { skip("real.pdf", "导出为图片"); return; }
+
+    lr::Document doc;
+    if (doc.open(src) != lr::DocError::Ok) { fail("real.pdf", "导出为图片", "打不开"); return; }
+
+    const std::wstring out_png = dir + L"\\导出测试_第1页.png";
+    const std::wstring out_jpg = dir + L"\\导出测试_第1页.jpg";
+
+    // PNG（无损）：文件头必须是 89 50 4E 47。
+    {
+        float eff = 0.0f;
+        const lr::DocError e = doc.save_page_as_image(
+            0, 2.0f, lr::ImageFormat::Png, 0, 8192, 0, lr::PageScheme::Original, out_png, &eff);
+        unsigned char head[8] = {};
+        const std::size_t n = read_head(out_png, head, sizeof head);
+        const bool magic = n == 8 && head[0] == 0x89 && head[1] == 0x50 &&
+                           head[2] == 0x4E && head[3] == 0x47;
+        if (e == lr::DocError::Ok && magic && file_size(out_png) > 0)
+            pass("real.pdf", "导出 PNG：写出且文件头正确（中文名）");
+        else {
+            char d[192];
+            std::snprintf(d, sizeof d, "err=%s head=%zu size=%lld",
+                          std::string(lr::to_string(e)).c_str(), n, file_size(out_png));
+            fail("real.pdf", "导出 PNG：写出且文件头正确（中文名）", d);
+        }
+    }
+
+    // JPEG（有损）：文件头必须是 FF D8 FF。
+    {
+        float eff = 0.0f;
+        const lr::DocError e = doc.save_page_as_image(
+            0, 2.0f, lr::ImageFormat::Jpeg, 85, 8192, 0, lr::PageScheme::Original, out_jpg, &eff);
+        unsigned char head[3] = {};
+        const std::size_t n = read_head(out_jpg, head, sizeof head);
+        const bool magic = n == 3 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF;
+        if (e == lr::DocError::Ok && magic && file_size(out_jpg) > 0)
+            pass("real.pdf", "导出 JPEG：写出且文件头正确（中文名）");
+        else {
+            char d[320];
+            std::snprintf(d, sizeof d, "err=%s head=%zu size=%lld last=%s",
+                          std::string(lr::to_string(e)).c_str(), n, file_size(out_jpg),
+                          std::string(doc.last_error()).c_str());
+            fail("real.pdf", "导出 JPEG：写出且文件头正确（中文名）", d);
+        }
+    }
+
+    // 旋转 + 深色纸张：导出"当前视图"路径（render_page 的变换链路）。
+    {
+        const std::wstring out2 = dir + L"\\导出测试_旋转深色.png";
+        float eff = 0.0f;
+        const lr::DocError e = doc.save_page_as_image(
+            0, 1.0f, lr::ImageFormat::Png, 0, 8192, 90, lr::PageScheme::Dark, out2, &eff);
+        if (e == lr::DocError::Ok && file_size(out2) > 0)
+            pass("real.pdf", "导出（旋转 90° + 深色纸张）成功");
+        else
+            fail("real.pdf", "导出（旋转 90° + 深色纸张）成功",
+                 std::string(lr::to_string(e)).c_str());
+        DeleteFileW(out2.c_str());
+    }
+
+    // 无效输出目录：应如实报错、绝不崩溃。
+    {
+        float eff = 0.0f;
+        const std::wstring bad = dir + L"\\__no_such_dir__\\x.png";
+        const lr::DocError e = doc.save_page_as_image(
+            0, 1.0f, lr::ImageFormat::Png, 0, 8192, 0, lr::PageScheme::Original, bad, &eff);
+        if (e != lr::DocError::Ok)
+            pass("real.pdf", "无效输出路径：如实报错不崩溃");
+        else
+            fail("real.pdf", "无效输出路径：如实报错不崩溃", "竟然写成功了");
+    }
+
+    DeleteFileW(out_png.c_str());
+    DeleteFileW(out_jpg.c_str());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -871,6 +974,7 @@ int main(int argc, char** argv) {
     run_render_cases(dir);
     run_scheme_layer_cases(dir);
     run_text_cases(dir);
+    run_export_cases(dir);
 
     std::printf("\n=== 结果：%d 通过 / %d 失败 / %d 跳过 ===\n", g_pass, g_fail, g_skip);
     if (g_fail > 0) {

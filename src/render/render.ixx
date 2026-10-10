@@ -130,6 +130,43 @@ struct SearchStatus {
     std::string needle;             // 当前关键字（UTF-8）
 };
 
+// ---- 导出为图片 ----
+//
+// 导出是**后台批处理**：一次可以导出若干页，逐页渲染并编码写出。作业跑在渲染工作线程上
+// （复用唯一的 Document 实例，不新开线程、不重复解析），每轮至多做一页，与阅读渲染交替 ——
+// 故导出期间阅读照常流畅。UI 线程只投递请求、轮询进度，零 fz_*、零阻塞（ADR-009/012）。
+//
+// 编码格式与写文件在 document 层完成（fz_* 只能出现在那里，ADR-003）。
+struct ExportRequest {
+    std::vector<int> pages;                       // 0 基页号，顺序即导出顺序
+    float            scale = 300.0f / 72.0f;      // 清晰度：DPI / 72（1.0 = 72dpi）
+    int              format = 0;                  // 0 = PNG，1 = JPEG（对应 lr::ImageFormat）
+    int              quality = 90;                // JPEG 质量 1~100（PNG 忽略）
+    int              rotation_deg = 0;            // 视图旋转（"应用当前视图"时传入当前值，否则 0）
+    int              scheme = 0;                  // 纸张方案（同上，0 = 原色）
+    int              max_dimension = 12000;       // 单边像素上限（超出等比下调）。比屏幕渲染的
+                                                  // 8192 放宽：导出面向存档/打印，600dpi 的 A4
+                                                  // 约 4960×7016；仍设上限是为了不让病态页面（或
+                                                  // 极端 DPI）一次性分配出巨块内存（12000²×4B
+                                                  // ≈ 576MB 最坏）。超出时 document 层等比下调倍率。
+    std::wstring     out_dir;                     // 多页：输出目录；单页：完整文件路径
+    bool             single_file = false;         // true = out_dir 即完整文件路径（单页）
+    std::string      base_name;                   // 多页文件名主干（UTF-8，调用方已清洗非法字符）
+};
+
+// 导出进度/结果快照（UI 线程读取，值拷贝）。
+struct ExportStatus {
+    bool          active = false;      // 正在导出（含"正在取消"）
+    int           done = 0;            // 已处理页数
+    int           total = 0;           // 总页数
+    int           failed = 0;          // 失败页数
+    bool          finished = false;    // 本轮已结束（成功/失败/取消），UI 消费后 clear_export_result 清除
+    bool          cancelled = false;   // 是否被取消
+    std::uint64_t id = 0;              // 本轮序号
+    std::wstring  last_written;        // 单页：最终文件路径；多页：输出目录（提示/打开用）
+    std::string   error_text;          // 失败原因（UTF-8，取首个失败；全成功为空）
+};
+
 // ---- 渲染调度器 ----
 class Renderer {
 public:
@@ -220,6 +257,15 @@ public:
     [[nodiscard]] SearchStatus search_status() const;
     // 把自上次调用以来**新增**的命中追加到 out 尾部（不覆盖已有内容）。
     void take_search_hits(std::vector<SearchHit>& out);
+
+    // ---- 导出为图片 ----
+    // 投递一次导出（UI 线程）。已有在途导出时**替换**之（latest-wins：当前页导完即切换）。
+    // 换文档 / 关闭文档会取消在途导出。
+    void start_export(ExportRequest req);
+    void cancel_export();
+    [[nodiscard]] ExportStatus export_status() const;
+    // UI 消费完 finished 后调用：清除结果（finished 复位），让状态栏提示不重复弹出。
+    void clear_export_result();
 
 private:
     struct Impl;

@@ -65,6 +65,15 @@ inline std::wstring file_name_of(const std::wstring& path) {
     return sep == std::wstring::npos ? path : path.substr(sep + 1);
 }
 
+// 目录 + 文件名拼成完整路径（按需补一个分隔符）。dir 为空时原样返回 name。
+// 与 file_name_of / extension_of 同处：路径工具统一放本模块（当前由 render 的多页导出使用）。
+inline std::wstring join_path(const std::wstring& dir, const std::wstring& name) {
+    if (dir.empty()) return name;
+    const wchar_t last = dir.back();
+    if (last == L'\\' || last == L'/') return dir + name;
+    return dir + L"\\" + name;
+}
+
 inline bool file_exists(const std::wstring& path) {
     const DWORD attrs = GetFileAttributesW(path.c_str());
     return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);

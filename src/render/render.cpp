@@ -53,6 +53,7 @@ module;
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <cwchar>
 #include <deque>
 #include <exception>
 #include <mutex>
@@ -202,6 +203,19 @@ bool wants_equal(const std::vector<RenderWant>& a, const std::vector<RenderWant>
         if (std::fabs(a[i].scale - b[i].scale) > 1e-3f) return false;
     }
     return true;
+}
+
+// ---- 导出为图片的路径工具（纯字符串，不引入 <filesystem>）----
+
+// 多页导出的文件名：<主干>_p<N>.<ext>。N 为 1 基页号，补零到 4 位（保证字典序=页序）。
+// 目录拼接用 lr::join_path（utils 模块的路径工具）。
+std::wstring page_file_name(const std::string& base_u8, int page0, int format) {
+    std::wstring stem = base_u8.empty() ? std::wstring(L"page") : lr::utf8_to_wide(base_u8);
+    wchar_t suffix[32] = {};
+    std::swprintf(suffix, 32, L"_p%04d", page0 + 1);
+    stem += suffix;
+    stem += (format == 1) ? L".jpg" : L".png";
+    return stem;
 }
 
 }  // namespace
@@ -553,6 +567,45 @@ struct DocumentWorker {
 };
 
 // ============================================================
+//  ExportJob —— 导出为图片的后台作业（导出功能）
+// ============================================================
+//
+// 与 SearchJob 同一形态：**每轮至多做一页**，做完必然回到主循环，渲染请求得以插队 ——
+// 故导出期间阅读不受影响。作业跑在渲染工作线程上，复用 DocumentWorker 的 Document 实例
+// （不新开线程、不重复解析；fz_* 全在 document 层）。
+//
+// 锁纪律：req / has_req 与全部进度字段受 Sync::mtx 保护；cur 是**工作线程私有**的执行副本
+// （在锁内从 req 取走），此后只在工作线程访问，避免渲染一页的长时间里持锁。
+struct ExportJob {
+    Sync*           sync = nullptr;
+    DocumentWorker* docw = nullptr;
+
+    ExportRequest req;              // 受锁：UI 写入 / 工作线程取走
+    bool          has_req = false;  // 受锁：有未开始（或被替换）的请求
+
+    ExportRequest cur;              // 工作线程私有：取走后的执行副本
+    bool          cap_logged = false;  // 工作线程私有：本轮是否已记过"倍率被上限下调"日志
+
+    // 进度（受锁）
+    bool          active = false;
+    int           done = 0, total = 0, failed = 0;
+    bool          finished = false;
+    bool          cancelled = false;
+    std::uint64_t id = 0, next_id = 0;
+    std::wstring  last_written;
+    std::string   error_text;
+
+    void start(ExportRequest r);
+    void cancel();
+    [[nodiscard]] ExportStatus status() const;
+    void clear_result();
+    void cancel_locked() noexcept;   // 调用方须已持锁
+    void fault_locked() noexcept;    // 工作线程故障：把在途导出收尾为失败
+    void step() noexcept;
+    void step_impl();
+};
+
+// ============================================================
 //  PageScheduler —— 渲染/缩略图请求调度（ADR-085）
 // ============================================================
 struct PageScheduler {
@@ -629,6 +682,8 @@ struct Renderer::Impl {
         sched.sync = &sync;
         sched.store = &store;
         sched.docw = &docw;
+        exp.sync = &sync;
+        exp.docw = &docw;
     }
 
     ID3D11Device* device = nullptr;
@@ -642,6 +697,7 @@ struct Renderer::Impl {
     ContentService  content;
     SearchJob       search;
     PageScheduler   sched;
+    ExportJob       exp;
 
     std::jthread worker;
 
@@ -698,7 +754,7 @@ struct Renderer::Impl {
             std::unique_lock lock(sync.mtx);
             sync.cv.wait(lock, st, [this] {
                 return cmd.has_value() || content.aux_dirty || sched.wants_dirty ||
-                       sched.thumbs_dirty || search.active;
+                       sched.thumbs_dirty || search.active || exp.has_req || exp.active;
             });
             if (st.stop_requested()) return false;
             // 优先级：显式命令 > 辅助请求 > 渲染请求 > 缩略图 > 检索。
@@ -730,6 +786,9 @@ struct Renderer::Impl {
         else search.step();
         // 渲染/缩略图之后捎带一轮检索：两者都不忙时才轮到它，天然与渲染交替。
         if (have_wants || have_thumbs) search.step();
+        // 导出为图片：每轮至多一页，排在最后 —— 有渲染/检索时它只推进一页，不抢占，
+        // 空闲时它连续推进。故导出期间阅读与检索都不受影响。
+        exp.step();
         return true;
     }
 
@@ -748,6 +807,7 @@ struct Renderer::Impl {
                 store.clear_thumbs();
                 search.cancel_locked();
                 content.clear_content_locked();
+                exp.fault_locked();
                 sched.reset_wants_bookkeeping();
                 docw.info = DocumentInfo{};
                 docw.outline.clear();
@@ -768,6 +828,11 @@ struct Renderer::Impl {
     }
 
     void handle_command(const Command& c) {
+        // 换文档 / 关文档：在途导出立即取消（它绑在旧文档的页上，继续导会导错或越界）。
+        if (c.kind == Command::Kind::Open || c.kind == Command::Kind::Close) {
+            std::lock_guard lock(sync.mtx);
+            exp.cancel_locked();
+        }
         switch (c.kind) {
         case Command::Kind::Open:         docw.open(c); break;
         case Command::Kind::Close:        docw.close(c); break;
@@ -921,6 +986,142 @@ void SearchJob::step_impl() {
     next_page = page;
     truncated = trunc;
     if (trunc || page >= total) active = false;
+}
+
+// ---- ExportJob ----
+
+void ExportJob::start(ExportRequest r) {
+    std::lock_guard lock(sync->mtx);
+    req = std::move(r);
+    has_req = true;
+    // 已有在途作业时不立刻清进度：工作线程下一轮取走新请求时才重置（避免 UI 进度闪一下）。
+    sync->cv.notify_all();
+}
+
+void ExportJob::cancel() {
+    std::lock_guard lock(sync->mtx);
+    cancel_locked();
+    sync->cv.notify_all();
+}
+
+// 取消：清掉未开始的请求；若正在导出则置 cancelled，工作线程在该页结束后收敛（finished）。
+// 保持 active 为真，使工作线程的等待谓词仍成立、能被唤醒去收尾。
+void ExportJob::cancel_locked() noexcept {
+    has_req = false;
+    if (!active) return;
+    cancelled = true;
+}
+
+ExportStatus ExportJob::status() const {
+    std::lock_guard lock(sync->mtx);
+    ExportStatus s;
+    s.active = active;
+    s.done = done;
+    s.total = total;
+    s.failed = failed;
+    s.finished = finished;
+    s.cancelled = cancelled;
+    s.id = id;
+    s.last_written = last_written;
+    s.error_text = error_text;
+    return s;
+}
+
+void ExportJob::clear_result() {
+    std::lock_guard lock(sync->mtx);
+    finished = false;
+    cancelled = false;
+    error_text.clear();
+}
+
+// 工作线程故障：把在途导出收尾为失败（finished），让 UI 不至于永远停在"导出中"。
+void ExportJob::fault_locked() noexcept {
+    if (!has_req && !active) return;
+    has_req = false;
+    active = false;
+    finished = true;
+    cancelled = true;
+}
+
+void ExportJob::step() noexcept {
+    try {
+        step_impl();
+    } catch (const std::exception& e) {
+        lr::log::error("render", "export step threw " + lr::log::kv("what", e.what()));
+        std::lock_guard lock(sync->mtx);
+        active = false;
+        finished = true;
+        if (error_text.empty()) error_text = "导出过程出错";
+    } catch (...) {
+        lr::log::error("render", "export step threw " + lr::log::kv("what", "non-std"));
+        std::lock_guard lock(sync->mtx);
+        active = false;
+        finished = true;
+        if (error_text.empty()) error_text = "导出过程出错";
+    }
+}
+
+void ExportJob::step_impl() {
+    int page = -1;
+    {
+        std::lock_guard lock(sync->mtx);
+        if (has_req) {                 // 取走（或被替换的）新请求：重置进度
+            cur = std::move(req);
+            has_req = false;
+            active = true;
+            done = 0;
+            failed = 0;
+            finished = false;
+            cancelled = false;
+            error_text.clear();
+            last_written.clear();
+            cap_logged = false;
+            total = static_cast<int>(cur.pages.size());
+            id = ++next_id;
+        } else if (!active || finished) {
+            return;
+        }
+        if (cancelled || total <= 0) {
+            finished = true;
+            active = false;
+            return;
+        }
+        page = cur.pages[static_cast<std::size_t>(done)];
+    }
+
+    // 目标路径（cur 为工作线程私有，锁外读取安全）。
+    std::wstring out_path;
+    if (cur.single_file) out_path = cur.out_dir;
+    else out_path = lr::join_path(cur.out_dir, page_file_name(cur.base_name, page, cur.format));
+
+    float   eff = 0.0f;
+    const DocError e = docw->engine.save_page_as_image(
+        page, cur.scale, static_cast<ImageFormat>(cur.format), cur.quality,
+        cur.max_dimension, cur.rotation_deg, static_cast<PageScheme>(cur.scheme),
+        out_path, &eff);
+
+    // 诊断：请求倍率被单边像素上限下调时留一次痕。对用户是**无感**的（页仍然导出成功，
+    // 只是分辨率低于所选 DPI），但排查"某页导出为何不够清晰"时必须能看到这件事。
+    // 每轮导出只记一次，避免整本导出把日志刷满。
+    if (!cap_logged && eff > 0.0f && eff < cur.scale) {
+        cap_logged = true;
+        lr::log::info("render", "export scale capped " +
+                                    lr::log::kv("want", static_cast<double>(cur.scale)) + " " +
+                                    lr::log::kv("used", static_cast<double>(eff)));
+    }
+
+    std::lock_guard lock(sync->mtx);
+    if (!active) return;               // 期间被取消 / 替换：丢弃本页结果
+    ++done;
+    if (e != DocError::Ok) {
+        ++failed;
+        if (error_text.empty()) error_text = std::string(lr::describe(e));
+    }
+    last_written = cur.single_file ? out_path : cur.out_dir;
+    if (done >= static_cast<int>(cur.pages.size())) {
+        finished = true;
+        active = false;
+    }
 }
 
 // ---- ContentService ----
@@ -1729,6 +1930,28 @@ SearchStatus Renderer::search_status() const {
 void Renderer::take_search_hits(std::vector<SearchHit>& out) {
     if (!impl_) return;
     impl_->search.take(out);
+}
+
+// ---- 导出为图片 ----
+
+void Renderer::start_export(ExportRequest req) {
+    if (!impl_) return;
+    impl_->exp.start(std::move(req));
+}
+
+void Renderer::cancel_export() {
+    if (!impl_) return;
+    impl_->exp.cancel();
+}
+
+ExportStatus Renderer::export_status() const {
+    if (!impl_) return {};
+    return impl_->exp.status();
+}
+
+void Renderer::clear_export_result() {
+    if (!impl_) return;
+    impl_->exp.clear_result();
 }
 
 // ---- 视图变换 ----

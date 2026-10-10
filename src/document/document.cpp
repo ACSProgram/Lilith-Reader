@@ -734,6 +734,74 @@ void drop_document_safe(fz_context* ctx, fz_document*& doc) noexcept {
     fz_catch(ctx) {}
 }
 
+// 把 RGBA8 页面 pixmap 转成**不透明 RGB8**（导出 JPEG 用）。
+//
+// 为什么不用 fz_convert_pixmap：源有 alpha、目标无 alpha 时它直接抛
+// "cannot drop alpha when converting pixmap"（实测，MuPDF 1.26）。而 JPEG 的 4 分量会被
+// MuPDF 当作 **CMYK**，所以必须真的降到 3 分量。页面渲染时已用不透明白底清屏、alpha 恒为 255，
+// 故"去 alpha"就是取 RGB 三通道，无需 alpha 合成。
+// 返回的 pixmap 由调用方 drop；失败返回 nullptr。只做 POD 运算，可安全放在 fz_try 内。
+fz_pixmap* rgb_pixmap_from_rgba(fz_context* ctx, fz_pixmap* src) noexcept {
+    if (ctx == nullptr || src == nullptr) return nullptr;
+    fz_pixmap* dst = nullptr;
+    fz_var(dst);
+    fz_try(ctx) {
+        const int w = fz_pixmap_width(ctx, src);
+        const int h = fz_pixmap_height(ctx, src);
+        const int ss = fz_pixmap_stride(ctx, src);
+        const unsigned char* sp = fz_pixmap_samples(ctx, src);
+        if (w <= 0 || h <= 0 || ss <= 0 || sp == nullptr)
+            fz_throw(ctx, FZ_ERROR_ARGUMENT, "bad source pixmap for rgb conversion");
+        dst = fz_new_pixmap_with_bbox(ctx, fz_device_rgb(ctx), fz_pixmap_bbox(ctx, src),
+                                      nullptr, 0);
+        const int ds = fz_pixmap_stride(ctx, dst);
+        unsigned char* dp = fz_pixmap_samples(ctx, dst);
+        for (int y = 0; y < h; ++y) {
+            const unsigned char* s =
+                sp + static_cast<std::size_t>(y) * static_cast<std::size_t>(ss);
+            unsigned char* d =
+                dp + static_cast<std::size_t>(y) * static_cast<std::size_t>(ds);
+            for (int x = 0; x < w; ++x) {
+                d[x * 3 + 0] = s[x * 4 + 0];
+                d[x * 3 + 1] = s[x * 4 + 1];
+                d[x * 3 + 2] = s[x * 4 + 2];
+            }
+        }
+    }
+    fz_catch(ctx) {
+        if (dst != nullptr) { fz_drop_pixmap(ctx, dst); dst = nullptr; }
+    }
+    return dst;
+}
+
+// 把一段内存按 Windows 原生宽字符路径写出（导出为图片用）。
+//
+// 为什么不用 fz_save_pixmap_as_png(ctx, pix, filename)：那些接口收 const char*，
+// 走 MuPDF 的 UTF-8 文件名入口；中文/非 ASCII 路径在 Windows 上会被 ANSI 代码页截断
+// 或写出失败。这里先编码进 fz_buffer（内存），再用 CreateFileW 按宽路径写出，
+// 与项目既有的"宽字符路径优先"约定一致（见 open 用 fz_open_file_w）。
+//
+// 分块写入：单次 WriteFile 上限按 DWORD 计，超大图（几百 MB）一次写不完。
+bool write_bytes_to_wide_path(const std::wstring& path, const unsigned char* data,
+                              std::size_t n) noexcept {
+    if (path.empty() || data == nullptr || n == 0) return false;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool ok = true;
+    const unsigned char* p = data;
+    std::size_t remaining = n;
+    while (remaining > 0) {
+        const DWORD chunk = static_cast<DWORD>(remaining > 0x40000000u ? 0x40000000u : remaining);
+        DWORD written = 0;
+        if (!WriteFile(h, p, chunk, &written, nullptr) || written == 0) { ok = false; break; }
+        p += written;
+        remaining -= written;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
 }  // namespace
 
 // ---- 错误码文案 ----
@@ -1900,6 +1968,103 @@ DocError Document::render_page_region(int index, float scale, PageBitmap& out,
     }
 
     out = PageBitmap(impl);
+    return DocError::Ok;
+}
+
+// ---- 导出为图片 ----
+
+DocError Document::save_page_as_image(int index, float scale, ImageFormat fmt, int quality,
+                                      int max_dimension, int rotation_deg, PageScheme scheme,
+                                      const std::wstring& path,
+                                      float* out_effective_scale) noexcept {
+    if (out_effective_scale != nullptr) *out_effective_scale = 0.0f;
+    if (!impl_ || !impl_->doc || !impl_->ctx) return DocError::NotOpen;
+    if (path.empty()) return DocError::Internal;
+    if (quality < 1) quality = 1;
+    if (quality > 100) quality = 100;
+
+    // 1) 渲染整页：完全复用 render_page 的路径（旋转 / 纸张方案 / 尺寸钳制都在里面）。
+    //    PageBitmap 是带析构函数的 C++ 对象，构造在 fz_try 之外，符合 ADR-009。
+    PageBitmap bmp;
+    const DocError render_err =
+        render_page(index, scale, bmp, max_dimension, rotation_deg, scheme);
+    if (render_err != DocError::Ok) return render_err;
+    if (!bmp.valid()) {
+        set_error(impl_->last_error, "render returned an empty bitmap");
+        return DocError::Internal;
+    }
+    if (out_effective_scale != nullptr) *out_effective_scale = bmp.effective_scale();
+
+    // Document 是 PageBitmap 的友元，可直接取内部的 fz_pixmap（编码需要它，而不是裸像素）。
+    fz_context* ctx = impl_->ctx;
+    fz_pixmap*  pix = (bmp.impl_ != nullptr) ? bmp.impl_->pix : nullptr;
+    if (pix == nullptr) {
+        set_error(impl_->last_error, "render produced a null pixmap");
+        return DocError::Internal;
+    }
+
+    // 2) 编码进内存缓冲。JPEG 需要先转成不透明 RGB（见 rgb_pixmap_from_rgba 的说明），
+    //    转换与编码各自独立，释放路径清晰。
+    fz_pixmap* rgb = nullptr;
+    fz_buffer* buf = nullptr;
+    DocError   result = DocError::Ok;
+    char       err[kErrCap] = {};
+
+    if (fmt == ImageFormat::Jpeg) {
+        rgb = rgb_pixmap_from_rgba(ctx, pix);
+        if (rgb == nullptr) {
+            set_error(impl_->last_error, "failed to convert page to RGB for JPEG");
+            return DocError::Internal;
+        }
+    }
+
+    fz_try(ctx) {
+        fz_var(buf);
+        if (fmt == ImageFormat::Png)
+            buf = fz_new_buffer_from_pixmap_as_png(ctx, pix, fz_default_color_params);
+        else
+            buf = fz_new_buffer_from_pixmap_as_jpeg(ctx, rgb, fz_default_color_params,
+                                                    quality, 0);
+    }
+    fz_catch(ctx) {
+        if (buf != nullptr) { fz_drop_buffer(ctx, buf); buf = nullptr; }
+        result = classify(ctx);
+        copy_caught_message(ctx, err, kErrCap);
+    }
+    drop_pixmap_safe(ctx, rgb);   // 无论成功失败都释放（ADR-083 边界函数）
+
+    if (result != DocError::Ok) {
+        set_error(impl_->last_error, err);
+        return result;
+    }
+    if (buf == nullptr) {
+        set_error(impl_->last_error, "image encode returned a null buffer");
+        return DocError::Internal;
+    }
+
+    // 3) 取缓冲数据（fz_try 覆盖），随后在 fz_try 之外按宽字符路径写出。
+    // 注意 fz_buffer_storage 的签名：**返回**字节数，指针经出参给出。
+    unsigned char* data = nullptr;
+    std::size_t    len = 0;
+    fz_try(ctx) {
+        fz_var(data);
+        fz_var(len);
+        len = fz_buffer_storage(ctx, buf, &data);
+    }
+    fz_catch(ctx) {
+        data = nullptr;
+        len = 0;
+    }
+
+    const bool wrote = (data != nullptr && len > 0) &&
+                       write_bytes_to_wide_path(path, data, len);
+    fz_drop_buffer(ctx, buf);
+
+    if (!wrote) {
+        set_error(impl_->last_error, "failed to write image file");
+        return DocError::Internal;
+    }
+    impl_->last_error.clear();
     return DocError::Ok;
 }
 

@@ -350,6 +350,11 @@ int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE,
             g_app.request_open_dialog = false;
             open_file_dialog_now();
         }
+        // 「导出为图片」的输出选择（另存为 / 选目录）：同为模态对话框，帧间执行。
+        if (g_app.request_export_pick) {
+            g_app.request_export_pick = false;
+            export_pick_output_now();
+        }
     }
 quit:
     crash::set_phase("shutdown");

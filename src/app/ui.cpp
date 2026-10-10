@@ -1059,6 +1059,13 @@ bool menu_item_cmd(const char* icon, const char* label, Cmd shortcut_cmd,
     return menu_item(icon, label, sc.c_str(), checked, enabled, tip);
 }
 
+// 当前主题的强调色（深/浅 chrome × 纸张方案，已过 tone_apply，ADR-068）。
+// 定义在此、声明在 app_internal.h，与 export.cpp 的对话框按钮共用一份。
+ImVec4 accent_color() {
+    return tone_apply(g_app.dark_theme ? ImVec4(0.42f, 0.65f, 0.94f, 1.0f)
+                                       : ImVec4(0.23f, 0.49f, 0.85f, 1.0f));
+}
+
 // 扁平按钮配色（顶栏/工具条，ADR-045）：
 // 默认**无底色**——否则一排按钮就是一排灰块，工具栏显脏；悬停/按下才浮现柔和底色。
 // active（如"侧栏已开/设置已开"）用低透明强调色底表示状态，而不是加粗边框。
@@ -1066,8 +1073,7 @@ bool menu_item_cmd(const char* icon, const char* label, Cmd shortcut_cmd,
 // 返回作用域对象：调用方持有它即可，不必记得配对 PopStyleColor(3)。
 [[nodiscard]] ig::StyleColor3 flat_button_style(bool active) {
     // 强调色也过一遍纸张方案的色调（ADR-068）：否则暖色方案下会出现"页面暖、按钮冷"。
-    const ImVec4 accent = tone_apply(g_app.dark_theme ? ImVec4(0.42f, 0.65f, 0.94f, 1.0f)
-                                                  : ImVec4(0.23f, 0.49f, 0.85f, 1.0f));
+    const ImVec4 accent = accent_color();
     const ImVec4 ink    = g_app.dark_theme ? ImVec4(1, 1, 1, 1) : ImVec4(0, 0, 0, 1);
     return ig::StyleColor3(
         ImGuiCol_Button,
@@ -1221,6 +1227,19 @@ void draw_main_menu_contents() {
     const bool rd = (g_app.session.doc.kind == UiDoc::Kind::Reading);
     if (menu_item_cmd(kIcOpenFile, "打开文档…", Cmd::OpenFile)) g_app.request_open_dialog = true;
     if (menu_item(kIcClose, "关闭文档", nullptr, false, has_doc)) close_document();
+    // 「导出为」子菜单：直接选定格式再打开对话框（格式在对话框里仍可改）。
+    // Ctrl+E 是"打开对话框、沿用上次格式"的快捷入口，故只在首项标注一次，避免两项都挂同一个键。
+    if (const ig::Menu ex = ig::Menu(with_icon(kIcImage, "导出为").c_str(), rd)) {
+        const std::string sc = chord_label(g_app.binds[static_cast<int>(Cmd::ExportImage)][0]);
+        if (menu_item(kIcImage, "PNG 图片…", sc.c_str())) {
+            g_app.export_format = 0;
+            open_export_dialog();
+        }
+        if (menu_item(kIcImage, "JPEG 图片…", nullptr)) {
+            g_app.export_format = 1;
+            open_export_dialog();
+        }
+    }
     ImGui::Separator();
     // 视图菜单里包含全局外观设置；无文档时仍可打开它，纸张项会单独置灰。
     if (const ig::Menu v = ig::Menu(with_icon(kIcDoc, "视图").c_str())) {
@@ -1637,7 +1656,8 @@ namespace {
 // 有则**不派发全局命令**：一来避免 Esc 之类"既关弹窗又触发命令"（Esc 现已是可绑定键），
 // 二来对话框期间应用级快捷键本就不该抢输入。
 bool any_dialog_open() {
-    if (g_app.show_settings || g_app.open_jump || g_app.session.open_password) return true;
+    if (g_app.show_settings || g_app.open_jump || g_app.session.open_password || g_app.export_open)
+        return true;
     return ImGui::IsPopupOpen(nullptr,
                               ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
 }
@@ -1652,6 +1672,7 @@ void draw_shell() {
     g_app.renderer->drain_retired();  // 帧首：释放上一帧退役的纹理
     update_clipboard_results();   // 帧首：取走复制结果并写剪贴板
     update_search();              // 帧首：取走检索的新命中 + 执行待办跳转
+    update_export();              // 帧首：投递导出输出目标 + 轮询导出进度
     update_ime_association();     // 输入法关联随文本输入激活状态切换（ADR-028）
     if (g_app.apply_scale_pending) {  // 界面缩放改动：样式只在帧首换，绝不在一帧中途换
         g_app.apply_scale_pending = false;
@@ -1770,6 +1791,7 @@ void draw_shell() {
     draw_jump_popup();
     draw_password_popup();
     draw_confirm_popup();                                   // 智能匹配询问 / 删除二次确认
+    draw_export_popup();                                    // 导出为图片对话框
     draw_settings_window();
     update_key_capture();   // 在设置窗口绘制之后推进按键捕获（跳过"点按钮"那一帧的鼠标点击）
 
@@ -1787,6 +1809,8 @@ void draw_shell() {
             g_app.open_jump = false;
         } else if (g_app.show_settings) {
             g_app.show_settings = false;
+        } else if (g_app.export_open) {
+            g_app.export_open = false;
         } else if (g_app.confirm_open) {
             // 确认弹窗上按 Esc = 次按钮（"取消"）；智能匹配的次按钮是"从头开始"，
             // 那不是 Esc 该替用户做的决定，故这里只按"沿用"（已经沿用过了）关掉弹窗。

@@ -73,6 +73,10 @@ const CmdDef kCmds[kCmdCount] = {
     { "Copy",           "文本", "复制选中文本",              false, false, kb(ImGuiKey_C, ImGuiMod_Ctrl), ImGuiKey_None },
     { "SelectAll",      "文本", "全选当前页文本",            false, false, kb(ImGuiKey_A, ImGuiMod_Ctrl), ImGuiKey_None },
     { "OpenSearch",     "文本", "查找",                      false, false, kb(ImGuiKey_F, ImGuiMod_Ctrl), ImGuiKey_None },
+
+    // 导出为图片（导出功能）。追加在表末尾以**严格对齐 Cmd 枚举顺序**（kCmds 以枚举值作下标）；
+    // group 仍是「界面」，故在按键设置里归入界面组，与它在表中的物理位置无关。
+    { "ExportImage",    "界面", "导出为图片…",               false, true,  kb(ImGuiKey_E, ImGuiMod_Ctrl), ImGuiKey_None },
 };
 
 void reset_binds_to_default() {
