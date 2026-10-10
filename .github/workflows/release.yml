@@ -1,57 +1,47 @@
-name: PR CI
+name: Release
+
+# 发布级 CI（两级中的第二级，见 docs/03-决策记录.md ADR-102）：
+# 只在推送 v* 标签时运行，产出安装包并创建 **草稿** 预发布，不自动公开。
+# 验证级 CI（pr.yml）负责分支/PR 的构建与回归；本 workflow 只做"把标签变成可下载产物"。
+#
+# 本地发布约定：打标签前先在本地把 CHANGELOG 切好、版本号同步好、commit 完；
+# 标签一旦推上来即视为公开发布，必须通过 docs/06-发布政策.md 的门槛。
 
 on:
-  pull_request:
   push:
-    branches:
-      - main
-  # 手动触发：用于排查偶发失败或在未改动的分支上复跑，避免只能靠空提交触发
-  workflow_dispatch:
+    tags:
+      - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
-# 同一 ref 的新推送取消尚未跑完的旧运行（PR 快速迭代时避免排队堆积）。
-# 发布级 workflow（release.yml）刻意不取消：tag 构建不可半途而废。
+# 发布构建不可半途而废：同一 tag 的重复推送不互相取消（与 pr.yml 相反）
 concurrency:
-  group: pr-ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 defaults:
   run:
-    # PowerShell 7, not Windows PowerShell 5.1: the `>> $env:GITHUB_OUTPUT` /
-    # `>> $env:GITHUB_ENV` writes below must be UTF-8. 5.1's redirection emits
-    # UTF-16LE and the runner would read the values back as garbage.
+    # 与 pr.yml 同样要求 PowerShell 7：`>> $env:GITHUB_OUTPUT` 必须是 UTF-8
     shell: pwsh
 
 jobs:
-  build-and-test:
-    name: Windows build and tests (${{ matrix.configuration }})
+  build-release:
+    name: Build installer and publish draft release
     runs-on: windows-2025
-    # vcpkg 从零构建（缓存未命中时）是本 job 的耗时大头，给足上限避免误杀
-    timeout-minutes: 90
-    strategy:
-      # Debug/Release 互不拖累：一个配置挂了另一个的结论仍然可见
-      fail-fast: false
-      matrix:
-        # Debug 只编不测（ADR-084）：run_tests.ps1 自带 cl.exe 编译、不消费主工程产物，
-        # 对 Debug 产物重跑回归没有信息增益；Debug 的价值在编译+链接期的断言与分支检查。
-        configuration: [Debug, Release]
-
+    timeout-minutes: 120
     steps:
-      - name: Check out source
+      - name: Check out immutable tag
         uses: actions/checkout@v4
+        with:
+          # tag 与版本一致性校验需要完整的标签上下文
+          fetch-depth: 0
 
       - name: Resolve build paths
         id: paths
         run: |
-          # The libmupdf port emits an unquoted /LIBPATH in one build step. Keep
-          # both vcpkg roots outside the repository checkout, whose name contains
-          # a space on this project: the path would otherwise be split into two
-          # arguments (LNK1181).
-          #
-          # The `runner` context is not available in a job-level `env:` block, so
-          # the roots are resolved here and exported to later steps instead.
+          # 与 pr.yml 一致：vcpkg 安装根与二进制缓存都放在检出目录之外
+          # （仓库路径含空格会触发 libmupdf 端口的 LNK1181，见 ADR-010）
           $root = Join-Path $env:RUNNER_TEMP 'lilith-reader'
           $install = Join-Path $root 'vcpkg-installed'
           $cache = Join-Path $root 'vcpkg-binary-cache'
@@ -64,7 +54,7 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Install Python test dependencies
+      - name: Install Python dependencies
         run: python -m pip install --disable-pip-version-check pillow fonttools pymupdf
 
       - name: Locate Visual Studio and vcpkg
@@ -102,13 +92,8 @@ jobs:
 
       - name: Enable user-wide vcpkg MSBuild integration
         run: |
-          # 经典 vcpkg 集成（向 ClCompile/Link 注入 include/lib 路径）只在 MSBuild
-          # 能找到 %LOCALAPPDATA%\vcpkg\vcpkg.user.props 时生效，该文件由
-          # `vcpkg integrate install` 生成。全新 runner 上没有它，且 VS 18 的
-          # C++ targets 已不再自动导入 bundled vcpkg 的经典集成（旧钩子只认这个
-          # 用户级文件）。缺了这一步，下面的 /p:Vcpkg* 属性没有任何 targets 消费，
-          # 构建直接 C1083（mupdf/fitz.h、ft2build.h 找不到）——本地能编过是因为
-          # 开发机跑过 integrate install，属于机器级状态，不在仓库里。
+          # 全新 runner 上没有 %LOCALAPPDATA%\vcpkg\vcpkg.user.props，缺了它经典
+          # 集成不生效，构建直接 C1083（见 ADR-076 勘误）
           & '${{ steps.tools.outputs.VCPKG }}' integrate install
           if ($LASTEXITCODE -ne 0) { throw "vcpkg integrate install failed with exit code $LASTEXITCODE" }
 
@@ -125,9 +110,6 @@ jobs:
           $manifestRoot = Join-Path $env:RUNNER_TEMP 'lilith-reader\manifest'
           New-Item -ItemType Directory -Force -Path $manifestRoot, $env:VCPKG_INSTALL_ROOT, $env:VCPKG_BINARY_CACHE | Out-Null
 
-          # The checked-in manifest predates vcpkg's mandatory baseline field.
-          # Keep that compatibility detail in CI without changing project files
-          # that are also edited by the UI work in progress.
           $manifest = Get-Content "$env:GITHUB_WORKSPACE\vcpkg.json" -Raw | ConvertFrom-Json
           $manifest | Add-Member -NotePropertyName 'builtin-baseline' -NotePropertyValue 'a0400024711b283056538ac19ced80b91a83c24c' -Force
           $manifest | ConvertTo-Json -Depth 20 | Set-Content "$manifestRoot\vcpkg.json" -Encoding utf8
@@ -144,16 +126,37 @@ jobs:
           }
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed with exit code $LASTEXITCODE" }
 
+      - name: Verify tag matches declared version
+        id: version
+        run: |
+          # 发布口径：tag `v<版本>` 必须与安装器与 exe 资源里的版本串一致，
+          # 否则会出现"标签叫 rc.2、安装包叫 rc.1"这类不可追溯的事故。
+          # 与 installer/LilithReader.iss 的编译期数字版本校验互补（那条只管 PE 数字版本）。
+          $tag = "${{ github.ref_name }}"
+
+          $iss = Get-Content "$env:GITHUB_WORKSPACE\installer\LilithReader.iss" -Raw
+          if ($iss -notmatch '#define\s+MyAppVersion\s+"([^"]+)"') { throw "MyAppVersion not found in LilithReader.iss" }
+          $issVersion = $Matches[1]
+
+          $rc = Get-Content "$env:GITHUB_WORKSPACE\src\app\app.rc" -Raw
+          if ($rc -notmatch 'VALUE\s+"ProductVersion",\s+"([^"]+)"') { throw "ProductVersion not found in app.rc" }
+          $rcVersion = $Matches[1]
+
+          Write-Host "tag=$tag  installer=$issVersion  app.rc=$rcVersion"
+          if ("v$issVersion" -ne $tag) { throw "Tag '$tag' does not match installer version 'v$issVersion'" }
+          if ($rcVersion -ne $issVersion) { throw "app.rc ProductVersion '$rcVersion' != installer MyAppVersion '$issVersion'" }
+
+          "version=$issVersion" >> $env:GITHUB_OUTPUT
+
       - name: Build application
         run: |
-          $msbuild = '${{ steps.tools.outputs.MSBUILD }}'
           $vcpkgRoot = '${{ steps.tools.outputs.VS_PATH }}\VC\vcpkg'
           $installRoot = $env:VCPKG_INSTALL_ROOT
           & '${{ steps.tools.outputs.MSBUILD }}' `
             "$env:GITHUB_WORKSPACE\src\LilithReader.vcxproj" `
             /m `
             /nologo `
-            /p:Configuration=${{ matrix.configuration }} `
+            /p:Configuration=Release `
             /p:Platform=x64 `
             /p:PlatformToolset=${{ steps.tools.outputs.TOOLSET }} `
             /p:VcpkgEnableManifest=false `
@@ -162,55 +165,18 @@ jobs:
             "/p:VcpkgInstalledDir=$installRoot"
           if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE" }
 
-      - name: Upload Release executable for packaging
-        if: matrix.configuration == 'Release'
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-exe
-          path: bin/Release/LilithReader.exe
-          if-no-files-found: error
-
       - name: Run automated tests
-        if: matrix.configuration == 'Release'
         run: |
+          # 发布级仍跑一遍全量回归：验证级只保证 PR 当时的绿色，tag 指向的确切提交
+          # 必须自己再证明一次（tag 可指向任意历史提交）。
           & powershell.exe -NoProfile -ExecutionPolicy Bypass `
             -File "$env:GITHUB_WORKSPACE\tests\run_tests.ps1" `
             -VcpkgRoot "$env:VCPKG_INSTALL_ROOT"
           if ($LASTEXITCODE -ne 0) { throw "Automated tests failed with exit code $LASTEXITCODE" }
 
-      - name: Upload test diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          # v4 不允许同名 artifact 重复上传，两个矩阵实例都失败时会撞名
-          name: pr-ci-diagnostics-${{ matrix.configuration }}
-          if-no-files-found: ignore
-          path: |
-            tests/_build/**
-            tests/samples/**
-            build/**
-            bin/**
-
-  installer:
-    name: Installer build and size gate
-    runs-on: windows-2025
-    needs: build-and-test
-    timeout-minutes: 30
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Download Release executable
-        uses: actions/download-artifact@v4
-        with:
-          name: release-exe
-          path: bin/Release
-
       - name: Build installer
         run: |
-          # 复用仓库自带的打包脚本（ISCC 路径探测 + exe 存在检查都在里面），
-          # 不在 CI 内另写一套 ISCC 调用，避免打包定义漂移。
-          # runner 镜像预装 Inno Setup 6.7.1，落在 Program Files (x86)。
+          # 复用仓库自带打包脚本（ISCC 路径探测 + exe 存在检查都在里面）
           & "$env:GITHUB_WORKSPACE\installer\build_installer.bat"
           if ($LASTEXITCODE -ne 0) { throw "Installer build failed with exit code $LASTEXITCODE" }
 
@@ -220,9 +186,54 @@ jobs:
             "$env:GITHUB_WORKSPACE\installer\dist"
           if ($LASTEXITCODE -ne 0) { throw "Installer size check failed" }
 
-      - name: Upload installer
+      - name: Stage release assets
+        run: |
+          $assets = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
+          New-Item -ItemType Directory -Force -Path $assets | Out-Null
+          Get-ChildItem "$env:GITHUB_WORKSPACE\installer\dist\*.exe" | ForEach-Object {
+            Copy-Item $_.FullName $assets
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Add-Content -Path (Join-Path $assets 'SHA256SUMS.txt') -Encoding ascii
+          }
+          Get-ChildItem $assets | Format-Table Name, Length -AutoSize
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $changelog = Get-Content "$env:GITHUB_WORKSPACE\CHANGELOG.md" -Raw
+          $lines = $changelog -split "`r?`n"
+          $start = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match "^##\s+$([regex]::Escape($version))(\s|$)") { $start = $i + 1; break }
+          }
+          if ($start -lt 0) { throw "No CHANGELOG section for version $version" }
+          $body = @()
+          for ($i = $start; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^##\s') { break }
+            $body += $lines[$i]
+          }
+          $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          ($body -join "`n").Trim() | Set-Content $notes -Encoding utf8
+          "file=$notes" >> $env:GITHUB_OUTPUT
+
+      - name: Create draft GitHub release from existing tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # --draft + --prerelease：不自动公开，由维护者复核后再手动发布
+          # （安装包未做代码签名，见 docs/06-发布政策.md）
+          gh release create "${{ github.ref_name }}" `
+            release-assets/* `
+            --verify-tag `
+            --draft `
+            --prerelease `
+            --title "Lilith Reader ${{ steps.version.outputs.version }}" `
+            --notes-file "${{ steps.notes.outputs.file }}"
+
+      - name: Upload workflow evidence
         uses: actions/upload-artifact@v4
         with:
-          name: installer
-          path: installer/dist/*.exe
+          name: release-evidence-${{ steps.version.outputs.version }}
+          path: release-assets/*
           if-no-files-found: error

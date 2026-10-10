@@ -23,8 +23,8 @@
 
 #define MyAppName "Lilith Reader"
 ; 显示版本（可含预发布后缀，用于文件名、注册表显示、欢迎页文案）
-#define MyAppVersion "1.0-rc.1"
-; 数字版本：PE 版本资源是 4 段纯数字，无法表达 "-rc.1"；它必须与
+#define MyAppVersion "1.0-rc.2"
+; 数字版本：PE 版本资源是 4 段纯数字，无法表达 "-rc.2"；它必须与
 ; src/app/app.rc 的 FILEVERSION 一致，是编译期校验的比对基准。
 #define MyAppVersionNumeric "1.0.0.0"
 #define MyAppPublisher "Lilith"
@@ -50,7 +50,7 @@ VersionInfoVersion={#MyAppVersionNumeric}
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} 安装程序
 VersionInfoProductName={#MyAppName}
-; 数字版本字段只接受 x.x.x.x，预发布后缀（-rc.1）放到 *TextVersion 字段
+; 数字版本字段只接受 x.x.x.x，预发布后缀（-rc.2）放到 *TextVersion 字段
 VersionInfoProductVersion={#MyAppVersionNumeric}
 VersionInfoTextVersion={#MyAppVersion}
 VersionInfoProductTextVersion={#MyAppVersion}

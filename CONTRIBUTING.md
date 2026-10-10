@@ -53,8 +53,9 @@ installer\build_installer.bat   :: 打安装包（需 Inno Setup 6，先跑过 b
 
 - 从 `main` 开分支开发，完成后提 Pull Request。
 - 每批改动收尾即提交（编译零错、测试通过、文档同步完成后），不与后续修改混在工作区。
-- CI（`.github/workflows/pr.yml`）会在 Windows runner 上跑 Debug/Release 构建、全量回归
-  与安装包体积门禁，请确保其通过。
+- CI 分两级：验证级 `.github/workflows/pr.yml` 会在 Windows runner 上跑 Debug/Release 构建、
+  全量回归与安装包体积门禁；发布级 `.github/workflows/release.yml` 仅在推送 `v*` 标签时构建
+  安装包并创建草稿预发布。发布口径见 [docs/06-发布政策.md](docs/06-发布政策.md)。
 
 ## 报告问题
 

@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "lilith-reader",
-  "version-string": "1.0.0-rc.1",
+  "version-string": "1.0.0-rc.2",
   "dependencies": [
     "libmupdf"
   ]

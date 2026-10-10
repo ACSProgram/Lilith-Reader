@@ -22,6 +22,7 @@
 | [`03-决策记录.md`](03-决策记录.md) | ADR 台账：选型的决定/理由/后果 | **只追加**，末尾续写；勘误以「勘误」注记 |
 | [`04-人工验证.md`](04-人工验证.md) | **待执行**的人工验证清单 | 项通过后整节移入归档 |
 | [`05-体积预算.md`](05-体积预算.md) | 体积构成与裁剪手段（**体积数据的唯一出处**） | 实测数据变化时更新 |
+| [`06-发布政策.md`](06-发布政策.md) | 版本口径、切版本动作、CI 与人工门槛（**版本与发布口径的唯一出处**） | 版本流程/门槛变化时更新 |
 | [`archive/YYYY-MM/`](archive/README.md) | 已完成批次的过程记录、事故、已通过验证清单 | 只增不改，新文件必须在[索引](archive/README.md)登记 |
 
 各模块契约写在模块接口文件头注释（`src/*/*.ixx`）里，与 `02-架构设计.md` 互为摘要。
@@ -42,7 +43,8 @@
 | 导出为图片（对话框 / 输出选择 / 后台导出 / PNG·JPEG 编码与写出） | [架构设计 §11](02-架构设计.md)、[决策记录 ADR-101](03-决策记录.md) | `src/app/export.cpp`、`document::save_page_as_image`、`render` 的 `ExportJob`（`render.cpp`） |
 | 界面外壳（顶栏/主菜单/右键菜单/设置/按键/主题/图标/动效） | [架构设计 §7](02-架构设计.md)、[决策记录 ADR-045/054~056/059/061/066/097](03-决策记录.md) | `src/app/ui.cpp`、`src/app/settings_ui.cpp`、`src/app/platform.cpp`、`src/app/app.rc` |
 | 窗口尺寸/全屏/最小化（swapchain 重建、闪烁、覆盖层栏） | [架构设计 §7.1](02-架构设计.md)、[决策记录 ADR-057/058/060/061/095~097](03-决策记录.md) | `src/app/main.cpp`、`src/app/platform.cpp`、`src/app/ui.cpp` |
-| 构建、依赖、打包、CI 的完整细节 | [架构设计 §8](02-架构设计.md)、[决策记录 ADR-076](03-决策记录.md) | `build.bat`、`vcpkg.json`、`installer/LilithReader.iss`、`.github/workflows/pr.yml` |
+| 构建、依赖、打包、CI 的完整细节 | [架构设计 §8](02-架构设计.md)、[决策记录 ADR-076/084/102](03-决策记录.md) | `build.bat`、`vcpkg.json`、`installer/LilithReader.iss`、`.github/workflows/pr.yml`、`.github/workflows/release.yml` |
+| 版本号写在哪、怎么切版本、发布门槛 | [发布政策](06-发布政策.md) | `installer/LilithReader.iss`、`src/app/app.rc`、`vcpkg.json` |
 | 体积构成、裁剪手段 | [体积预算](05-体积预算.md) | — |
 | 某个选型"为什么这么做" | [决策记录](03-决策记录.md)（追加式台账，按 ADR 编号查） | — |
 | 待人工执行哪些验证 | [人工验证](04-人工验证.md) | 本次改动涉及的文件 |
